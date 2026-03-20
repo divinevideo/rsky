@@ -121,9 +121,17 @@ async fn robots() -> &'static str {
     "# Hello!\n\n# Crawling the public API is allowed\nUser-agent: *\nAllow: /"
 }
 
-#[tracing::instrument(skip_all)]
 #[get("/xrpc/_health")]
-async fn health(
+async fn health_live() -> Json<ServerVersion> {
+    let env_version = env::var("VERSION").unwrap_or("0.3.0-beta.3".into());
+    Json(ServerVersion {
+        version: env_version,
+    })
+}
+
+#[tracing::instrument(skip_all)]
+#[get("/xrpc/_health/ready")]
+async fn health_ready(
     connection: DbConn,
 ) -> Result<Json<ServerVersion>, status::Custom<Json<ErrorMessageResponse>>> {
     let result = connection
@@ -236,7 +244,20 @@ pub async fn build_rocket(cfg: Option<RocketConfig>) -> Rocket<Build> {
         )),
     };
     let mut background_sequencer = sequencer.sequencer.write().await.clone();
-    tokio::spawn(async move { background_sequencer.start().await });
+    std::thread::Builder::new()
+        .name("sequencer".into())
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build sequencer runtime");
+            rt.block_on(async move {
+                if let Err(e) = background_sequencer.start().await {
+                    tracing::error!("Sequencer exited with error: {e}");
+                }
+            });
+        })
+        .expect("failed to spawn sequencer thread");
 
     let aws_sdk_config = aws_config::from_env()
         .endpoint_url(env::var("AWS_ENDPOINT").unwrap_or("localhost".to_owned()))
@@ -294,7 +315,8 @@ pub async fn build_rocket(cfg: Option<RocketConfig>) -> Rocket<Build> {
             routes![
                 index,
                 robots,
-                health,
+                health_live,
+                health_ready,
                 com::atproto::admin::delete_account::delete_account,
                 com::atproto::admin::disable_account_invites::disable_account_invites,
                 com::atproto::admin::disable_invite_codes::disable_invite_codes,
