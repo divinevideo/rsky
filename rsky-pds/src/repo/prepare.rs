@@ -97,6 +97,29 @@ pub fn find_blob_refs(val: Lex, path: Option<Vec<String>>, layer: Option<u8>) ->
             .flat_map(|item| find_blob_refs(item, Some(path.clone()), Some(layer + 1)))
             .collect::<Vec<FoundBlobRef>>(),
         Lex::Blob(blob) => vec![FoundBlobRef { r#ref: blob, path }],
+        Lex::Ipld(Ipld::List(list)) => list
+            .into_iter()
+            .flat_map(|item| find_blob_refs(Lex::Ipld(item), Some(path.clone()), Some(layer + 1)))
+            .collect::<Vec<FoundBlobRef>>(),
+        Lex::Ipld(Ipld::Map(map)) => match serde_json::to_value(&map)
+            .ok()
+            .and_then(|json| serde_json::from_value::<JsonBlobRef>(json).ok())
+        {
+            Some(blob) => vec![FoundBlobRef {
+                r#ref: BlobRef { original: blob },
+                path,
+            }],
+            None => map
+                .into_iter()
+                .flat_map(|(key, item)| {
+                    find_blob_refs(
+                        Lex::Ipld(item),
+                        Some([path.as_slice(), [key].as_slice()].concat()),
+                        Some(layer + 1),
+                    )
+                })
+                .collect::<Vec<FoundBlobRef>>(),
+        },
         Lex::Ipld(Ipld::Json(JsonValue::Array(list))) => list
             .into_iter()
             .flat_map(|item| match serde_json::from_value::<RepoRecord>(item) {
@@ -134,6 +157,44 @@ pub fn find_blob_refs(val: Lex, path: Option<Vec<String>>, layer: Option<u8>) ->
                 )
             })
             .collect::<Vec<FoundBlobRef>>(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::blobs_for_write;
+    use anyhow::Result;
+    use rsky_repo::types::RepoRecord;
+    use serde_json::json;
+
+    #[test]
+    fn finds_blob_refs_in_video_embed_records_deserialized_from_json() -> Result<()> {
+        let record: RepoRecord = serde_json::from_value(json!({
+            "$type": "app.bsky.feed.post",
+            "text": "staging ACL smoke 2026-03-21T04:00:00Z",
+            "createdAt": "2026-03-21T04:00:00Z",
+            "langs": ["en"],
+            "embed": {
+                "$type": "app.bsky.embed.video",
+                "video": {
+                    "$type": "blob",
+                    "ref": { "$link": "bafkreigh2akiscaildc4v5lskm6ty6q6ks5xifh4rtfj24rl6vb7aq6nzu" },
+                    "mimeType": "video/mp4",
+                    "size": 1027159
+                },
+                "alt": "staging ACL smoke",
+                "aspectRatio": {
+                    "width": 1,
+                    "height": 1
+                }
+            }
+        }))?;
+
+        let blobs = blobs_for_write(record, false)?;
+
+        assert_eq!(blobs.len(), 1);
+        assert_eq!(blobs[0].mime_type, "video/mp4");
+        Ok(())
     }
 }
 

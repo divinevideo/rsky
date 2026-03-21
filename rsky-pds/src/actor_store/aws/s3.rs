@@ -219,12 +219,7 @@ impl S3BlobStore {
             .client
             .copy_object()
             .bucket(&self.s3_bucket)
-            .copy_source(format!(
-                "{0}/{1}/{2}",
-                env_str("AWS_ENDPOINT_BUCKET").unwrap(),
-                self.bucket,
-                keys.from
-            ))
+            .copy_source(format_copy_source(&self.s3_bucket, &keys.from))
             .key(keys.to);
         let request = if Self::should_apply_public_read_acl() {
             request.acl(ObjectCannedAcl::PublicRead)
@@ -248,9 +243,13 @@ fn endpoint_supports_object_acl(endpoint: Option<&str>) -> bool {
     !matches!(endpoint, Some(value) if value.contains("storage.googleapis.com"))
 }
 
+fn format_copy_source(bucket: &str, key: &str) -> String {
+    format!("{bucket}/{key}")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::endpoint_supports_object_acl;
+    use super::{endpoint_supports_object_acl, format_copy_source};
 
     #[test]
     fn gcs_endpoint_disables_object_acl() {
@@ -261,5 +260,16 @@ mod tests {
     fn non_gcs_endpoint_keeps_object_acl() {
         assert!(endpoint_supports_object_acl(Some("https://s3.us-west-2.amazonaws.com")));
         assert!(endpoint_supports_object_acl(None));
+    }
+
+    #[test]
+    fn copy_source_uses_bucket_and_object_key_once() {
+        assert_eq!(
+            format_copy_source(
+                "divine-pds-blobs-staging",
+                "tmp/did:plc:ebt5msdpfavoklkap6gl54bm/dTvI9ekk72DT6PxuYH6q3k6GCVPHPSTB",
+            ),
+            "divine-pds-blobs-staging/tmp/did:plc:ebt5msdpfavoklkap6gl54bm/dTvI9ekk72DT6PxuYH6q3k6GCVPHPSTB",
+        );
     }
 }
