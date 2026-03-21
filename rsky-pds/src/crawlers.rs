@@ -35,26 +35,44 @@ impl Crawlers {
         if now - self.last_notified < NOTIFY_THRESHOLD as usize {
             return Ok(());
         }
-        let _ = stream::iter(self.crawlers.clone())
-            .then(|service: String| async move {
-                let client = reqwest::Client::builder()
-                    .user_agent(APP_USER_AGENT)
-                    .build()?;
-                let record = CrawlerRequest {
-                    hostname: service.clone(),
-                };
-                Ok::<reqwest::Response, anyhow::Error>(
-                    client
-                        .post(format!("{}/xrpc/com.atproto.sync.requestCrawl", service))
-                        .json(&record)
-                        .send()
-                        .await?,
-                )
+        let hostname = self.hostname.clone();
+        let results = stream::iter(self.crawlers.clone())
+            .filter(|s| {
+                let empty = s.is_empty();
+                async move { !empty }
+            })
+            .then(|service: String| {
+                let hostname = hostname.clone();
+                async move {
+                    let client = reqwest::Client::builder()
+                        .user_agent(APP_USER_AGENT)
+                        .connect_timeout(std::time::Duration::from_secs(5))
+                        .timeout(std::time::Duration::from_secs(10))
+                        .build()?;
+                    let record = CrawlerRequest {
+                        hostname,
+                    };
+                    Ok::<reqwest::Response, anyhow::Error>(
+                        client
+                            .post(format!(
+                                "{}/xrpc/com.atproto.sync.requestCrawl",
+                                service
+                            ))
+                            .json(&record)
+                            .send()
+                            .await?,
+                    )
+                }
             })
             .collect::<Vec<_>>()
-            .await
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()?;
+            .await;
+
+        // Log failures but don't block writes
+        for result in &results {
+            if let Err(e) = result {
+                tracing::warn!("Failed to notify crawler: {e}");
+            }
+        }
 
         self.last_notified = now;
         Ok(())
