@@ -212,9 +212,16 @@ pub mod update_email;
 #[cfg(test)]
 mod tests {
     use super::validate_handle;
+    use lazy_static::lazy_static;
+    use std::sync::Mutex;
+
+    lazy_static! {
+        static ref ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
+    }
 
     #[test]
     fn validate_handle_uses_service_domains_when_present() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
         unsafe {
             std::env::set_var("PDS_HOSTNAME", "pds.staging.dvines.org");
             std::env::set_var("PDS_SERVICE_HANDLE_DOMAINS", ".staging.dvines.org,.divine.video");
@@ -227,6 +234,7 @@ mod tests {
 
     #[test]
     fn validate_handle_falls_back_to_hostname_without_service_domains() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
         unsafe {
             std::env::set_var("PDS_HOSTNAME", "localhost");
             std::env::remove_var("PDS_SERVICE_HANDLE_DOMAINS");

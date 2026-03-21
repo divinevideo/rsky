@@ -8,6 +8,7 @@ use crate::sequencer::outbox::{Outbox, OutboxOpts};
 use crate::sequencer::Sequencer;
 use crate::xrpc_server::stream::frames::{ErrorFrame, Frame, MessageFrame, MessageFrameOpts};
 use crate::xrpc_server::stream::types::ErrorFrameBody;
+use crate::SeqEventBroadcast;
 use chrono::offset::Utc as UtcOffset;
 use chrono::{DateTime, Duration};
 use futures::{pin_mut, StreamExt};
@@ -40,6 +41,7 @@ fn get_backfill_limit(ms: u64) -> String {
 pub async fn subscribe_repos<'a>(
     cursor: Option<i64>,
     cfg: &'a State<ServerConfig>,
+    broadcast: &'a State<SeqEventBroadcast>,
     mut shutdown: Shutdown,
     ws: ws::WebSocket,
 ) -> ws::Stream!['a] {
@@ -48,11 +50,13 @@ pub async fn subscribe_repos<'a>(
             Crawlers::new(cfg.service.hostname.clone(), cfg.crawlers.clone()),
             None,
         );
+        let broadcast_rx = broadcast.sender.subscribe();
         let mut outbox = Outbox::new(
             sequencer_lock.clone(),
             Some(OutboxOpts {
                 max_buffer_size: cfg.subscription.repo_backfill_limit_ms as usize,
-            })
+            }),
+            broadcast_rx,
         );
 
         tracing::debug!("@LOG DEBUG: request to com.atproto.sync.subscribeRepos; Cursor={cursor:?}");

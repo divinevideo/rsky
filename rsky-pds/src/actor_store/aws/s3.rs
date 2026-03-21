@@ -5,7 +5,7 @@ use aws_config::SdkConfig;
 use aws_sdk_s3 as s3;
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::types::{Delete, ObjectCannedAcl, ObjectIdentifier};
+use aws_sdk_s3::types::{Delete, ObjectIdentifier};
 use lexicon_cid::Cid;
 use rsky_common::env::env_str;
 use rsky_common::get_random_str;
@@ -66,7 +66,6 @@ impl S3BlobStore {
             .body(body)
             .bucket(&self.s3_bucket)
             .key(self.get_tmp_path(&key))
-            .acl(ObjectCannedAcl::PublicRead)
             .send()
             .await?;
         Ok(key)
@@ -94,7 +93,6 @@ impl S3BlobStore {
             .body(body)
             .bucket(&self.s3_bucket)
             .key(self.get_stored_path(cid))
-            .acl(ObjectCannedAcl::PublicRead)
             .send()
             .await?;
         Ok(())
@@ -199,17 +197,15 @@ impl S3BlobStore {
     }
 
     async fn move_object(&self, keys: MoveObject) -> Result<()> {
+        let copy_source = match env_str("AWS_ENDPOINT_BUCKET") {
+            Some(endpoint_bucket) => format!("{}/{}/{}", endpoint_bucket, self.bucket, keys.from),
+            None => format!("{}/{}", self.s3_bucket, keys.from),
+        };
         self.client
             .copy_object()
             .bucket(&self.s3_bucket)
-            .copy_source(format!(
-                "{0}/{1}/{2}",
-                env_str("AWS_ENDPOINT_BUCKET").unwrap(),
-                self.bucket,
-                keys.from
-            ))
+            .copy_source(copy_source)
             .key(keys.to)
-            .acl(ObjectCannedAcl::PublicRead)
             .send()
             .await?;
         self.client

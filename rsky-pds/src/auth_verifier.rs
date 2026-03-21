@@ -625,6 +625,12 @@ pub struct AdminToken {
     pub access: AccessOutput,
 }
 
+fn admin_password_from_env() -> Option<String> {
+    env::var("PDS_ADMIN_PASSWORD")
+        .ok()
+        .or_else(|| env::var("PDS_ADMIN_PASS").ok())
+}
+
 #[rocket::async_trait]
 impl<'r> FromRequest<'r> for AdminToken {
     type Error = AuthError;
@@ -638,8 +644,16 @@ impl<'r> FromRequest<'r> for AdminToken {
             )),
             Some(parsed) => {
                 let BasicAuth { username, password } = parsed;
+                let expected_password = match admin_password_from_env() {
+                    Some(password) => password,
+                    None => {
+                        let error = AuthError::AuthRequired("BadAuth".to_string());
+                        req.local_cache(|| Some(ApiError::InvalidRequest(error.to_string())));
+                        return Outcome::Error((Status::BadRequest, error));
+                    }
+                };
 
-                if username != "admin" || password != env::var("PDS_ADMIN_PASS").unwrap() {
+                if username != "admin" || password != expected_password {
                     let error = AuthError::AuthRequired("BadAuth".to_string());
                     req.local_cache(|| Some(ApiError::InvalidRequest(error.to_string())));
                     Outcome::Error((Status::BadRequest, error))

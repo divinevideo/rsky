@@ -7,17 +7,13 @@ use crate::sequencer::events::{
     format_seq_account_evt, format_seq_commit, format_seq_handle_update, format_seq_identity_evt,
     SeqEvt, TypedAccountEvt, TypedCommitEvt, TypedIdentityEvt, TypedSyncEvt,
 };
-use crate::EVENT_EMITTER;
 use anyhow::Result;
 use diesel::*;
 use events::format_seq_sync_evt;
-use futures::{Stream, StreamExt};
 use rsky_common::time::SECOND;
 use rsky_common::{cbor_to_struct, wait};
 use rsky_repo::types::CommitDataWithOps;
 use std::cmp;
-use std::pin::Pin;
-use std::task::{Context, Poll, Waker};
 
 pub struct RequestSeqRangeOpts {
     pub earliest_seq: Option<i64>,
@@ -30,7 +26,6 @@ pub struct RequestSeqRangeOpts {
 pub struct Sequencer {
     pub destroyed: bool,
     pub tries_with_no_results: u32,
-    pub waker: Option<Waker>,
     pub crawlers: Crawlers,
     pub last_seen: Option<i64>,
 }
@@ -41,28 +36,87 @@ impl Sequencer {
             destroyed: false,
             tries_with_no_results: 0,
             last_seen: Some(last_seen.unwrap_or(0)),
-            waker: None,
             crawlers,
         }
     }
 
-    pub async fn start(&mut self) -> Result<()> {
+    /// Run the sequencer polling loop. Polls repo_seq for new events and
+    /// broadcasts them to all firehose subscribers via the broadcast channel.
+    pub async fn start(
+        &mut self,
+        tx: tokio::sync::broadcast::Sender<Vec<SeqEvt>>,
+    ) -> Result<()> {
         let curr = self.curr().await?;
         self.last_seen = Some(curr.unwrap_or(0));
-        if self.waker.is_none() {
-            loop {
-                while let Some(_) = self.next().await {}
+        tracing::info!(
+            "Sequencer started, last_seen: {:?}",
+            self.last_seen
+        );
+        loop {
+            if self.destroyed {
+                tracing::info!("Sequencer destroyed, exiting");
+                break;
+            }
+            match self.poll_and_broadcast(&tx).await {
+                Ok(true) => {
+                    // Found events, reset backoff
+                    self.tries_with_no_results = 0;
+                }
+                Ok(false) => {
+                    // No events, backoff
+                    self.tries_with_no_results += 1;
+                    let wait_time = cmp::min(
+                        2u64.checked_pow(self.tries_with_no_results).unwrap_or(2),
+                        SECOND as u64,
+                    );
+                    wait(wait_time);
+                }
+                Err(e) => {
+                    tracing::error!("Sequencer poll error: {e}");
+                    self.tries_with_no_results += 1;
+                    let wait_time = cmp::min(
+                        2u64.checked_pow(self.tries_with_no_results).unwrap_or(2),
+                        SECOND as u64,
+                    );
+                    wait(wait_time);
+                }
             }
         }
         Ok(())
     }
 
+    /// Poll the database for new events and broadcast them.
+    /// Returns true if events were found.
+    async fn poll_and_broadcast(
+        &mut self,
+        tx: &tokio::sync::broadcast::Sender<Vec<SeqEvt>>,
+    ) -> Result<bool> {
+        let evts = self.request_seq_range(RequestSeqRangeOpts {
+            earliest_seq: self.last_seen,
+            latest_seq: None,
+            earliest_time: None,
+            limit: Some(1000),
+        }).await?;
+
+        if evts.is_empty() {
+            return Ok(false);
+        }
+
+        // Update last_seen
+        if let Some(last_evt) = evts.last() {
+            self.last_seen = Some(last_evt.seq());
+        }
+
+        // Broadcast to all subscribers (ignore error if no receivers)
+        let count = evts.len();
+        let _ = tx.send(evts);
+        tracing::debug!("Sequencer broadcast {count} events, last_seen: {:?}", self.last_seen);
+
+        Ok(true)
+    }
+
     pub async fn destroy(&mut self) {
         self.destroyed = true;
-        if let Some(waker) = self.waker.take() {
-            waker.wake();
-        }
-        EVENT_EMITTER.write().await.emit("close", ());
     }
 
     pub async fn curr(&self) -> Result<Option<i64>> {
@@ -144,7 +198,7 @@ impl Sequencer {
         for row in rows {
             let time = row.sequenced_at;
             match row.seq {
-                None => continue, // should never hit this because of WHERE clause
+                None => continue,
                 Some(seq) => match row.event_type.as_str() {
                     "append" | "rebase" => {
                         seq_evts.push(SeqEvt::TypedCommitEvt(TypedCommitEvt {
@@ -186,18 +240,6 @@ impl Sequencer {
         }
 
         Ok(seq_evts)
-    }
-
-    async fn exponential_backoff(&mut self) {
-        self.tries_with_no_results += 1;
-        let wait_time = cmp::min(
-            2u64.checked_pow(self.tries_with_no_results).unwrap_or(2),
-            SECOND as u64,
-        );
-        wait(wait_time);
-        if let Some(waker) = self.waker.take() {
-            waker.wake();
-        }
     }
 
     pub async fn sequence_evt(&mut self, evt: models::RepoSeq) -> Result<i64> {
@@ -251,56 +293,6 @@ impl Sequencer {
     pub async fn sequence_sync_evt(&mut self, did: String, data: SyncEvtData) -> Result<i64> {
         let evt = format_seq_sync_evt(did, data).await?;
         self.sequence_evt(evt).await
-    }
-}
-
-impl Stream for Sequencer {
-    type Item = Result<(), anyhow::Error>;
-
-    #[tracing::instrument(skip_all)]
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        if self.destroyed {
-            return Poll::Ready(None);
-        }
-        // if already polling, do not start another poll
-        return match futures::executor::block_on(self.request_seq_range(RequestSeqRangeOpts {
-            earliest_seq: self.last_seen,
-            latest_seq: None,
-            earliest_time: None,
-            limit: Some(1000),
-        })) {
-            Err(err) => {
-                tracing::error!(
-                    "@LOG: sequencer failed to poll db, err: {}, last_seen: {:?}",
-                    err.to_string(),
-                    self.last_seen
-                );
-                self.waker = Some(cx.waker().clone());
-                futures::executor::block_on(self.exponential_backoff());
-                Poll::Ready(Some(Err(err)))
-            }
-            Ok(evts) => {
-                if evts.len() > 0 {
-                    self.tries_with_no_results = 0;
-                    futures::executor::block_on(EVENT_EMITTER.write()).emit(
-                        "events",
-                        evts.iter()
-                            .map(|evt| serde_json::to_string(evt).unwrap())
-                            .collect::<Vec<String>>(),
-                    );
-                    self.last_seen = match evts.last() {
-                        None => self.last_seen,
-                        Some(last_evt) => Some(last_evt.seq()),
-                    };
-                    self.waker = Some(cx.waker().clone());
-                    Poll::Ready(Some(Ok(())))
-                } else {
-                    self.waker = Some(cx.waker().clone());
-                    futures::executor::block_on(self.exponential_backoff());
-                    Poll::Pending
-                }
-            }
-        };
     }
 }
 

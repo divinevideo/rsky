@@ -15,6 +15,13 @@ use testcontainers_modules::postgres;
 use testcontainers_modules::postgres::Postgres;
 
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
+const TEST_ADMIN_PASSWORD: &str = "test-admin-password";
+const TEST_REPO_SIGNING_KEY_HEX: &str =
+    "4f3edf983ac636a65a842ce7c78d9aa706d3b113bce036f4aeb4f7f7a5c5f3cf";
+const TEST_PLC_ROTATION_KEY_HEX: &str =
+    "6c3699283bda56ad74f6b855546325b68d482e983852a5b0d1f5b0f8d7e79b4f";
+const TEST_JWT_KEY_HEX: &str =
+    "8f2a55949068468ad5d670dfd0c0a33d5b9e7e1a2c0d2059f0f8f8779d4d078d";
 
 /**
     Establish connection to the testcontainer postgres
@@ -31,10 +38,13 @@ pub fn establish_connection(database_url: &str) -> Result<PgConnection> {
 }
 
 /**
-    Fetch PDS_ADMIN_PASS to be used for creating initial accounts
+    Fetch the configured admin password to be used for creating initial accounts
 */
 pub fn get_admin_token() -> String {
-    let credentials = Credentials::new("admin", env_str("PDS_ADMIN_PASS").unwrap().as_str());
+    let admin_password = env_str("PDS_ADMIN_PASSWORD")
+        .or_else(|| env_str("PDS_ADMIN_PASS"))
+        .unwrap_or_else(|| TEST_ADMIN_PASSWORD.to_string());
+    let credentials = Credentials::new("admin", admin_password.as_str());
     credentials.as_http_header()
 }
 
@@ -58,6 +68,22 @@ pub async fn get_postgres() -> ContainerAsync<Postgres> {
     Start Client for the RSky-PDS and have it use the provided postgres container
 */
 pub async fn get_client(postgres: &ContainerAsync<Postgres>) -> Client {
+    unsafe {
+        std::env::set_var("PDS_ADMIN_PASSWORD", TEST_ADMIN_PASSWORD);
+        std::env::set_var("PDS_ADMIN_PASS", TEST_ADMIN_PASSWORD);
+        std::env::set_var("PDS_HOSTNAME", "localhost");
+        std::env::set_var("PDS_SERVICE_DID", "did:web:localhost");
+        std::env::set_var("PDS_SERVICE_HANDLE_DOMAINS", ".test");
+        std::env::set_var("PDS_JWT_KEY_K256_PRIVATE_KEY_HEX", TEST_JWT_KEY_HEX);
+        std::env::set_var(
+            "PDS_REPO_SIGNING_KEY_K256_PRIVATE_KEY_HEX",
+            TEST_REPO_SIGNING_KEY_HEX,
+        );
+        std::env::set_var(
+            "PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX",
+            TEST_PLC_ROTATION_KEY_HEX,
+        );
+    }
     let port = postgres.get_host_port_ipv4(5432).await.unwrap();
     let connection_string = format!("postgres://postgres:postgres@localhost:{port}/postgres",);
     Client::untracked(
