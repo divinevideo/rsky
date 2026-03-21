@@ -58,15 +58,25 @@ impl S3BlobStore {
         format!("quarantine/{0}/{1}", self.bucket, cid)
     }
 
+    fn should_apply_public_read_acl() -> bool {
+        endpoint_supports_object_acl(env_str("AWS_ENDPOINT").as_deref())
+    }
+
     pub async fn put_temp(&self, bytes: Vec<u8>) -> Result<String> {
         let key = self.gen_key();
         let body = ByteStream::from(bytes);
-        self.client
+        let request = self
+            .client
             .put_object()
             .body(body)
             .bucket(&self.s3_bucket)
-            .key(self.get_tmp_path(&key))
-            .acl(ObjectCannedAcl::PublicRead)
+            .key(self.get_tmp_path(&key));
+        let request = if Self::should_apply_public_read_acl() {
+            request.acl(ObjectCannedAcl::PublicRead)
+        } else {
+            request
+        };
+        request
             .send()
             .await?;
         Ok(key)
@@ -89,12 +99,18 @@ impl S3BlobStore {
 
     pub async fn put_permanent(&self, cid: Cid, bytes: Vec<u8>) -> Result<()> {
         let body = ByteStream::from(bytes);
-        self.client
+        let request = self
+            .client
             .put_object()
             .body(body)
             .bucket(&self.s3_bucket)
-            .key(self.get_stored_path(cid))
-            .acl(ObjectCannedAcl::PublicRead)
+            .key(self.get_stored_path(cid));
+        let request = if Self::should_apply_public_read_acl() {
+            request.acl(ObjectCannedAcl::PublicRead)
+        } else {
+            request
+        };
+        request
             .send()
             .await?;
         Ok(())
@@ -199,7 +215,8 @@ impl S3BlobStore {
     }
 
     async fn move_object(&self, keys: MoveObject) -> Result<()> {
-        self.client
+        let request = self
+            .client
             .copy_object()
             .bucket(&self.s3_bucket)
             .copy_source(format!(
@@ -208,8 +225,13 @@ impl S3BlobStore {
                 self.bucket,
                 keys.from
             ))
-            .key(keys.to)
-            .acl(ObjectCannedAcl::PublicRead)
+            .key(keys.to);
+        let request = if Self::should_apply_public_read_acl() {
+            request.acl(ObjectCannedAcl::PublicRead)
+        } else {
+            request
+        };
+        request
             .send()
             .await?;
         self.client
@@ -219,5 +241,25 @@ impl S3BlobStore {
             .send()
             .await?;
         Ok(())
+    }
+}
+
+fn endpoint_supports_object_acl(endpoint: Option<&str>) -> bool {
+    !matches!(endpoint, Some(value) if value.contains("storage.googleapis.com"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::endpoint_supports_object_acl;
+
+    #[test]
+    fn gcs_endpoint_disables_object_acl() {
+        assert!(!endpoint_supports_object_acl(Some("https://storage.googleapis.com")));
+    }
+
+    #[test]
+    fn non_gcs_endpoint_keeps_object_acl() {
+        assert!(endpoint_supports_object_acl(Some("https://s3.us-west-2.amazonaws.com")));
+        assert!(endpoint_supports_object_acl(None));
     }
 }
