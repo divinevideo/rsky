@@ -2,7 +2,7 @@ FROM rust:1.86-bookworm AS builder
 
 WORKDIR /usr/src/rsky
 COPY . .
-ENV CARGO_BUILD_JOBS=1
+ENV CARGO_BUILD_JOBS=8
 RUN cargo build --release --package rsky-pds --jobs "${CARGO_BUILD_JOBS}"
 
 FROM debian:bookworm-slim
