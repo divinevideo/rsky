@@ -756,11 +756,28 @@ pub async fn validate_bearer_token<'r>(
     let token = bearer_token_from_req(request)?;
     if let Some(token) = token {
         let secp = Secp256k1::new();
-        let private_key = env::var("PDS_JWT_KEY_K256_PRIVATE_KEY_HEX").unwrap();
-        let secret_key =
-            SecretKey::from_slice(&hex::decode(private_key.as_bytes()).unwrap()).unwrap();
-        let jwt_key = Keypair::from_secret_key(&secp, &secret_key);
-        let payload = verify_jwt(token.clone(), jwt_key, verify_options).await?;
+        // Try JWT key first (for session tokens)
+        let jwt_private_key = env::var("PDS_JWT_KEY_K256_PRIVATE_KEY_HEX").unwrap();
+        let jwt_secret_key =
+            SecretKey::from_slice(&hex::decode(jwt_private_key.as_bytes()).unwrap()).unwrap();
+        let jwt_key = Keypair::from_secret_key(&secp, &jwt_secret_key);
+        let payload = match verify_jwt(token.clone(), jwt_key, verify_options.clone()).await {
+            Ok(payload) => payload,
+            Err(_jwt_err) => {
+                // Fall back to repo signing key (for service auth tokens
+                // that come back from external services like video.bsky.app)
+                let repo_key_hex = env::var("PDS_REPO_SIGNING_KEY_K256_PRIVATE_KEY_HEX")
+                    .unwrap_or_default();
+                if repo_key_hex.is_empty() {
+                    return Err(_jwt_err);
+                }
+                let repo_secret_key = SecretKey::from_slice(
+                    &hex::decode(repo_key_hex.as_bytes()).unwrap(),
+                ).unwrap();
+                let repo_key = Keypair::from_secret_key(&secp, &repo_secret_key);
+                verify_jwt(token.clone(), repo_key, verify_options).await?
+            }
+        };
         let JwtPayload {
             sub, aud, scope, ..
         } = payload.clone();
