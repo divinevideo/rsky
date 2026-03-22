@@ -781,8 +781,16 @@ pub async fn validate_bearer_token<'r>(
         let JwtPayload {
             sub, aud, scope, ..
         } = payload.clone();
-        let sub = sub.unwrap();
-        let aud = aud.unwrap();
+        // Service auth tokens use 'iss' (mapped to 'sub' by jwt_simple) but may also
+        // have it only in the issuer field. Fall back to empty if not present.
+        let sub = match sub {
+            Some(s) => s,
+            None => bail!("BadJwt: missing sub/iss in token"),
+        };
+        let aud = match aud {
+            Some(a) => a,
+            None => bail!("BadJwt: missing aud in token"),
+        };
         if !sub.starts_with("did:") {
             bail!("Malformed token")
         }
