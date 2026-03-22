@@ -197,10 +197,7 @@ impl S3BlobStore {
     }
 
     async fn move_object(&self, keys: MoveObject) -> Result<()> {
-        let copy_source = match env_str("AWS_ENDPOINT_BUCKET") {
-            Some(endpoint_bucket) => format!("{}/{}/{}", endpoint_bucket, self.bucket, keys.from),
-            None => format!("{}/{}", self.s3_bucket, keys.from),
-        };
+        let copy_source = format!("{}/{}", self.s3_bucket, keys.from);
         self.client
             .copy_object()
             .bucket(&self.s3_bucket)

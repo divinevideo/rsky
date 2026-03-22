@@ -998,8 +998,15 @@ pub async fn verify_jwt(
     let public_key = key.public_key();
     let claims = public_key.verify_token::<CustomClaimObj>(&jwt, verify_options)?;
 
+    let scope = if claims.custom.scope.is_empty() {
+        // Service auth tokens (from video.bsky.app etc.) don't have scope,
+        // they have lxm instead. Default to Access scope.
+        AuthScope::Access
+    } else {
+        AuthScope::from_str(&claims.custom.scope)?
+    };
     Ok(JwtPayload {
-        scope: AuthScope::from_str(&claims.custom.scope)?,
+        scope,
         sub: claims.subject,
         aud: claims.audiences,
         exp: claims.expires_at,
