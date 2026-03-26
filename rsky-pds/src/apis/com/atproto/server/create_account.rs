@@ -4,7 +4,7 @@ use crate::actor_store::aws::s3::S3BlobStore;
 use crate::actor_store::ActorStore;
 use crate::apis::com::atproto::server::safe_resolve_did_doc;
 use crate::apis::ApiError;
-use crate::auth_verifier::UserDidAuthOptional;
+use crate::auth_verifier::OptionalAccessOrAdminToken;
 use crate::config::ServerConfig;
 use crate::db::DbConn;
 use crate::handle::{normalize_and_validate_handle, HandleValidationContext, HandleValidationOpts};
@@ -44,7 +44,7 @@ pub struct TransformedCreateAccountInput {
 )]
 pub async fn server_create_account(
     body: Json<CreateAccountInput>,
-    auth: UserDidAuthOptional,
+    auth: OptionalAccessOrAdminToken,
     sequencer: &State<SharedSequencer>,
     s3_config: &State<SdkConfig>,
     cfg: &State<ServerConfig>,
@@ -53,6 +53,12 @@ pub async fn server_create_account(
     db: DbConn,
 ) -> Result<Json<CreateAccountOutput>, ApiError> {
     tracing::info!("Creating new user account");
+    let is_admin = auth
+        .access
+        .as_ref()
+        .and_then(|a| a.credentials.as_ref())
+        .map(|c| c.r#type == "admin_token")
+        .unwrap_or(false);
     let requester = match auth.access {
         Some(access) if access.credentials.is_some() => access.credentials.unwrap().iss,
         _ => None,
@@ -72,6 +78,7 @@ pub async fn server_create_account(
         id_resolver,
         body.into_inner(),
         requester,
+        is_admin,
         &account_manager,
     )
     .await?;
@@ -234,18 +241,29 @@ pub async fn server_create_account(
     }))
 }
 
-/// Validates Create Account Parameters and builds PLC Operation if needed
+/// Validates Create Account Parameters and builds PLC Operation if needed.
+///
+/// When `is_admin` is true and a pre-existing DID is supplied, the invite
+/// code, email, and password requirements are relaxed.  This is the path
+/// used by divine-atbridge to provision accounts on behalf of authenticated
+/// users coming through login.divine.video / keycast.
 pub async fn validate_inputs_for_local_pds(
     cfg: &State<ServerConfig>,
     id_resolver: &State<SharedIdResolver>,
     input: CreateAccountInput,
     requester: Option<String>,
+    is_admin: bool,
     account_manager: &AccountManager,
 ) -> Result<TransformedCreateAccountInput, ApiError> {
     let did: String;
     let plc_op;
     let deactivated: bool;
     let email;
+
+    // Admin-authenticated requests that supply a pre-existing DID (the
+    // divine-atbridge provisioning flow) skip invite, email, and password
+    // checks.  All other callers must satisfy every requirement.
+    let is_admin_import = is_admin && input.did.is_some();
 
     //PLC Op Validation
     if input.plc_op.is_some() {
@@ -255,24 +273,31 @@ pub async fn validate_inputs_for_local_pds(
     }
 
     //Invite Code Validation
-    let invite_code = if cfg.invites.required && input.invite_code.is_none() {
+    let invite_code = if !is_admin_import && cfg.invites.required && input.invite_code.is_none() {
         return Err(ApiError::InvalidInviteCode);
     } else {
         input.invite_code.clone()
     };
 
-    //Email Validation
-    if input.email.is_none() {
-        return Err(ApiError::InvalidEmail);
-    };
-    match input.email {
-        None => return Err(ApiError::InvalidEmail),
-        Some(ref input_email) => {
-            let e_slice: &str = &input_email[..]; // take a full slice of the string
-            if !EmailAddress::is_valid(e_slice) {
-                return Err(ApiError::InvalidEmail);
-            } else {
-                email = input_email.clone();
+    //Email Validation — admin imports use a placeholder
+    if is_admin_import {
+        email = input
+            .email
+            .clone()
+            .unwrap_or_else(|| format!("noreply+{}@divine.video", input.handle));
+    } else {
+        if input.email.is_none() {
+            return Err(ApiError::InvalidEmail);
+        };
+        match input.email {
+            None => return Err(ApiError::InvalidEmail),
+            Some(ref input_email) => {
+                let e_slice: &str = &input_email[..];
+                if !EmailAddress::is_valid(e_slice) {
+                    return Err(ApiError::InvalidEmail);
+                } else {
+                    email = input_email.clone();
+                }
             }
         }
     }
@@ -294,17 +319,28 @@ pub async fn validate_inputs_for_local_pds(
 
     // Check Handle and Email are still available
     let handle_accnt = account_manager.get_account(&handle, None).await?;
-    let email_accnt = account_manager.get_account_by_email(&email, None).await?;
     if handle_accnt.is_some() {
         return Err(ApiError::HandleNotAvailable);
-    } else if email_accnt.is_some() {
-        return Err(ApiError::EmailNotAvailable);
+    }
+    if !is_admin_import {
+        let email_accnt = account_manager.get_account_by_email(&email, None).await?;
+        if email_accnt.is_some() {
+            return Err(ApiError::EmailNotAvailable);
+        }
     }
 
-    // Check password  exists
-    let password = match input.password {
-        None => return Err(ApiError::InvalidPassword),
-        Some(ref pass) => pass.clone(),
+    // Check password exists — admin imports generate a random password
+    let password = if is_admin_import {
+        input.password.clone().unwrap_or_else(|| {
+            use rand::Rng;
+            let bytes: [u8; 32] = rand::thread_rng().gen();
+            hex::encode(bytes)
+        })
+    } else {
+        match input.password {
+            None => return Err(ApiError::InvalidPassword),
+            Some(ref pass) => pass.clone(),
+        }
     };
 
     // Get Signing Key
