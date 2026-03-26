@@ -2,7 +2,8 @@ FROM rust:1.86-bookworm AS builder
 
 WORKDIR /usr/src/rsky
 COPY . .
-ENV CARGO_BUILD_JOBS=8
+ARG CARGO_BUILD_JOBS=4
+ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
 ENV CARGO_PROFILE_RELEASE_DEBUG=0
 RUN cargo build --release --package rsky-pds --jobs "${CARGO_BUILD_JOBS}"
 
