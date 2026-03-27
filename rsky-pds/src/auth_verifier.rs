@@ -1013,9 +1013,12 @@ pub async fn verify_jwt(
     } else {
         AuthScope::from_str(&claims.custom.scope)?
     };
+    // Service auth tokens (e.g. from video.bsky.app) use 'iss' instead of 'sub'.
+    // Fall back to issuer when subject is absent.
+    let sub = claims.subject.or_else(|| claims.issuer.clone());
     Ok(JwtPayload {
         scope,
-        sub: claims.subject,
+        sub,
         aud: claims.audiences,
         exp: claims.expires_at,
         iat: claims.issued_at,
