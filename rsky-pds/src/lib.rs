@@ -6,7 +6,6 @@ extern crate serde;
 use crate::read_after_write::viewer::{LocalViewer, LocalViewerCreator, LocalViewerCreatorParams};
 use crate::sequencer::Sequencer;
 use atrium_xrpc_client::reqwest::ReqwestClient;
-use event_emitter_rs::EventEmitter;
 use lazy_static::lazy_static;
 pub mod account_manager;
 pub mod actor_store;
@@ -62,10 +61,12 @@ pub struct SharedATPAgent {
     pub app_view_agent: Option<RwLock<AtpServiceClient<ReqwestClient>>>,
 }
 
-// Use lazy_static! because the size of EventEmitter is not known at compile time
-lazy_static! {
-    // Export the emitter with `pub` keyword
-    pub static ref EVENT_EMITTER: RwLock<EventEmitter> = RwLock::new(EventEmitter::new());
+use crate::sequencer::events::SeqEvt;
+
+/// Broadcast channel for firehose events. The background sequencer sends events
+/// here, and each subscribe_repos WebSocket subscriber receives them.
+pub struct SeqEventBroadcast {
+    pub sender: tokio::sync::broadcast::Sender<Vec<SeqEvt>>,
 }
 
 extern crate rocket;
@@ -237,6 +238,11 @@ pub async fn build_rocket(cfg: Option<RocketConfig>) -> Rocket<Build> {
         .merge(("limits", Limits::default().limit("file", 100.mebibytes())));
     let cfg = env_to_cfg();
 
+    let (seq_tx, _) = tokio::sync::broadcast::channel::<Vec<SeqEvt>>(256);
+    let seq_broadcast = SeqEventBroadcast {
+        sender: seq_tx.clone(),
+    };
+
     let sequencer = SharedSequencer {
         sequencer: RwLock::new(Sequencer::new(
             Crawlers::new(cfg.service.hostname.clone(), cfg.crawlers.clone()),
@@ -247,13 +253,19 @@ pub async fn build_rocket(cfg: Option<RocketConfig>) -> Rocket<Build> {
     std::thread::Builder::new()
         .name("sequencer".into())
         .spawn(move || {
+            eprintln!("[sequencer] thread started");
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .expect("failed to build sequencer runtime");
             rt.block_on(async move {
-                if let Err(e) = background_sequencer.start().await {
-                    tracing::error!("Sequencer exited with error: {e}");
+                eprintln!("[sequencer] runtime ready, calling start()");
+                match background_sequencer.start(seq_tx).await {
+                    Ok(()) => eprintln!("[sequencer] start() returned Ok"),
+                    Err(e) => {
+                        eprintln!("[sequencer] start() returned Err: {e}");
+                        tracing::error!("Sequencer exited with error: {e}");
+                    }
                 }
             });
         })
@@ -392,6 +404,7 @@ pub async fn build_rocket(cfg: Option<RocketConfig>) -> Rocket<Build> {
                 bsky_api_get_forwarder,
                 bsky_api_post_forwarder,
                 well_known::well_known,
+                well_known::did_json,
                 all_options
             ],
         )
@@ -400,6 +413,7 @@ pub async fn build_rocket(cfg: Option<RocketConfig>) -> Rocket<Build> {
         .attach(DbConn::fairing())
         .attach(shield)
         .manage(sequencer)
+        .manage(seq_broadcast)
         .manage(aws_sdk_config)
         .manage(id_resolver)
         .manage(cfg)

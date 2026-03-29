@@ -5,7 +5,7 @@ use aws_config::SdkConfig;
 use aws_sdk_s3 as s3;
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::types::{Delete, ObjectCannedAcl, ObjectIdentifier};
+use aws_sdk_s3::types::{Delete, ObjectIdentifier};
 use lexicon_cid::Cid;
 use rsky_common::env::env_str;
 use rsky_common::get_random_str;
@@ -58,25 +58,14 @@ impl S3BlobStore {
         format!("quarantine/{0}/{1}", self.bucket, cid)
     }
 
-    fn should_apply_public_read_acl() -> bool {
-        endpoint_supports_object_acl(env_str("AWS_ENDPOINT").as_deref())
-    }
-
     pub async fn put_temp(&self, bytes: Vec<u8>) -> Result<String> {
         let key = self.gen_key();
         let body = ByteStream::from(bytes);
-        let request = self
-            .client
+        self.client
             .put_object()
             .body(body)
             .bucket(&self.s3_bucket)
-            .key(self.get_tmp_path(&key));
-        let request = if Self::should_apply_public_read_acl() {
-            request.acl(ObjectCannedAcl::PublicRead)
-        } else {
-            request
-        };
-        request
+            .key(self.get_tmp_path(&key))
             .send()
             .await?;
         Ok(key)
@@ -99,18 +88,11 @@ impl S3BlobStore {
 
     pub async fn put_permanent(&self, cid: Cid, bytes: Vec<u8>) -> Result<()> {
         let body = ByteStream::from(bytes);
-        let request = self
-            .client
+        self.client
             .put_object()
             .body(body)
             .bucket(&self.s3_bucket)
-            .key(self.get_stored_path(cid));
-        let request = if Self::should_apply_public_read_acl() {
-            request.acl(ObjectCannedAcl::PublicRead)
-        } else {
-            request
-        };
-        request
+            .key(self.get_stored_path(cid))
             .send()
             .await?;
         Ok(())
@@ -215,18 +197,12 @@ impl S3BlobStore {
     }
 
     async fn move_object(&self, keys: MoveObject) -> Result<()> {
-        let request = self
-            .client
+        let copy_source = format!("{}/{}", self.s3_bucket, keys.from);
+        self.client
             .copy_object()
             .bucket(&self.s3_bucket)
-            .copy_source(format_copy_source(&self.s3_bucket, &keys.from))
-            .key(keys.to);
-        let request = if Self::should_apply_public_read_acl() {
-            request.acl(ObjectCannedAcl::PublicRead)
-        } else {
-            request
-        };
-        request
+            .copy_source(copy_source)
+            .key(keys.to)
             .send()
             .await?;
         self.client
@@ -236,40 +212,5 @@ impl S3BlobStore {
             .send()
             .await?;
         Ok(())
-    }
-}
-
-fn endpoint_supports_object_acl(endpoint: Option<&str>) -> bool {
-    !matches!(endpoint, Some(value) if value.contains("storage.googleapis.com"))
-}
-
-fn format_copy_source(bucket: &str, key: &str) -> String {
-    format!("{bucket}/{key}")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{endpoint_supports_object_acl, format_copy_source};
-
-    #[test]
-    fn gcs_endpoint_disables_object_acl() {
-        assert!(!endpoint_supports_object_acl(Some("https://storage.googleapis.com")));
-    }
-
-    #[test]
-    fn non_gcs_endpoint_keeps_object_acl() {
-        assert!(endpoint_supports_object_acl(Some("https://s3.us-west-2.amazonaws.com")));
-        assert!(endpoint_supports_object_acl(None));
-    }
-
-    #[test]
-    fn copy_source_uses_bucket_and_object_key_once() {
-        assert_eq!(
-            format_copy_source(
-                "divine-pds-blobs-staging",
-                "tmp/did:plc:ebt5msdpfavoklkap6gl54bm/dTvI9ekk72DT6PxuYH6q3k6GCVPHPSTB",
-            ),
-            "divine-pds-blobs-staging/tmp/did:plc:ebt5msdpfavoklkap6gl54bm/dTvI9ekk72DT6PxuYH6q3k6GCVPHPSTB",
-        );
     }
 }

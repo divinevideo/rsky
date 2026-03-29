@@ -756,16 +756,41 @@ pub async fn validate_bearer_token<'r>(
     let token = bearer_token_from_req(request)?;
     if let Some(token) = token {
         let secp = Secp256k1::new();
-        let private_key = env::var("PDS_JWT_KEY_K256_PRIVATE_KEY_HEX").unwrap();
-        let secret_key =
-            SecretKey::from_slice(&hex::decode(private_key.as_bytes()).unwrap()).unwrap();
-        let jwt_key = Keypair::from_secret_key(&secp, &secret_key);
-        let payload = verify_jwt(token.clone(), jwt_key, verify_options).await?;
+        // Try JWT key first (for session tokens)
+        let jwt_private_key = env::var("PDS_JWT_KEY_K256_PRIVATE_KEY_HEX").unwrap();
+        let jwt_secret_key =
+            SecretKey::from_slice(&hex::decode(jwt_private_key.as_bytes()).unwrap()).unwrap();
+        let jwt_key = Keypair::from_secret_key(&secp, &jwt_secret_key);
+        let payload = match verify_jwt(token.clone(), jwt_key, verify_options.clone()).await {
+            Ok(payload) => payload,
+            Err(_jwt_err) => {
+                // Fall back to repo signing key (for service auth tokens
+                // that come back from external services like video.bsky.app)
+                let repo_key_hex = env::var("PDS_REPO_SIGNING_KEY_K256_PRIVATE_KEY_HEX")
+                    .unwrap_or_default();
+                if repo_key_hex.is_empty() {
+                    return Err(_jwt_err);
+                }
+                let repo_secret_key = SecretKey::from_slice(
+                    &hex::decode(repo_key_hex.as_bytes()).unwrap(),
+                ).unwrap();
+                let repo_key = Keypair::from_secret_key(&secp, &repo_secret_key);
+                verify_jwt(token.clone(), repo_key, verify_options).await?
+            }
+        };
         let JwtPayload {
             sub, aud, scope, ..
         } = payload.clone();
-        let sub = sub.unwrap();
-        let aud = aud.unwrap();
+        // Service auth tokens use 'iss' (mapped to 'sub' by jwt_simple) but may also
+        // have it only in the issuer field. Fall back to empty if not present.
+        let sub = match sub {
+            Some(s) => s,
+            None => bail!("BadJwt: missing sub/iss in token"),
+        };
+        let aud = match aud {
+            Some(a) => a,
+            None => bail!("BadJwt: missing aud in token"),
+        };
         if !sub.starts_with("did:") {
             bail!("Malformed token")
         }
@@ -981,9 +1006,19 @@ pub async fn verify_jwt(
     let public_key = key.public_key();
     let claims = public_key.verify_token::<CustomClaimObj>(&jwt, verify_options)?;
 
+    let scope = if claims.custom.scope.is_empty() {
+        // Service auth tokens (from video.bsky.app etc.) don't have scope,
+        // they have lxm instead. Default to Access scope.
+        AuthScope::Access
+    } else {
+        AuthScope::from_str(&claims.custom.scope)?
+    };
+    // Service auth tokens (e.g. from video.bsky.app) use 'iss' instead of 'sub'.
+    // Fall back to issuer when subject is absent.
+    let sub = claims.subject.or_else(|| claims.issuer.clone());
     Ok(JwtPayload {
-        scope: AuthScope::from_str(&claims.custom.scope)?,
-        sub: claims.subject,
+        scope,
+        sub,
         aud: claims.audiences,
         exp: claims.expires_at,
         iat: claims.issued_at,
