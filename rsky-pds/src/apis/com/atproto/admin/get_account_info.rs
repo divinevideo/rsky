@@ -2,10 +2,10 @@ use crate::account_manager::helpers::account::AvailabilityFlags;
 use crate::account_manager::AccountManager;
 use crate::apis::ApiError;
 use crate::auth_verifier::Moderator;
+use crate::config::configured_entryway_url;
 use anyhow::{bail, Result};
 use futures::try_join;
 use rocket::serde::json::Json;
-use rsky_common::env::env_str;
 use rsky_lexicon::com::atproto::admin::AccountView;
 use rsky_syntax::handle::INVALID_HANDLE;
 
@@ -25,7 +25,7 @@ async fn inner_get_account_info(
         account_manager.get_invited_by_for_accounts(vec![did.clone()])
     )?;
     if let Some(account) = account {
-        let manages_own_invites = env_str("PDS_ENTRYWAY_URL").is_none();
+        let manages_own_invites = configured_entryway_url().is_none();
         Ok(AccountView {
             did: account.did,
             handle: account.handle.unwrap_or(INVALID_HANDLE.to_string()),

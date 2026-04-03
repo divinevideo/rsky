@@ -404,8 +404,8 @@ pub async fn build_rocket(cfg: Option<RocketConfig>) -> Rocket<Build> {
                 bsky_api_get_forwarder,
                 bsky_api_post_forwarder,
                 well_known::well_known,
-                well_known::did_json,
                 well_known::oauth_protected_resource,
+                well_known::did_json,
                 all_options
             ],
         )

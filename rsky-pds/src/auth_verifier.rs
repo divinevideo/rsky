@@ -2,6 +2,7 @@ use crate::account_manager::helpers::account::{ActorAccount, AvailabilityFlags};
 use crate::account_manager::helpers::auth::CustomClaimObj;
 use crate::account_manager::AccountManager;
 use crate::apis::ApiError;
+use crate::config::configured_entryway_did;
 use crate::xrpc_server::auth::{verify_jwt as verify_service_jwt_server, ServiceJwtPayload};
 use crate::SharedIdResolver;
 use anyhow::{bail, Result};
@@ -533,6 +534,7 @@ impl<'r> FromRequest<'r> for ModService {
     async fn from_request(req: &'r Request<'_>) -> Outcome<Self, Self::Error> {
         if let Some(mod_service_did) = env_str("PDS_MOD_SERVICE_DID") {
             let id_resolver = req.guard::<&State<SharedIdResolver>>().await.unwrap();
+            let entryway_did = configured_entryway_did();
             match verify_service_jwt(
                 req,
                 id_resolver,
@@ -546,32 +548,34 @@ impl<'r> FromRequest<'r> for ModService {
             )
             .await
             {
-                Ok(payload)
-                    if Some(payload.aud.clone()) != env_str("PDS_SERVICE_DID")
-                        && (env_str("PDS_ENTRYWAY_DID").is_none()
-                            || Some(payload.aud.clone()) != env_str("PDS_ENTRYWAY_DID")) =>
-                {
-                    let error = AuthError::BadJwtAudience(
-                        "jwt audience does not match service did".to_string(),
-                    );
-                    req.local_cache(|| Some(ApiError::InvalidRequest(error.to_string())));
-                    Outcome::Error((Status::BadRequest, error))
+                Ok(payload) => {
+                    let is_service_aud = Some(payload.aud.clone()) == env_str("PDS_SERVICE_DID");
+                    let is_entryway_aud =
+                        entryway_did.as_ref() == Some(&payload.aud);
+                    if !is_service_aud && !is_entryway_aud {
+                        let error = AuthError::BadJwtAudience(
+                            "jwt audience does not match service did".to_string(),
+                        );
+                        req.local_cache(|| Some(ApiError::InvalidRequest(error.to_string())));
+                        Outcome::Error((Status::BadRequest, error))
+                    } else {
+                        Outcome::Success(ModService {
+                            access: AccessOutput {
+                                credentials: Some(Credentials {
+                                    r#type: "mod_service".to_string(),
+                                    did: None,
+                                    scope: None,
+                                    audience: None,
+                                    token_id: None,
+                                    aud: Some(payload.aud),
+                                    iss: Some(payload.iss),
+                                    is_privileged: None,
+                                }),
+                                artifacts: None,
+                            },
+                        })
+                    }
                 }
-                Ok(payload) => Outcome::Success(ModService {
-                    access: AccessOutput {
-                        credentials: Some(Credentials {
-                            r#type: "mod_service".to_string(),
-                            did: None,
-                            scope: None,
-                            audience: None,
-                            token_id: None,
-                            aud: Some(payload.aud),
-                            iss: Some(payload.iss),
-                            is_privileged: None,
-                        }),
-                        artifacts: None,
-                    },
-                }),
                 Err(error) => {
                     let error = AuthError::BadJwt(error.to_string());
                     req.local_cache(|| Some(ApiError::InvalidRequest(error.to_string())));

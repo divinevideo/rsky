@@ -246,7 +246,7 @@ pub async fn server_create_account(
 /// When `is_admin` is true and a pre-existing DID is supplied, the invite
 /// code, email, and password requirements are relaxed.  This is the path
 /// used by divine-atbridge to provision accounts on behalf of authenticated
-/// users coming through login.divine.video / keycast.
+/// users coming through keycast.
 pub async fn validate_inputs_for_local_pds(
     cfg: &State<ServerConfig>,
     id_resolver: &State<SharedIdResolver>,
