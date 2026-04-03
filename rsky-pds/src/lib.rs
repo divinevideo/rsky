@@ -464,6 +464,7 @@ mod tests {
                 cache_state_ttl: 60_000,
                 cache_max_ttl: 120_000,
                 recovery_did_key: None,
+                oauth_authorization_server: None,
                 service_handle_domains: vec![".staging.dvines.org".to_string()],
                 handle_backup_name_servers: Some(vec!["1.1.1.1".to_string()]),
                 enable_did_doc_with_session: false,
