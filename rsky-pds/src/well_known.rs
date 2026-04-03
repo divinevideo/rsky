@@ -1,5 +1,5 @@
 use crate::account_manager::AccountManager;
-use crate::config::ServerConfig;
+use crate::config::{entryway_url, ServerConfig};
 use anyhow::Result;
 use rocket::http::Status;
 use rocket::request::{FromRequest, Outcome};
@@ -69,17 +69,11 @@ pub async fn well_known(
 #[rocket::get("/.well-known/oauth-protected-resource")]
 pub async fn oauth_protected_resource(
     cfg: &State<ServerConfig>,
-) -> Result<Json<OAuthProtectedResourceMetadata>, status::Custom<String>> {
-    match cfg.identity.oauth_authorization_server.clone() {
-        Some(authorization_server) => Ok(Json(OAuthProtectedResourceMetadata {
-            resource: cfg.service.public_url.clone(),
-            authorization_servers: vec![authorization_server],
-        })),
-        None => Err(status::Custom(
-            Status::NotFound,
-            "OAuth protected resource metadata not configured".to_string(),
-        )),
-    }
+) -> Json<OAuthProtectedResourceMetadata> {
+    Json(OAuthProtectedResourceMetadata {
+        resource: cfg.service.public_url.clone(),
+        authorization_servers: vec![entryway_url()],
+    })
 }
 
 /// did:web DID document for service-to-service auth.

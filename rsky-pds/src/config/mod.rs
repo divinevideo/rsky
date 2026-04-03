@@ -4,6 +4,8 @@ use reqwest::header::HeaderMap;
 use rsky_common::env::{env_bool, env_int, env_list, env_str};
 use rsky_common::time::{DAY, HOUR, SECOND};
 
+pub const DEFAULT_ENTRYWAY_URL: &str = "https://entryway.divine.video";
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ServerConfig {
     pub service: CoreConfig,
@@ -63,6 +65,18 @@ pub struct CoreConfig {
     pub blob_upload_limit: usize,
     pub contact_email_address: Option<String>,
     pub dev_mode: bool,
+}
+
+pub fn configured_entryway_url() -> Option<String> {
+    env_str("PDS_ENTRYWAY_URL")
+}
+
+pub fn entryway_url() -> String {
+    configured_entryway_url().unwrap_or_else(|| DEFAULT_ENTRYWAY_URL.to_string())
+}
+
+pub fn configured_entryway_did() -> Option<String> {
+    env_str("PDS_ENTRYWAY_DID")
 }
 
 pub fn env_to_cfg() -> ServerConfig {

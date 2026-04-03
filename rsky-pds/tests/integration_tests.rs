@@ -29,6 +29,32 @@ async fn test_robots_txt() {
 }
 
 #[tokio::test]
+async fn test_oauth_protected_resource_metadata() {
+    let configured_entryway_url = "https://entryway-configured.example";
+    unsafe {
+        std::env::set_var("PDS_ENTRYWAY_URL", configured_entryway_url);
+    }
+    let postgres = common::get_postgres().await;
+    let client = common::get_client(&postgres).await;
+    let response = client
+        .get("/.well-known/oauth-protected-resource")
+        .dispatch()
+        .await;
+    let response_status = response.status();
+    let response_body = response.into_json::<serde_json::Value>().await.unwrap();
+
+    assert_eq!(response_status, Status::Ok);
+    assert_eq!(
+        response_body["authorization_servers"],
+        json!([configured_entryway_url])
+    );
+    assert_eq!(
+        response_body["resource"],
+        json!(client.rocket().state::<ServerConfig>().unwrap().service.public_url)
+    );
+}
+
+#[tokio::test]
 async fn test_create_invite_code() {
     let postgres = common::get_postgres().await;
     let client = common::get_client(&postgres).await;
