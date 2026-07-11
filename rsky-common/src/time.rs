@@ -37,10 +37,12 @@ pub fn from_str_to_utc(str: &String) -> DateTime<UtcOffset> {
         .and_utc()
 }
 
-#[allow(deprecated)]
 pub fn from_micros_to_utc(micros: i64) -> DateTime<UtcOffset> {
-    let nanoseconds = 230 * 1000000;
-    DateTime::<Utc>::from_utc(NaiveDateTime::from_timestamp(micros, nanoseconds), Utc)
+    // NaiveDateTime::from_timestamp takes SECONDS; passing microseconds here
+    // used to overflow chrono's range and panic ("invalid or out-of-range
+    // datetime"), which broke every refreshSession call.
+    DateTime::from_timestamp_micros(micros)
+        .unwrap_or_else(|| panic!("timestamp out of range: {micros} micros"))
 }
 
 pub fn from_micros_to_str(micros: i64) -> String {

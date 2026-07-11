@@ -23,14 +23,13 @@ pub async fn inner_get_service_auth(
     // We just use the repo signing key
     let private_key = env::var("PDS_REPO_SIGNING_KEY_K256_PRIVATE_KEY_HEX").unwrap();
     let keypair = SecretKey::from_slice(&hex::decode(private_key.as_bytes()).unwrap()).unwrap();
-    let exp = match exp {
-        None => None,
-        Some(exp) => Some(exp * 1000),
-    };
+    // `exp` is Unix epoch SECONDS per the lexicon; from_micros_to_utc needs
+    // microseconds. (The previous *1000 produced milliseconds, so any
+    // client-supplied expiration failed validation.)
     if let Some(exp) = exp {
         let system_time = SystemTime::now();
         let now: DateTime<UtcOffset> = system_time.into();
-        let diff = from_micros_to_utc(exp as i64) - now;
+        let diff = from_micros_to_utc((exp as i64) * 1_000_000) - now;
         if diff.num_milliseconds() < 0 {
             bail!("BadExpiration: expiration is in past");
         } else if diff.num_milliseconds() > HOUR as i64 {
@@ -47,10 +46,13 @@ pub async fn inner_get_service_auth(
             bail!("insufficient access to request a service auth token for the following method: {lxm}");
         }
     }
+    // Honor the validated client-requested expiration (previously dropped,
+    // forcing every token to the 60s default — too short for callers like
+    // video.bsky.app that hold the token across a transcode).
     create_service_jwt(ServiceJwtParams {
         iss: did,
         aud,
-        exp: None,
+        exp,
         lxm,
         jti: None,
         keypair,

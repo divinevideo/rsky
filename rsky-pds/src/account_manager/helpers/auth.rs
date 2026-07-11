@@ -4,7 +4,7 @@ use crate::models;
 use anyhow::Result;
 use diesel::*;
 use jwt_simple::prelude::*;
-use rsky_common::time::{from_micros_to_utc, MINUTE};
+use rsky_common::time::{from_micros_to_utc, MINUTE, SECOND};
 use rsky_common::{get_random_str, json_to_b64url, RFC3339_VARIANT};
 use secp256k1::{Keypair, Message, SecretKey};
 use sha2::{Digest, Sha256};
@@ -162,13 +162,16 @@ pub async fn create_service_jwt(params: ServiceJwtParams) -> Result<String> {
     let ServiceJwtParams {
         iss, aud, keypair, ..
     } = params;
-    let now = SystemTime::now()
+    // JWT exp is NumericDate: SECONDS since the epoch (RFC 7519). MINUTE is in
+    // milliseconds. The previous math ((now_micros + 60_000)/1000) produced a
+    // milliseconds value that no spec-compliant verifier interprets correctly.
+    let now_secs = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
-        .expect("timestamp in micros since UNIX epoch")
-        .as_micros() as usize;
+        .expect("timestamp since UNIX epoch")
+        .as_secs();
     let exp = params
         .exp
-        .unwrap_or(((now + MINUTE as usize) / 1000) as u64);
+        .unwrap_or(now_secs + (MINUTE / SECOND) as u64);
     let lxm = params.lxm;
     let jti = get_random_str();
     let header = ServiceJwtHeader {
@@ -226,7 +229,10 @@ pub async fn store_refresh_token(
 ) -> Result<()> {
     use crate::schema::pds::refresh_token::dsl as RefreshTokenSchema;
 
-    let exp = from_micros_to_utc((payload.exp.as_millis() / 1000) as i64);
+    // payload.exp is a coarsetime Duration since the epoch; from_micros_to_utc
+    // needs microseconds (the previous seconds value only produced correct
+    // dates because from_micros_to_utc itself misread its input as seconds).
+    let exp = from_micros_to_utc((payload.exp.as_millis() as i64) * 1000);
 
     db.run(move |conn| {
         insert_into(RefreshTokenSchema::refresh_token)

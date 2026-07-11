@@ -56,11 +56,21 @@ where
             let parts_1 = *parts_1;
             let sig = *sig;
             let payload = parse_payload(parts_1)?;
+            // JWT exp is NumericDate: SECONDS since the epoch (RFC 7519). The
+            // previous check compared against microseconds, which rejected
+            // every spec-compliant token as expired. Tolerate legacy tokens
+            // that were minted with a milliseconds exp (13-digit values) by
+            // normalising them down to seconds before comparing.
             let now = SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
-                .expect("timestamp in micros since UNIX epoch")
-                .as_micros();
-            if now > payload.exp as u128 {
+                .expect("timestamp since UNIX epoch")
+                .as_secs();
+            let exp_secs = if payload.exp > 100_000_000_000 {
+                payload.exp / 1000
+            } else {
+                payload.exp
+            };
+            if now > exp_secs {
                 bail!("JwtExpired: jwt expired")
             }
             if own_did.is_some() && payload.aud != own_did.unwrap() {
@@ -114,7 +124,7 @@ where
             Ok(ServiceJwtPayload {
                 iss: payload.iss,
                 aud: payload.aud,
-                exp: Some(Duration::from_micros(payload.exp)),
+                exp: Some(Duration::from_secs(exp_secs)),
             })
         }
         _ => bail!("BadJwt: poorly formatted jwt"),
