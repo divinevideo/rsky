@@ -169,9 +169,7 @@ pub async fn create_service_jwt(params: ServiceJwtParams) -> Result<String> {
         .duration_since(SystemTime::UNIX_EPOCH)
         .expect("timestamp since UNIX epoch")
         .as_secs();
-    let exp = params
-        .exp
-        .unwrap_or(now_secs + (MINUTE / SECOND) as u64);
+    let exp = params.exp.unwrap_or(now_secs + (MINUTE / SECOND) as u64);
     let lxm = params.lxm;
     let jti = get_random_str();
     let header = ServiceJwtHeader {

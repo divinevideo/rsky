@@ -426,7 +426,9 @@ pub async fn build_rocket(cfg: Option<RocketConfig>) -> Rocket<Build> {
 #[cfg(test)]
 mod tests {
     use crate::build_id_resolver;
-    use crate::config::{CoreConfig, IdentityConfig, InvitesConfig, ServerConfig, SubscriptionConfig};
+    use crate::config::{
+        CoreConfig, IdentityConfig, InvitesConfig, ServerConfig, SubscriptionConfig,
+    };
     use rsky_identity::did::did_resolver::ResolverKind;
     use std::time::Duration;
 
@@ -482,7 +484,10 @@ mod tests {
             other => panic!("unexpected plc resolver: {other:?}"),
         }
 
-        let cache = id_resolver.did.cache.expect("did cache should be configured");
+        let cache = id_resolver
+            .did
+            .cache
+            .expect("did cache should be configured");
         assert_eq!(cache.stale_ttl, Duration::from_millis(60_000));
         assert_eq!(cache.max_ttl, Duration::from_millis(120_000));
     }

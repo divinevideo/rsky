@@ -6,7 +6,7 @@ use std::sync::Mutex;
 use testcontainers::ContainerAsync;
 use testcontainers_modules::postgres::Postgres;
 
-use rsky_pds::{RocketConfig, build_rocket};
+use rsky_pds::{build_rocket, RocketConfig};
 
 mod common;
 
