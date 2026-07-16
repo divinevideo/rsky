@@ -95,11 +95,7 @@ impl Drop for ErrorOnDropTcpStream {
     }
 }
 
-fn write_response(
-    stream: &mut ErrorOnDropTcpStream,
-    status: &str,
-    body: &str,
-) -> Result<()> {
+fn write_response(stream: &mut ErrorOnDropTcpStream, status: &str, body: &str) -> Result<()> {
     let response = format!(
         "HTTP/1.1 {status}\r\n\
          Content-Type: text/plain; charset=utf-8\r\n\
