@@ -582,8 +582,7 @@ impl<'r> FromRequest<'r> for ModService {
             {
                 Ok(payload) => {
                     let is_service_aud = Some(payload.aud.clone()) == env_str("PDS_SERVICE_DID");
-                    let is_entryway_aud =
-                        entryway_did.as_ref() == Some(&payload.aud);
+                    let is_entryway_aud = entryway_did.as_ref() == Some(&payload.aud);
                     if !is_service_aud && !is_entryway_aud {
                         let error = AuthError::BadJwtAudience(
                             "jwt audience does not match service did".to_string(),
@@ -814,14 +813,13 @@ pub async fn validate_bearer_token<'r>(
                 }
                 // Fall back to repo signing key (for service auth tokens
                 // that come back from external services like video.bsky.app)
-                let repo_key_hex = env::var("PDS_REPO_SIGNING_KEY_K256_PRIVATE_KEY_HEX")
-                    .unwrap_or_default();
+                let repo_key_hex =
+                    env::var("PDS_REPO_SIGNING_KEY_K256_PRIVATE_KEY_HEX").unwrap_or_default();
                 if repo_key_hex.is_empty() {
                     return Err(jwt_err);
                 }
-                let repo_secret_key = SecretKey::from_slice(
-                    &hex::decode(repo_key_hex.as_bytes()).unwrap(),
-                ).unwrap();
+                let repo_secret_key =
+                    SecretKey::from_slice(&hex::decode(repo_key_hex.as_bytes()).unwrap()).unwrap();
                 let repo_key = Keypair::from_secret_key(&secp, &repo_secret_key);
                 verify_jwt(token.clone(), repo_key, verify_options).await?
             }

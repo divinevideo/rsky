@@ -42,16 +42,10 @@ impl Sequencer {
 
     /// Run the sequencer polling loop. Polls repo_seq for new events and
     /// broadcasts them to all firehose subscribers via the broadcast channel.
-    pub async fn start(
-        &mut self,
-        tx: tokio::sync::broadcast::Sender<Vec<SeqEvt>>,
-    ) -> Result<()> {
+    pub async fn start(&mut self, tx: tokio::sync::broadcast::Sender<Vec<SeqEvt>>) -> Result<()> {
         let curr = self.curr().await?;
         self.last_seen = Some(curr.unwrap_or(0));
-        tracing::info!(
-            "Sequencer started, last_seen: {:?}",
-            self.last_seen
-        );
+        tracing::info!("Sequencer started, last_seen: {:?}", self.last_seen);
         loop {
             if self.destroyed {
                 tracing::info!("Sequencer destroyed, exiting");
@@ -91,12 +85,14 @@ impl Sequencer {
         &mut self,
         tx: &tokio::sync::broadcast::Sender<Vec<SeqEvt>>,
     ) -> Result<bool> {
-        let evts = self.request_seq_range(RequestSeqRangeOpts {
-            earliest_seq: self.last_seen,
-            latest_seq: None,
-            earliest_time: None,
-            limit: Some(1000),
-        }).await?;
+        let evts = self
+            .request_seq_range(RequestSeqRangeOpts {
+                earliest_seq: self.last_seen,
+                latest_seq: None,
+                earliest_time: None,
+                limit: Some(1000),
+            })
+            .await?;
 
         if evts.is_empty() {
             return Ok(false);
@@ -110,7 +106,10 @@ impl Sequencer {
         // Broadcast to all subscribers (ignore error if no receivers)
         let count = evts.len();
         let _ = tx.send(evts);
-        tracing::debug!("Sequencer broadcast {count} events, last_seen: {:?}", self.last_seen);
+        tracing::debug!(
+            "Sequencer broadcast {count} events, last_seen: {:?}",
+            self.last_seen
+        );
 
         Ok(true)
     }

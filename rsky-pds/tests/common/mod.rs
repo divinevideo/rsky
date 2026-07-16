@@ -23,8 +23,7 @@ const TEST_REPO_SIGNING_KEY_HEX: &str =
     "4f3edf983ac636a65a842ce7c78d9aa706d3b113bce036f4aeb4f7f7a5c5f3cf";
 const TEST_PLC_ROTATION_KEY_HEX: &str =
     "6c3699283bda56ad74f6b855546325b68d482e983852a5b0d1f5b0f8d7e79b4f";
-const TEST_JWT_KEY_HEX: &str =
-    "8f2a55949068468ad5d670dfd0c0a33d5b9e7e1a2c0d2059f0f8f8779d4d078d";
+const TEST_JWT_KEY_HEX: &str = "8f2a55949068468ad5d670dfd0c0a33d5b9e7e1a2c0d2059f0f8f8779d4d078d";
 
 /**
     Establish connection to the testcontainer postgres

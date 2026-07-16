@@ -224,7 +224,10 @@ mod tests {
         let _guard = ENV_TEST_LOCK.lock().unwrap();
         unsafe {
             std::env::set_var("PDS_HOSTNAME", "pds.staging.dvines.org");
-            std::env::set_var("PDS_SERVICE_HANDLE_DOMAINS", ".staging.dvines.org,.divine.video");
+            std::env::set_var(
+                "PDS_SERVICE_HANDLE_DOMAINS",
+                ".staging.dvines.org,.divine.video",
+            );
         }
 
         assert!(validate_handle("alice.staging.dvines.org"));
