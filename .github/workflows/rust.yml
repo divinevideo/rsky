@@ -40,7 +40,10 @@ env:
   PDS_REPO_SIGNING_KEY_K256_PRIVATE_KEY_HEX: 71cfcf4882a6cff494c3d0affadd3858eb3a5838e7b5e15170e696a590a4fa01
   # Docker build configuration
   REGISTRY: ghcr.io
-  ORGANIZATION: blacksky-algorithms
+  # Push images to the namespace of whichever repo runs this workflow, so a
+  # fork (e.g. divinevideo/rsky) pushes to its own GHCR namespace instead of
+  # 403ing against the upstream org.
+  ORGANIZATION: ${{ github.repository_owner }}
 
 jobs:
   # First determine which workspace members need to be processed
