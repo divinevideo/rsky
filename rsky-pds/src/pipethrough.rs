@@ -98,11 +98,23 @@ impl<'r> FromRequest<'r> for HandlerPipeThrough {
                             {
                                 tracing::error!("@LOG: XRPC ERROR Status:{status}; Message: {message:?}; Error: {error:?}; Headers: {headers:?}");
                             }
-                            req.local_cache(|| Some(ApiError::InvalidRequest(error.to_string())));
+                            req.local_cache(|| {
+                                Some(if crate::auth_verifier::is_expired_jwt(&error) {
+                                    ApiError::ExpiredToken
+                                } else {
+                                    ApiError::InvalidRequest(error.to_string())
+                                })
+                            });
                             Outcome::Error((Status::BadRequest, error))
                         }
                         _ => {
-                            req.local_cache(|| Some(ApiError::InvalidRequest(error.to_string())));
+                            req.local_cache(|| {
+                                Some(if crate::auth_verifier::is_expired_jwt(&error) {
+                                    ApiError::ExpiredToken
+                                } else {
+                                    ApiError::InvalidRequest(error.to_string())
+                                })
+                            });
                             Outcome::Error((Status::BadRequest, error))
                         }
                     },

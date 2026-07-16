@@ -1,5 +1,8 @@
+#![allow(dead_code)]
+
 use anyhow::Result;
 use diesel::{Connection, PgConnection};
+use jwt_simple::prelude::*;
 use diesel_migrations::{embed_migrations, EmbeddedMigrations, MigrationHarness};
 use http_auth_basic::Credentials;
 use rocket::http::{ContentType, Header};
@@ -142,4 +145,130 @@ pub async fn create_account(client: &Client) -> (String, String) {
         .await;
 
     ("foo@example.com".to_string(), "password".to_string())
+}
+
+/// The `PDS_SERVICE_DID` configured by [`get_client`]; every session/refresh
+/// token must carry this as its audience.
+pub const TEST_SERVICE_DID: &str = "did:web:localhost";
+
+/// Log in with `username`/`password` and return the account's real DID.
+///
+/// `createAccount` mints its own DID rather than honouring the one supplied, so
+/// tokens whose `sub` must match a real account have to use this value.
+pub async fn login_did(client: &Client, username: &str, password: &str) -> String {
+    let response = client
+        .post("/xrpc/com.atproto.server.createSession")
+        .header(ContentType::JSON)
+        .body(json!({ "identifier": username, "password": password }).to_string())
+        .dispatch()
+        .await;
+    let session: serde_json::Value =
+        serde_json::from_str(&response.into_string().await.unwrap()).unwrap();
+    session["did"].as_str().expect("session did").to_string()
+}
+
+/// The custom claim payload rsky embeds in session tokens. Only `scope` matters
+/// for the auth path; `lxm` defaults to absent on deserialization.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct TestScopeClaim {
+    scope: String,
+}
+
+/// Forge a session-style ES256K JWT with full control over its validity window,
+/// signed by the raw 32-byte secp256k1 secret in `key_hex`.
+///
+/// `issued_ago_secs` / `expires_in_secs` are offsets from *now* (seconds).
+/// A negative `expires_in_secs` produces a token whose `exp` is in the past.
+/// Because jwt-simple's default clock tolerance is 900s, callers wanting a
+/// genuinely-expired token must backdate `exp` by MORE than 15 minutes.
+#[allow(clippy::too_many_arguments)]
+pub fn sign_test_token(
+    key_hex: &str,
+    scope: &str,
+    sub: &str,
+    aud: &str,
+    jti: Option<String>,
+    issued_ago_secs: u64,
+    expires_in_secs: i64,
+) -> String {
+    let key = ES256kKeyPair::from_bytes(&hex::decode(key_hex).expect("valid hex key"))
+        .expect("valid ES256K key");
+    let now = Clock::now_since_epoch();
+    let issued_at = now - Duration::from_secs(issued_ago_secs);
+    let expires_at = if expires_in_secs >= 0 {
+        now + Duration::from_secs(expires_in_secs as u64)
+    } else {
+        now - Duration::from_secs((-expires_in_secs) as u64)
+    };
+    // `valid_for` here is overwritten below; jwt-simple just needs a seed value.
+    let mut claims = Claims::with_custom_claims(
+        TestScopeClaim {
+            scope: scope.to_string(),
+        },
+        Duration::from_hours(2),
+    )
+    .with_audience(aud.to_string())
+    .with_subject(sub.to_string());
+    claims.issued_at = Some(issued_at);
+    claims.invalid_before = Some(issued_at);
+    claims.expires_at = Some(expires_at);
+    if let Some(jti) = jti {
+        claims = claims.with_jwt_id(jti);
+    }
+    key.sign(claims).expect("sign test token")
+}
+
+/// A genuinely-expired access token (exp 1h in the past), signed by the JWT key.
+pub fn expired_access_token(did: &str) -> String {
+    sign_test_token(
+        TEST_JWT_KEY_HEX,
+        "com.atproto.access",
+        did,
+        TEST_SERVICE_DID,
+        None,
+        10_800,
+        -3_600,
+    )
+}
+
+/// A genuinely-expired refresh token (exp 1h in the past), signed by the JWT
+/// key and carrying a `jti` (required by the refresh guard).
+pub fn expired_refresh_token(did: &str) -> String {
+    sign_test_token(
+        TEST_JWT_KEY_HEX,
+        "com.atproto.refresh",
+        did,
+        TEST_SERVICE_DID,
+        Some("expired-refresh-jti".to_string()),
+        10_800,
+        -3_600,
+    )
+}
+
+/// A currently-valid access token (exp 2h in the future), signed by the JWT key.
+pub fn valid_access_token(did: &str) -> String {
+    sign_test_token(
+        TEST_JWT_KEY_HEX,
+        "com.atproto.access",
+        did,
+        TEST_SERVICE_DID,
+        None,
+        0,
+        7_200,
+    )
+}
+
+/// A currently-valid access token signed by the REPO signing key (as an
+/// external service such as video.bsky.app sends). Exercises the repo-key
+/// fallback in `validate_bearer_token`.
+pub fn repo_key_signed_access_token(did: &str) -> String {
+    sign_test_token(
+        TEST_REPO_SIGNING_KEY_HEX,
+        "com.atproto.access",
+        did,
+        TEST_SERVICE_DID,
+        None,
+        0,
+        7_200,
+    )
 }
