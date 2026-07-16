@@ -2,9 +2,9 @@
 
 use anyhow::Result;
 use diesel::{Connection, PgConnection};
-use jwt_simple::prelude::*;
 use diesel_migrations::{embed_migrations, EmbeddedMigrations, MigrationHarness};
 use http_auth_basic::Credentials;
+use jwt_simple::prelude::*;
 use rocket::http::{ContentType, Header};
 use rocket::local::asynchronous::Client;
 use rocket::serde::json::json;
