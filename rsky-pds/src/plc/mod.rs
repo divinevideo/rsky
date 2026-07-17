@@ -59,10 +59,7 @@ impl Client {
 
     pub async fn get_document_data(&self, did: &String) -> Result<DocumentData> {
         match self
-            .make_get_req(
-                format!("{0}/{1}/data", self.url, did),
-                None,
-            )
+            .make_get_req(format!("{0}/{1}/data", self.url, did), None)
             .await
         {
             Ok(res) => Ok(res),
@@ -72,10 +69,7 @@ impl Client {
 
     pub async fn get_last_op(&self, did: &String) -> Result<CompatibleOpOrTombstone> {
         match self
-            .make_get_req(
-                format!("{0}/{1}/log/last", self.url, did),
-                None,
-            )
+            .make_get_req(format!("{0}/{1}/log/last", self.url, did), None)
             .await
         {
             Ok(res) => Ok(res),

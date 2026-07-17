@@ -116,6 +116,10 @@ fi
 # Filter out packages to skip
 FILTERED_MEMBERS=()
 for pkg in "${CHANGED_MEMBERS[@]}"; do
+    # Skip empty entries (Cargo.toml parsing can yield a blank member, which
+    # surfaces only when .github changes force the full member list and then
+    # produces `cargo check --package ''`).
+    [[ -n "$pkg" ]] || continue
     skip=false
     for skip_pkg in "${SKIP_PACKAGES[@]}"; do
         if [[ "$pkg" == "$skip_pkg" ]]; then

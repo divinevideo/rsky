@@ -50,7 +50,14 @@ async fn test_oauth_protected_resource_metadata() {
     );
     assert_eq!(
         response_body["resource"],
-        json!(client.rocket().state::<ServerConfig>().unwrap().service.public_url)
+        json!(
+            client
+                .rocket()
+                .state::<ServerConfig>()
+                .unwrap()
+                .service
+                .public_url
+        )
     );
 }
 

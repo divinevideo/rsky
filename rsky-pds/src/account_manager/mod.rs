@@ -279,8 +279,9 @@ impl AccountManager {
             // original expiration time to its revocation grace period.
             let prev_expires_at = from_str_to_micros(&token.expires_at);
 
-            const REFRESH_GRACE_MS: i32 = 2 * HOUR;
-            let grace_expires_at = dt.timestamp_micros() + REFRESH_GRACE_MS as i64;
+            // HOUR is in milliseconds; timestamp_micros() is microseconds.
+            const REFRESH_GRACE_MICROS: i64 = 2 * HOUR as i64 * 1000;
+            let grace_expires_at = dt.timestamp_micros() + REFRESH_GRACE_MICROS;
 
             let expires_at = if grace_expires_at < prev_expires_at {
                 grace_expires_at
@@ -301,7 +302,6 @@ impl AccountManager {
             let secret_key =
                 SecretKey::from_slice(&hex::decode(private_key.as_bytes()).unwrap()).unwrap();
             let jwt_key = Keypair::from_secret_key(&secp, &secret_key);
-
             let (access_jwt, refresh_jwt) = auth::create_tokens(CreateTokensOpts {
                 did: token.did,
                 jwt_key,

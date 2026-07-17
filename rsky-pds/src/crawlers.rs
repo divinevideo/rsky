@@ -49,15 +49,10 @@ impl Crawlers {
                         .connect_timeout(std::time::Duration::from_secs(5))
                         .timeout(std::time::Duration::from_secs(10))
                         .build()?;
-                    let record = CrawlerRequest {
-                        hostname,
-                    };
+                    let record = CrawlerRequest { hostname };
                     Ok::<reqwest::Response, anyhow::Error>(
                         client
-                            .post(format!(
-                                "{}/xrpc/com.atproto.sync.requestCrawl",
-                                service
-                            ))
+                            .post(format!("{}/xrpc/com.atproto.sync.requestCrawl", service))
                             .json(&record)
                             .send()
                             .await?,

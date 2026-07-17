@@ -4,7 +4,7 @@ use crate::models;
 use anyhow::Result;
 use diesel::*;
 use jwt_simple::prelude::*;
-use rsky_common::time::{from_micros_to_utc, MINUTE};
+use rsky_common::time::{from_micros_to_utc, MINUTE, SECOND};
 use rsky_common::{get_random_str, json_to_b64url, RFC3339_VARIANT};
 use secp256k1::{Keypair, Message, SecretKey};
 use sha2::{Digest, Sha256};
@@ -162,13 +162,14 @@ pub async fn create_service_jwt(params: ServiceJwtParams) -> Result<String> {
     let ServiceJwtParams {
         iss, aud, keypair, ..
     } = params;
-    let now = SystemTime::now()
+    // JWT exp is NumericDate: SECONDS since the epoch (RFC 7519). MINUTE is in
+    // milliseconds. The previous math ((now_micros + 60_000)/1000) produced a
+    // milliseconds value that no spec-compliant verifier interprets correctly.
+    let now_secs = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
-        .expect("timestamp in micros since UNIX epoch")
-        .as_micros() as usize;
-    let exp = params
-        .exp
-        .unwrap_or(((now + MINUTE as usize) / 1000) as u64);
+        .expect("timestamp since UNIX epoch")
+        .as_secs();
+    let exp = params.exp.unwrap_or(now_secs + (MINUTE / SECOND) as u64);
     let lxm = params.lxm;
     let jti = get_random_str();
     let header = ServiceJwtHeader {
@@ -226,7 +227,10 @@ pub async fn store_refresh_token(
 ) -> Result<()> {
     use crate::schema::pds::refresh_token::dsl as RefreshTokenSchema;
 
-    let exp = from_micros_to_utc((payload.exp.as_millis() / 1000) as i64);
+    // payload.exp is a coarsetime Duration since the epoch; from_micros_to_utc
+    // needs microseconds (the previous seconds value only produced correct
+    // dates because from_micros_to_utc itself misread its input as seconds).
+    let exp = from_micros_to_utc((payload.exp.as_millis() as i64) * 1000);
 
     db.run(move |conn| {
         insert_into(RefreshTokenSchema::refresh_token)
@@ -347,4 +351,105 @@ pub async fn add_refresh_grace_period(opts: RefreshGracePeriodOpts, db: &DbConn)
 
 pub fn get_refresh_token_id() -> String {
     get_random_str()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
+    use std::time::UNIX_EPOCH;
+
+    /// Same constant the integration harness feeds to
+    /// `PDS_JWT_KEY_K256_PRIVATE_KEY_HEX`.
+    const TEST_JWT_KEY_HEX: &str =
+        "8f2a55949068468ad5d670dfd0c0a33d5b9e7e1a2c0d2059f0f8f8779d4d078d";
+
+    /// Any `exp` above this is not a seconds-based NumericDate. Seconds values are
+    /// 10 digits until the year 5138; milliseconds values are already 13 digits.
+    const MAX_PLAUSIBLE_SECONDS_EXP: u64 = 100_000_000_000;
+
+    fn secret_key() -> SecretKey {
+        SecretKey::from_slice(&hex::decode(TEST_JWT_KEY_HEX).unwrap()).unwrap()
+    }
+
+    fn now_secs() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    async fn mint(exp: Option<u64>) -> String {
+        create_service_jwt(ServiceJwtParams {
+            iss: "did:web:pds.example".to_string(),
+            aud: "did:web:video.bsky.app".to_string(),
+            exp,
+            lxm: Some("app.bsky.video.getUploadLimits".to_string()),
+            jti: None,
+            keypair: secret_key(),
+        })
+        .await
+        .unwrap()
+    }
+
+    /// Decode the claims a receiving service would read off the wire.
+    ///
+    /// `json_to_b64url` encodes with the STANDARD base64 alphabet and then strips the
+    /// padding, so `STANDARD_NO_PAD` is the decoder that actually round-trips it. (A
+    /// url-safe decoder would blow up whenever the payload happens to contain `+` or
+    /// `/`, which is exactly the kind of intermittent failure this test must not have.)
+    fn claims_of(jwt: &str) -> ServiceJwtPayload {
+        let parts = jwt.split('.').collect::<Vec<&str>>();
+        assert_eq!(parts.len(), 3, "expected a three-part JWS");
+        serde_json::from_slice(&STANDARD_NO_PAD.decode(parts[1]).unwrap()).unwrap()
+    }
+
+    /// Regression: `create_service_jwt` computed `(now_micros + MINUTE) / 1000`, which
+    /// yields MILLIseconds. RFC 7519 NumericDate is SECONDS, so every token this PDS
+    /// minted carried an `exp` ~1000x in the future to a spec-compliant reader -- and
+    /// our own verifier, which compared it against microseconds, treated it as already
+    /// expired.
+    #[tokio::test]
+    async fn create_service_jwt_mints_a_seconds_numericdate_exp() {
+        let before = now_secs();
+
+        let exp = claims_of(&mint(None).await).exp.expect("exp claim");
+
+        assert!(
+            exp < MAX_PLAUSIBLE_SECONDS_EXP,
+            "exp {exp} is not a seconds NumericDate -- looks like milliseconds"
+        );
+        // Default service-token lifetime is one minute.
+        assert!(
+            exp >= before + 55 && exp <= now_secs() + 65,
+            "default exp should be ~60s out; got {exp} against now={before}"
+        );
+    }
+
+    /// A caller-supplied `exp` (e.g. video.bsky.app needs the token to outlive a
+    /// transcode) must be passed through untouched, in seconds.
+    #[tokio::test]
+    async fn create_service_jwt_honors_an_explicit_exp() {
+        let requested = now_secs() + 1800;
+
+        let exp = claims_of(&mint(Some(requested)).await)
+            .exp
+            .expect("exp claim");
+
+        assert_eq!(exp, requested);
+    }
+
+    /// The rest of the claim set the appview/video service relies on.
+    #[tokio::test]
+    async fn create_service_jwt_carries_iss_aud_and_lxm() {
+        let claims = claims_of(&mint(None).await);
+
+        assert_eq!(claims.iss, "did:web:pds.example");
+        assert_eq!(claims.aud, "did:web:video.bsky.app");
+        assert_eq!(
+            claims.lxm.as_deref(),
+            Some("app.bsky.video.getUploadLimits")
+        );
+        assert!(claims.jti.is_some(), "service tokens must carry a jti");
+    }
 }
