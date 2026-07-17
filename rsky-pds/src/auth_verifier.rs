@@ -23,6 +23,23 @@ use thiserror::Error;
 
 const INFINITY: u64 = u64::MAX;
 
+/// True when `err` is jwt-simple's expiry error (`JWTError::TokenHasExpired`),
+/// as opposed to a signature/format/other verification failure.
+///
+/// jwt-simple's `Error` is an `anyhow::Error` that wraps the `JWTError` enum
+/// (raised via `ensure!(..., JWTError::TokenHasExpired)`), so we recover the
+/// concrete cause with `downcast_ref`. This lets an expired token surface as an
+/// `ExpiredToken` code instead of being masked by the repo-key fallback or
+/// collapsed into a generic `BadJwt`. jwt-simple verifies the signature *before*
+/// validating claims, so a token signed by a different key fails at signature
+/// (never expiry) -- the repo-key service-auth path is unaffected.
+pub(crate) fn is_expired_jwt(err: &anyhow::Error) -> bool {
+    matches!(
+        err.downcast_ref::<jwt_simple::JWTError>(),
+        Some(jwt_simple::JWTError::TokenHasExpired)
+    )
+}
+
 #[derive(PartialEq, Clone, Debug)]
 pub enum AuthScope {
     Access,
@@ -125,6 +142,8 @@ pub struct JwtPayload {
 
 #[derive(Error, Debug)]
 pub enum AuthError {
+    #[error("ExpiredToken: `Token is expired`")]
+    ExpiredToken,
     #[error("BadJwt: `{0}`")]
     BadJwt(String),
     #[error("BadJwtAudience: `{0}`")]
@@ -172,14 +191,21 @@ impl<'r> FromRequest<'r> for Refresh {
                     None => {
                         let error =
                             AuthError::BadJwt("Unexpected missing refresh token id".to_owned());
-                        req.local_cache(|| Some(ApiError::InvalidRequest(error.to_string())));
+                        req.local_cache(|| Some(ApiError::from(&error)));
                         return Outcome::Error((Status::BadRequest, error));
                     }
                 }
             }
             Err(error) => {
-                let error = AuthError::BadJwt(error.to_string());
-                req.local_cache(|| Some(ApiError::InvalidRequest(error.to_string())));
+                // The refresh guard bypasses `access_check`, so map expiry here
+                // too: an expired REFRESH token on refreshSession must yield
+                // ExpiredToken so clients know the session is unrecoverable.
+                let error = if is_expired_jwt(&error) {
+                    AuthError::ExpiredToken
+                } else {
+                    AuthError::BadJwt(error.to_string())
+                };
+                req.local_cache(|| Some(ApiError::from(&error)));
                 return Outcome::Error((Status::BadRequest, error));
             }
         };
@@ -221,6 +247,9 @@ pub async fn access_check<'r>(
                 Status::BadRequest,
                 AuthError::AccountTakedown(error.to_string()),
             )),
+            _ if is_expired_jwt(&error) => {
+                Outcome::Error((Status::BadRequest, AuthError::ExpiredToken))
+            }
             _ => Outcome::Error((Status::BadRequest, AuthError::BadJwt(error.to_string()))),
         },
     }
@@ -259,7 +288,7 @@ impl<'r> FromRequest<'r> for AccessFull {
         match access_check(req, vec![AuthScope::Access], None).await {
             Outcome::Success(access) => Outcome::Success(AccessFull { access }),
             Outcome::Error(error) => {
-                req.local_cache(|| Some(ApiError::InvalidRequest(error.1.to_string())));
+                req.local_cache(|| Some(ApiError::from(&error.1)));
                 Outcome::Error(error)
             }
             Outcome::Forward(_) => panic!("Outcome::Forward returned"),
@@ -285,7 +314,7 @@ impl<'r> FromRequest<'r> for AccessPrivileged {
         {
             Outcome::Success(access) => Outcome::Success(Self { access }),
             Outcome::Error(error) => {
-                req.local_cache(|| Some(ApiError::InvalidRequest(error.1.to_string())));
+                req.local_cache(|| Some(ApiError::from(&error.1)));
                 Outcome::Error(error)
             }
             Outcome::Forward(_) => panic!("Outcome::Forward returned"),
@@ -315,7 +344,7 @@ impl<'r> FromRequest<'r> for AccessStandard {
         {
             Outcome::Success(access) => Outcome::Success(AccessStandard { access }),
             Outcome::Error(error) => {
-                req.local_cache(|| Some(ApiError::InvalidRequest(error.1.to_string())));
+                req.local_cache(|| Some(ApiError::from(&error.1)));
                 Outcome::Error(error)
             }
             Outcome::Forward(_) => panic!("Outcome::Forward returned"),
@@ -349,7 +378,7 @@ impl<'r> FromRequest<'r> for AccessStandardIncludeChecks {
         {
             Outcome::Success(access) => Outcome::Success(AccessStandardIncludeChecks { access }),
             Outcome::Error(error) => {
-                req.local_cache(|| Some(ApiError::InvalidRequest(error.1.to_string())));
+                req.local_cache(|| Some(ApiError::from(&error.1)));
                 Outcome::Error(error)
             }
             Outcome::Forward(_) => panic!("Outcome::Forward returned"),
@@ -383,7 +412,7 @@ impl<'r> FromRequest<'r> for AccessStandardCheckTakedown {
         {
             Outcome::Success(access) => Outcome::Success(AccessStandardCheckTakedown { access }),
             Outcome::Error(error) => {
-                req.local_cache(|| Some(ApiError::InvalidRequest(error.1.to_string())));
+                req.local_cache(|| Some(ApiError::from(&error.1)));
                 Outcome::Error(error)
             }
             Outcome::Forward(_) => panic!("Outcome::Forward returned"),
@@ -414,7 +443,7 @@ impl<'r> FromRequest<'r> for AccessStandardSignupQueued {
         {
             Outcome::Success(access) => Outcome::Success(AccessStandardSignupQueued { access }),
             Outcome::Error(error) => {
-                req.local_cache(|| Some(ApiError::InvalidRequest(error.1.to_string())));
+                req.local_cache(|| Some(ApiError::from(&error.1)));
                 Outcome::Error(error)
             }
             Outcome::Forward(_) => panic!("Outcome::Forward returned"),
@@ -438,13 +467,20 @@ impl<'r> FromRequest<'r> for RevokeRefreshToken {
                 Some(jti) => Outcome::Success(RevokeRefreshToken { id: jti }),
                 None => {
                     let error = AuthError::BadJwt("Unexpected missing refresh token id".to_owned());
-                    req.local_cache(|| Some(ApiError::InvalidRequest(error.to_string())));
+                    req.local_cache(|| Some(ApiError::from(&error)));
                     Outcome::Error((Status::BadRequest, error))
                 }
             },
             Err(error) => {
-                req.local_cache(|| Some(ApiError::InvalidRequest(error.to_string())));
-                Outcome::Error((Status::BadRequest, AuthError::BadJwt(error.to_string())))
+                // RevokeRefreshToken also bypasses `access_check`; surface
+                // expiry rather than collapsing it to BadJwt.
+                let error = if is_expired_jwt(&error) {
+                    AuthError::ExpiredToken
+                } else {
+                    AuthError::BadJwt(error.to_string())
+                };
+                req.local_cache(|| Some(ApiError::from(&error)));
+                Outcome::Error((Status::BadRequest, error))
             }
         }
     }
@@ -486,11 +522,7 @@ impl<'r> FromRequest<'r> for UserDidAuth {
                 },
             }),
             Err(error) => {
-                req.local_cache(|| {
-                    Some(ApiError::InvalidRequest(
-                        AuthError::BadJwt(error.to_string()).to_string(),
-                    ))
-                });
+                req.local_cache(|| Some(ApiError::from(&AuthError::BadJwt(error.to_string()))));
                 Outcome::Error((Status::BadRequest, AuthError::BadJwt(error.to_string())))
             }
         }
@@ -512,7 +544,7 @@ impl<'r> FromRequest<'r> for UserDidAuthOptional {
                     access: Some(output.access),
                 }),
                 Outcome::Error(err) => {
-                    req.local_cache(|| Some(ApiError::InvalidRequest(err.1.to_string())));
+                    req.local_cache(|| Some(ApiError::from(&err.1)));
                     Outcome::Error(err)
                 }
                 _ => panic!("Unexpected outcome during UserDidAuthOptional"),
@@ -555,7 +587,7 @@ impl<'r> FromRequest<'r> for ModService {
                         let error = AuthError::BadJwtAudience(
                             "jwt audience does not match service did".to_string(),
                         );
-                        req.local_cache(|| Some(ApiError::InvalidRequest(error.to_string())));
+                        req.local_cache(|| Some(ApiError::from(&error)));
                         Outcome::Error((Status::BadRequest, error))
                     } else {
                         Outcome::Success(ModService {
@@ -577,13 +609,13 @@ impl<'r> FromRequest<'r> for ModService {
                 }
                 Err(error) => {
                     let error = AuthError::BadJwt(error.to_string());
-                    req.local_cache(|| Some(ApiError::InvalidRequest(error.to_string())));
+                    req.local_cache(|| Some(ApiError::from(&error)));
                     Outcome::Error((Status::BadRequest, AuthError::BadJwt(error.to_string())))
                 }
             }
         } else {
             let error = AuthError::UntrustedIss("Untrusted issuer".to_string());
-            req.local_cache(|| Some(ApiError::InvalidRequest(error.to_string())));
+            req.local_cache(|| Some(ApiError::from(&error)));
             Outcome::Error((Status::BadRequest, error))
         }
     }
@@ -604,7 +636,7 @@ impl<'r> FromRequest<'r> for Moderator {
                     access: output.access,
                 }),
                 Outcome::Error(err) => {
-                    req.local_cache(|| Some(ApiError::InvalidRequest(err.1.to_string())));
+                    req.local_cache(|| Some(ApiError::from(&err.1)));
                     Outcome::Error(err)
                 }
                 _ => panic!("Unexpected outcome during Moderator"),
@@ -615,7 +647,7 @@ impl<'r> FromRequest<'r> for Moderator {
                     access: output.access,
                 }),
                 Outcome::Error(err) => {
-                    req.local_cache(|| Some(ApiError::InvalidRequest(err.1.to_string())));
+                    req.local_cache(|| Some(ApiError::from(&err.1)));
                     Outcome::Error(err)
                 }
                 _ => panic!("Unexpected outcome during Moderator"),
@@ -651,14 +683,14 @@ impl<'r> FromRequest<'r> for AdminToken {
                     Some(password) => password,
                     None => {
                         let error = AuthError::AuthRequired("BadAuth".to_string());
-                        req.local_cache(|| Some(ApiError::InvalidRequest(error.to_string())));
+                        req.local_cache(|| Some(ApiError::from(&error)));
                         return Outcome::Error((Status::BadRequest, error));
                     }
                 };
 
                 if username != "admin" || password != expected_password {
                     let error = AuthError::AuthRequired("BadAuth".to_string());
-                    req.local_cache(|| Some(ApiError::InvalidRequest(error.to_string())));
+                    req.local_cache(|| Some(ApiError::from(&error)));
                     Outcome::Error((Status::BadRequest, error))
                 } else {
                     Outcome::Success(AdminToken {
@@ -698,7 +730,7 @@ impl<'r> FromRequest<'r> for OptionalAccessOrAdminToken {
                     access: Some(output.access),
                 }),
                 Outcome::Error(err) => {
-                    req.local_cache(|| Some(ApiError::InvalidRequest(err.1.to_string())));
+                    req.local_cache(|| Some(ApiError::from(&err.1)));
                     Outcome::Error(err)
                 }
                 _ => panic!("Unexpected outcome during OptionalAccessOrAdminToken"),
@@ -709,7 +741,7 @@ impl<'r> FromRequest<'r> for OptionalAccessOrAdminToken {
                     access: Some(output.access),
                 }),
                 Outcome::Error(err) => {
-                    req.local_cache(|| Some(ApiError::InvalidRequest(err.1.to_string())));
+                    req.local_cache(|| Some(ApiError::from(&err.1)));
                     Outcome::Error(err)
                 }
                 _ => panic!("Unexpected outcome during OptionalAccessOrAdminToken"),
@@ -766,13 +798,25 @@ pub async fn validate_bearer_token<'r>(
         let jwt_key = Keypair::from_secret_key(&secp, &jwt_secret_key);
         let payload = match verify_jwt(token.clone(), jwt_key, verify_options.clone()).await {
             Ok(payload) => payload,
-            Err(_jwt_err) => {
+            Err(jwt_err) => {
+                // An expired session token must surface AS expiry. The repo-key
+                // fallback below would re-verify it and fail at *signature*,
+                // replacing the expiry error with a misleading "bad signature"
+                // -- so clients could never tell an expired token from a
+                // malformed one. Bail with the original expiry error instead.
+                // Safe for the video service-auth path: jwt-simple checks the
+                // signature before claims, so a repo-key-signed token fails the
+                // JWT-key attempt at signature (not expiry) and still falls
+                // through to the repo-key verification below.
+                if is_expired_jwt(&jwt_err) {
+                    return Err(jwt_err);
+                }
                 // Fall back to repo signing key (for service auth tokens
                 // that come back from external services like video.bsky.app)
                 let repo_key_hex =
                     env::var("PDS_REPO_SIGNING_KEY_K256_PRIVATE_KEY_HEX").unwrap_or_default();
                 if repo_key_hex.is_empty() {
-                    return Err(_jwt_err);
+                    return Err(jwt_err);
                 }
                 let repo_secret_key =
                     SecretKey::from_slice(&hex::decode(repo_key_hex.as_bytes()).unwrap()).unwrap();
