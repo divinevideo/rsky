@@ -157,8 +157,9 @@ fn tolerates_trailing_whitespace() {
 
 #[test]
 fn preserves_colons_in_password() {
-    // base64("admin:pass:word")
-    let parsed = parse_basic_auth("Basic YWRtaW46cGFzczp3b3Jk").expect("expected parse");
+    // Construct this synthetic fixture instead of storing an encoded credential.
+    let header = format!("Basic {}", base64pad.encode("admin:pass:word"));
+    let parsed = parse_basic_auth(&header).expect("expected parse");
     assert_eq!(parsed.username, "admin");
     assert_eq!(parsed.password, "pass:word");
 }
