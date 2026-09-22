@@ -518,6 +518,10 @@ fn fixture() -> &'static Fixture {
 /// the accounts the fixture ships with.
 #[allow(dead_code)]
 pub async fn get_client_with_fixture() -> (&'static Fixture, Client) {
+    // Parallel readers share the fixture, but their server startups must not
+    // race while initializing its SQLite sidecar databases.
+    static FIXTURE_BOOT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _boot = FIXTURE_BOOT.lock().await;
     let fixture = fixture();
     init_env();
     let path = |name: &str| fixture.data(name).to_str().unwrap().to_owned();
