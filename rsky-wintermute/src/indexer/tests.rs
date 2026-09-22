@@ -11,10 +11,9 @@ mod indexer_tests {
     use crate::indexer::IndexerManager;
     use crate::storage::Storage;
     use crate::types::{BackfillJob, LabelEvent, WriteAction};
-    use deadpool_postgres::{Config, ManagerConfig, Pool, RecyclingMethod, Runtime};
+    use deadpool_postgres::Pool;
     use std::sync::Arc;
     use tempfile::TempDir;
-    use tokio_postgres::NoTls;
 
     fn setup_test_storage() -> (Storage, TempDir) {
         let temp_dir = TempDir::with_prefix("indexer_test_").unwrap();
@@ -28,13 +27,8 @@ mod indexer_tests {
             "postgresql://postgres:postgres@localhost:5432/bsky_test".to_owned()
         });
 
-        let mut pg_config = Config::new();
-        pg_config.url = Some(database_url);
-        pg_config.manager = Some(ManagerConfig {
-            recycling_method: RecyclingMethod::Fast,
-        });
-
-        pg_config.create_pool(Some(Runtime::Tokio1), NoTls).unwrap()
+        crate::config::create_pg_pool(&database_url, crate::config::pg_pool_config(16))
+            .expect("test pool builds")
     }
 
     async fn cleanup_test_data(pool: &Pool, did: &str) {
@@ -62,10 +56,24 @@ mod indexer_tests {
             "notification",
         ];
 
+        // post_agg is keyed by post uri, so it must go before the posts do.
+        drop(
+            client
+                .execute(
+                    "DELETE FROM post_agg WHERE uri IN (SELECT uri FROM post WHERE creator = $1)",
+                    &[&did],
+                )
+                .await,
+        );
+
+        // One DELETE per candidate column: a single OR query fails outright on
+        // tables that lack any one of these columns, silently deleting nothing.
+        // Table names are quoted ("like" is a reserved word).
         for table in &tables {
-            let query =
-                format!("DELETE FROM {table} WHERE creator = $1 OR did = $1 OR author = $1");
-            drop(client.execute(&query, &[&did]).await);
+            for column in ["creator", "did", "author"] {
+                let query = format!("DELETE FROM \"{table}\" WHERE {column} = $1");
+                drop(client.execute(&query, &[&did]).await);
+            }
         }
 
         drop(
@@ -76,14 +84,6 @@ mod indexer_tests {
         drop(
             client
                 .execute("DELETE FROM profile_agg WHERE did = $1", &[&did])
-                .await,
-        );
-        drop(
-            client
-                .execute(
-                    "DELETE FROM post_agg WHERE uri IN (SELECT uri FROM post WHERE creator = $1)",
-                    &[&did],
-                )
                 .await,
         );
     }
@@ -117,10 +117,11 @@ mod indexer_tests {
             priority: false,
         };
 
-        let http_client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(60))
-            .build()
-            .unwrap();
+        let http_client = rsky_identity::safe_fetch::SafeClient::new(
+            rsky_identity::safe_fetch::NetworkPolicy::PERMISSIVE,
+            std::time::Duration::from_secs(60),
+        )
+        .unwrap();
 
         tracing::info!("processing backfill job for {test_did}");
         let result =
@@ -152,7 +153,8 @@ mod indexer_tests {
                 match indexer.storage.dequeue_firehose_backfill() {
                     Ok(Some((key, index_job))) => {
                         let result =
-                            IndexerManager::process_job(&indexer.pool_backfill, &index_job).await;
+                            IndexerManager::process_job(&indexer.pool_backfill, &index_job, false)
+                                .await;
 
                         match result {
                             Ok(()) => {
@@ -371,10 +373,11 @@ mod indexer_tests {
             priority: false,
         };
 
-        let http_client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(60))
-            .build()
-            .unwrap();
+        let http_client = rsky_identity::safe_fetch::SafeClient::new(
+            rsky_identity::safe_fetch::NetworkPolicy::PERMISSIVE,
+            std::time::Duration::from_secs(60),
+        )
+        .unwrap();
 
         let result =
             BackfillerManager::process_job(&storage, &http_client, &dashmap::DashMap::new(), &job)
@@ -395,7 +398,8 @@ mod indexer_tests {
                 match indexer.storage.dequeue_firehose_backfill() {
                     Ok(Some((key, index_job))) => {
                         let result =
-                            IndexerManager::process_job(&indexer.pool_backfill, &index_job).await;
+                            IndexerManager::process_job(&indexer.pool_backfill, &index_job, false)
+                                .await;
 
                         if result.is_ok() {
                             drop(indexer.storage.remove_firehose_backfill(&key));
@@ -438,9 +442,10 @@ mod indexer_tests {
             record: Some(serde_json::json!({"text": "test", "createdAt": "2024-01-01T00:00:00Z"})),
             indexed_at: chrono::Utc::now().to_rfc3339(),
             rev: "test".to_owned(),
+            provenance: None,
         };
 
-        let result = IndexerManager::process_job(&pool, &valid_job).await;
+        let result = IndexerManager::process_job(&pool, &valid_job, false).await;
         assert!(
             result.is_ok(),
             "expected valid URI to succeed: {:?}",
@@ -1252,6 +1257,8 @@ mod indexer_tests {
             time: chrono::Utc::now().to_rfc3339(),
             kind: "commit".to_owned(),
             commit: Some(CommitData {
+                cid: None,
+
                 rev: "test-rev-live".to_owned(),
                 ops: vec![
                     RepoOp {
@@ -1283,9 +1290,9 @@ mod indexer_tests {
             .await
             .expect("failed to enqueue event");
 
-        // Verify queue has 2 jobs
+        // Verify queue has one job per operation plus the commit-progress job
         let queue_len = storage.firehose_live_len().unwrap();
-        assert_eq!(queue_len, 2, "expected 2 jobs in firehose_live queue");
+        assert_eq!(queue_len, 3, "expected 3 jobs in firehose_live queue");
         tracing::info!("firehose_live queue has {queue_len} jobs");
 
         // Step 3: Simulate indexer dequeuing and processing jobs
@@ -1324,7 +1331,7 @@ mod indexer_tests {
             );
 
             // Process the job through indexer
-            match IndexerManager::process_job(&pool, &job_with_record).await {
+            match IndexerManager::process_job(&pool, &job_with_record, false).await {
                 Ok(()) => tracing::info!("successfully processed job {}", job_with_record.uri),
                 Err(e) => {
                     tracing::error!("failed to process job {}: {}", job_with_record.uri, e);
@@ -1340,7 +1347,7 @@ mod indexer_tests {
             processed_count += 1;
         }
 
-        assert_eq!(processed_count, 2, "expected to process 2 jobs");
+        assert_eq!(processed_count, 3, "expected to process 3 jobs");
         tracing::info!("processed {processed_count} jobs from firehose_live queue");
 
         // Step 4: Verify queue is empty
@@ -1391,9 +1398,10 @@ mod indexer_tests {
             record: None, // Missing record for create
             indexed_at: "2024-01-01T00:00:00Z".to_owned(),
             rev: "test".to_owned(),
+            provenance: None,
         };
 
-        let result = IndexerManager::process_job(&pool, &job).await;
+        let result = IndexerManager::process_job(&pool, &job, false).await;
 
         // Should fail with missing record error
         assert!(result.is_err());
@@ -1423,9 +1431,10 @@ mod indexer_tests {
             })),
             indexed_at: "2024-01-01T00:00:00Z".to_owned(),
             rev: "rev1".to_owned(),
+            provenance: None,
         };
 
-        IndexerManager::process_job(&pool, &create_job)
+        IndexerManager::process_job(&pool, &create_job, false)
             .await
             .unwrap();
 
@@ -1446,9 +1455,10 @@ mod indexer_tests {
             record: None,
             indexed_at: "2024-01-01T01:00:00Z".to_owned(),
             rev: "rev2".to_owned(),
+            provenance: None,
         };
 
-        IndexerManager::process_job(&pool, &delete_job)
+        IndexerManager::process_job(&pool, &delete_job, false)
             .await
             .unwrap();
 
@@ -1483,9 +1493,10 @@ mod indexer_tests {
             })),
             indexed_at: "2024-01-01T00:00:00Z".to_owned(),
             rev: "rev2".to_owned(),
+            provenance: None,
         };
 
-        IndexerManager::process_job(&pool, &initial_job)
+        IndexerManager::process_job(&pool, &initial_job, false)
             .await
             .unwrap();
 
@@ -1499,11 +1510,12 @@ mod indexer_tests {
                 "createdAt": "2024-01-01T00:00:00Z"
             })),
             indexed_at: "2024-01-01T00:00:00Z".to_owned(),
-            rev: "rev1".to_owned(), // Older revision
+            rev: "rev1".to_owned(), // Older revision,
+            provenance: None,
         };
 
         // Should succeed but skip the stale write
-        IndexerManager::process_job(&pool, &stale_job)
+        IndexerManager::process_job(&pool, &stale_job, false)
             .await
             .unwrap();
 
@@ -1539,6 +1551,7 @@ mod indexer_tests {
                 record: Some(serde_json::json!({"text": "test"})),
                 indexed_at: "2024-01-01T00:00:00Z".to_owned(),
                 rev: "test".to_owned(),
+                provenance: None,
             };
             manager.storage.enqueue_firehose_live(&job).unwrap();
         }
@@ -1581,6 +1594,7 @@ mod indexer_tests {
                 record: Some(serde_json::json!({"text": "live"})),
                 indexed_at: "2024-01-01T00:00:00Z".to_owned(),
                 rev: "test".to_owned(),
+                provenance: None,
             };
             manager.storage.enqueue_firehose_live(&job).unwrap();
         }
@@ -1593,6 +1607,7 @@ mod indexer_tests {
                 record: Some(serde_json::json!({"text": "backfill"})),
                 indexed_at: "2024-01-01T00:00:00Z".to_owned(),
                 rev: "test".to_owned(),
+                provenance: None,
             };
             manager.storage.enqueue_firehose_backfill(&job).unwrap();
         }
@@ -1641,6 +1656,7 @@ mod indexer_tests {
             record: Some(serde_json::json!({"text": "test"})),
             indexed_at: "2024-01-01T00:00:00Z".to_owned(),
             rev: "test".to_owned(),
+            provenance: None,
         };
         manager.storage.enqueue_firehose_live(&job).unwrap();
 
@@ -1758,9 +1774,10 @@ mod indexer_tests {
                 rev: "rev1".to_owned(),
                 record: Some(record),
                 indexed_at: indexed_at.clone(),
+                provenance: None,
             };
 
-            let result = IndexerManager::process_job(&pool, &create_job).await;
+            let result = IndexerManager::process_job(&pool, &create_job, false).await;
             assert!(
                 result.is_ok(),
                 "Failed to create {collection}: {:?}",
@@ -1775,9 +1792,10 @@ mod indexer_tests {
                 rev: "rev2".to_owned(),
                 record: None,
                 indexed_at: indexed_at.clone(),
+                provenance: None,
             };
 
-            let result = IndexerManager::process_job(&pool, &delete_job).await;
+            let result = IndexerManager::process_job(&pool, &delete_job, false).await;
             assert!(
                 result.is_ok(),
                 "Failed to delete {collection}: {:?}",
@@ -1856,8 +1874,9 @@ mod indexer_tests {
                 rev: "rev1".to_owned(),
                 record: Some(record.clone()),
                 indexed_at: indexed_at.clone(),
+                provenance: None,
             };
-            let result = IndexerManager::process_job(&pool, &create_job).await;
+            let result = IndexerManager::process_job(&pool, &create_job, false).await;
             assert!(
                 result.is_ok(),
                 "Failed to create {collection}: {:?}",
@@ -1872,8 +1891,9 @@ mod indexer_tests {
                 rev: "rev2".to_owned(),
                 record: None,
                 indexed_at: indexed_at.clone(),
+                provenance: None,
             };
-            let result = IndexerManager::process_job(&pool, &delete_job).await;
+            let result = IndexerManager::process_job(&pool, &delete_job, false).await;
             assert!(
                 result.is_ok(),
                 "Failed to delete {collection}: {:?}",
@@ -1882,5 +1902,1213 @@ mod indexer_tests {
         }
 
         cleanup_test_data(&pool, test_did).await;
+    }
+
+    #[tokio::test]
+    async fn bulk_post_langs_tags_round_trip_as_arrays() {
+        use crate::indexer::bulk::{self, PostCopyRow};
+
+        let pool = setup_test_pool();
+        let test_did = "did:plc:wintermute-test-langs-arrays";
+        cleanup_test_data(&pool, test_did).await;
+
+        let client = pool.get().await.unwrap();
+        client
+            .execute(
+                "INSERT INTO actor (did, \"indexedAt\") VALUES ($1, NOW()) \
+                 ON CONFLICT (did) DO NOTHING",
+                &[&test_did],
+            )
+            .await
+            .unwrap();
+
+        let uri = format!("at://{test_did}/app.bsky.feed.post/langstest1");
+        let langs_json = vec![serde_json::json!("en"), serde_json::json!("pt-BR")];
+        let tags_json = vec![serde_json::json!(r#"tag "quoted""#)];
+        let row = PostCopyRow {
+            uri: uri.clone(),
+            cid: "bafyreihhl5mpvjkrhnnagen2fomozzhnhhdq2jr6cego2nzbvmwewv5rd4".to_owned(),
+            creator: test_did.to_owned(),
+            text: "langs round trip".to_owned(),
+            reply_root: None,
+            reply_root_cid: None,
+            reply_parent: None,
+            reply_parent_cid: None,
+            created_at: "2026-07-30T00:00:00.000Z".to_owned(),
+            indexed_at: "2026-07-30T00:00:00.000Z".to_owned(),
+            langs: Some(bulk::pg_text_array_literal(&langs_json)),
+            tags: Some(bulk::pg_text_array_literal(&tags_json)),
+        };
+        bulk::copy_insert_posts(&client, &[row], true)
+            .await
+            .unwrap();
+
+        let db_row = client
+            .query_one(
+                "SELECT langs::text[], tags::text[] FROM post WHERE uri = $1",
+                &[&uri],
+            )
+            .await
+            .unwrap();
+        let langs: Vec<String> = db_row.get(0);
+        let tags: Vec<String> = db_row.get(1);
+        assert_eq!(langs, vec!["en".to_owned(), "pt-BR".to_owned()]);
+        assert_eq!(tags, vec![r#"tag "quoted""#.to_owned()]);
+
+        cleanup_test_data(&pool, test_did).await;
+    }
+
+    #[tokio::test]
+    async fn bulk_aggregates_increment_exactly_and_are_replay_safe() {
+        use crate::indexer::bulk::{self, PostCopyRow};
+
+        let pool = setup_test_pool();
+        let creator = "did:plc:wintermute-test-agg-creator";
+        let subject = "did:plc:wintermute-test-agg-subject";
+        for did in [creator, subject] {
+            cleanup_test_data(&pool, did).await;
+        }
+
+        let client = pool.get().await.unwrap();
+        for did in [creator, subject] {
+            client
+                .execute(
+                    "INSERT INTO actor (did, \"indexedAt\") VALUES ($1, NOW()) \
+                     ON CONFLICT (did) DO NOTHING",
+                    &[&did],
+                )
+                .await
+                .unwrap();
+        }
+
+        let post = |rkey: &str| PostCopyRow {
+            uri: format!("at://{creator}/app.bsky.feed.post/{rkey}"),
+            cid: "bafyreihhl5mpvjkrhnnagen2fomozzhnhhdq2jr6cego2nzbvmwewv5rd4".to_owned(),
+            creator: creator.to_owned(),
+            text: format!("agg test {rkey}"),
+            reply_root: None,
+            reply_root_cid: None,
+            reply_parent: None,
+            reply_parent_cid: None,
+            created_at: "2026-07-30T00:00:00.000Z".to_owned(),
+            indexed_at: "2026-07-30T00:00:00.000Z".to_owned(),
+            langs: None,
+            tags: None,
+        };
+        let posts = vec![post("aggpost1"), post("aggpost2")];
+        bulk::copy_insert_posts(&client, &posts, true)
+            .await
+            .unwrap();
+        // Replay the identical batch: dupes insert nothing and add nothing.
+        bulk::copy_insert_posts(&client, &posts, true)
+            .await
+            .unwrap();
+
+        let follow = bulk::FollowCopyRow {
+            uri: format!("at://{creator}/app.bsky.graph.follow/aggfollow1"),
+            cid: "bafyreihhl5mpvjkrhnnagen2fomozzhnhhdq2jr6cego2nzbvmwewv5rd4".to_owned(),
+            creator: creator.to_owned(),
+            subject_did: subject.to_owned(),
+            created_at: "2026-07-30T00:00:00.000Z".to_owned(),
+            indexed_at: "2026-07-30T00:00:00.000Z".to_owned(),
+            via: None,
+            via_cid: None,
+        };
+        bulk::copy_insert_follows(&client, std::slice::from_ref(&follow), true)
+            .await
+            .unwrap();
+        bulk::copy_insert_follows(&client, std::slice::from_ref(&follow), true)
+            .await
+            .unwrap();
+
+        let row = client
+            .query_one(
+                "SELECT \"postsCount\", \"followsCount\" FROM profile_agg WHERE did = $1",
+                &[&creator],
+            )
+            .await
+            .unwrap();
+        assert_eq!(row.get::<_, i64>(0), 2, "postsCount must be exactly 2");
+        assert_eq!(row.get::<_, i64>(1), 1, "followsCount must be exactly 1");
+
+        let row = client
+            .query_one(
+                "SELECT \"followersCount\" FROM profile_agg WHERE did = $1",
+                &[&subject],
+            )
+            .await
+            .unwrap();
+        assert_eq!(row.get::<_, i64>(0), 1, "followersCount must be exactly 1");
+
+        for did in [creator, subject] {
+            cleanup_test_data(&pool, did).await;
+        }
+    }
+
+    #[test]
+    fn collect_subject_notifications_recipients_and_self_skips() {
+        let record = serde_json::json!({
+            "subject": {"uri": "at://did:plc:subject-author/app.bsky.feed.post/abc"},
+            "via": {"uri": "at://did:plc:reposter/app.bsky.feed.repost/xyz"},
+        });
+        let mut rows = Vec::new();
+        IndexerManager::collect_subject_notifications(
+            &mut rows,
+            &record,
+            "did:plc:liker",
+            "at://did:plc:liker/app.bsky.feed.like/1",
+            "cid1",
+            "at://did:plc:subject-author/app.bsky.feed.post/abc",
+            "2026-07-30T00:00:00.000Z",
+            "like",
+            "like-via-repost",
+        );
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].did, "did:plc:subject-author");
+        assert_eq!(rows[0].reason, "like");
+        assert_eq!(
+            rows[0].reason_subject.as_deref(),
+            Some("at://did:plc:subject-author/app.bsky.feed.post/abc")
+        );
+        assert_eq!(rows[1].did, "did:plc:reposter");
+        assert_eq!(rows[1].reason, "like-via-repost");
+
+        // Self-like and self-via generate nothing
+        let mut rows = Vec::new();
+        IndexerManager::collect_subject_notifications(
+            &mut rows,
+            &serde_json::json!({
+                "subject": {"uri": "at://did:plc:liker/app.bsky.feed.post/own"},
+                "via": {"uri": "at://did:plc:liker/app.bsky.feed.repost/own"},
+            }),
+            "did:plc:liker",
+            "at://did:plc:liker/app.bsky.feed.like/2",
+            "cid2",
+            "at://did:plc:liker/app.bsky.feed.post/own",
+            "2026-07-30T00:00:00.000Z",
+            "like",
+            "like-via-repost",
+        );
+        assert!(rows.is_empty());
+
+        // Empty subject generates nothing
+        let mut rows = Vec::new();
+        IndexerManager::collect_subject_notifications(
+            &mut rows,
+            &serde_json::json!({}),
+            "did:plc:liker",
+            "at://did:plc:liker/app.bsky.feed.like/3",
+            "cid3",
+            "",
+            "2026-07-30T00:00:00.000Z",
+            "like",
+            "like-via-repost",
+        );
+        assert!(rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn bulk_notifications_and_post_agg_are_exact_and_replay_safe() {
+        use crate::indexer::bulk::{self, NotificationRow, PostCopyRow};
+
+        let pool = setup_test_pool();
+        let author = "did:plc:wintermute-test-notif-author";
+        let recipient = "did:plc:wintermute-test-notif-recip";
+        for did in [author, recipient] {
+            cleanup_test_data(&pool, did).await;
+        }
+
+        let client = pool.get().await.unwrap();
+        for did in [author, recipient] {
+            client
+                .execute(
+                    "INSERT INTO actor (did, \"indexedAt\") VALUES ($1, NOW()) \
+                     ON CONFLICT (did) DO NOTHING",
+                    &[&did],
+                )
+                .await
+                .unwrap();
+        }
+
+        let parent_uri = format!("at://{recipient}/app.bsky.feed.post/notifparent");
+        let cid = "bafyreihhl5mpvjkrhnnagen2fomozzhnhhdq2jr6cego2nzbvmwewv5rd4".to_owned();
+        let ts = "2026-07-30T00:00:00.000Z".to_owned();
+        client
+            .execute("DELETE FROM post_agg WHERE uri = $1", &[&parent_uri])
+            .await
+            .unwrap();
+        client
+            .execute("DELETE FROM quote WHERE subject = $1", &[&parent_uri])
+            .await
+            .unwrap();
+
+        // Parent post by recipient, then a batch reply by author: replyCount
+        // increments exactly once across a replay.
+        let parent = PostCopyRow {
+            uri: parent_uri.clone(),
+            cid: cid.clone(),
+            creator: recipient.to_owned(),
+            text: "parent".to_owned(),
+            reply_root: None,
+            reply_root_cid: None,
+            reply_parent: None,
+            reply_parent_cid: None,
+            created_at: ts.clone(),
+            indexed_at: ts.clone(),
+            langs: None,
+            tags: None,
+        };
+        let reply = PostCopyRow {
+            uri: format!("at://{author}/app.bsky.feed.post/notifreply"),
+            cid: cid.clone(),
+            creator: author.to_owned(),
+            text: "reply".to_owned(),
+            reply_root: Some(parent_uri.clone()),
+            reply_root_cid: Some(cid.clone()),
+            reply_parent: Some(parent_uri.clone()),
+            reply_parent_cid: Some(cid.clone()),
+            created_at: ts.clone(),
+            indexed_at: ts.clone(),
+            langs: None,
+            tags: None,
+        };
+        let applied = bulk::copy_insert_posts(&client, &[parent, reply], true)
+            .await
+            .unwrap();
+        assert_eq!(applied.len(), 2, "both posts must apply");
+        let replay_row = PostCopyRow {
+            uri: format!("at://{author}/app.bsky.feed.post/notifreply"),
+            cid: cid.clone(),
+            creator: author.to_owned(),
+            text: "reply replay".to_owned(),
+            reply_root: Some(parent_uri.clone()),
+            reply_root_cid: Some(cid.clone()),
+            reply_parent: Some(parent_uri.clone()),
+            reply_parent_cid: Some(cid.clone()),
+            created_at: ts.clone(),
+            indexed_at: ts.clone(),
+            langs: None,
+            tags: None,
+        };
+        let replayed = bulk::copy_insert_posts(&client, &[replay_row], true)
+            .await
+            .unwrap();
+        assert!(replayed.is_empty(), "replayed post must not re-apply");
+
+        // Batch likes and reposts of the parent: likeCount/repostCount exact
+        // across replays.
+        let like = bulk::SubjectRecordRow {
+            uri: format!("at://{author}/app.bsky.feed.like/notiflike"),
+            cid: cid.clone(),
+            creator: author.to_owned(),
+            subject: parent_uri.clone(),
+            subject_cid: cid.clone(),
+            created_at: ts.clone(),
+            indexed_at: ts.clone(),
+            via: None,
+            via_cid: None,
+        };
+        let like_applied = bulk::copy_insert_likes(&client, std::slice::from_ref(&like), true)
+            .await
+            .unwrap();
+        assert_eq!(like_applied.len(), 1);
+        let like_replayed = bulk::copy_insert_likes(&client, std::slice::from_ref(&like), true)
+            .await
+            .unwrap();
+        assert!(like_replayed.is_empty());
+
+        let repost = bulk::SubjectRecordRow {
+            uri: format!("at://{author}/app.bsky.feed.repost/notifrepost"),
+            cid: cid.clone(),
+            creator: author.to_owned(),
+            subject: parent_uri.clone(),
+            subject_cid: cid.clone(),
+            created_at: ts.clone(),
+            indexed_at: ts.clone(),
+            via: None,
+            via_cid: None,
+        };
+        bulk::copy_insert_reposts(&client, std::slice::from_ref(&repost), true)
+            .await
+            .unwrap();
+        bulk::copy_insert_reposts(&client, std::slice::from_ref(&repost), true)
+            .await
+            .unwrap();
+
+        // Batch quote of the parent: quoteCount exact across replays.
+        let quote = (
+            format!("at://{author}/app.bsky.feed.post/notifquote"),
+            cid.clone(),
+            parent_uri.clone(),
+            cid.clone(),
+            ts.clone(),
+            ts.clone(),
+        );
+        bulk::copy_insert_quotes(&client, std::slice::from_ref(&quote), true)
+            .await
+            .unwrap();
+        bulk::copy_insert_quotes(&client, std::slice::from_ref(&quote), true)
+            .await
+            .unwrap();
+
+        let agg = client
+            .query_one(
+                "SELECT \"replyCount\", \"likeCount\", \"repostCount\", \"quoteCount\" \
+                 FROM post_agg WHERE uri = $1",
+                &[&parent_uri],
+            )
+            .await
+            .unwrap();
+        assert_eq!(agg.get::<_, i64>(0), 1, "replyCount must be exactly 1");
+        assert_eq!(agg.get::<_, i64>(1), 1, "likeCount must be exactly 1");
+        assert_eq!(agg.get::<_, i64>(2), 1, "repostCount must be exactly 1");
+        assert_eq!(agg.get::<_, i64>(3), 1, "quoteCount must be exactly 1");
+
+        // Bulk notifications dedupe on (did, recordUri, reason).
+        let notif = NotificationRow {
+            did: recipient.to_owned(),
+            author: author.to_owned(),
+            record_uri: format!("at://{author}/app.bsky.feed.like/notiflike"),
+            record_cid: cid.clone(),
+            reason: "like",
+            reason_subject: Some(parent_uri.clone()),
+            sort_at: ts.clone(),
+        };
+        bulk::copy_insert_notifications(&client, std::slice::from_ref(&notif))
+            .await
+            .unwrap();
+        bulk::copy_insert_notifications(&client, std::slice::from_ref(&notif))
+            .await
+            .unwrap();
+        let notif_count: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM notification WHERE did = $1 AND author = $2",
+                &[&recipient, &author],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(notif_count, 1, "notification must dedupe to exactly 1");
+
+        client
+            .execute("DELETE FROM post_agg WHERE uri = $1", &[&parent_uri])
+            .await
+            .unwrap();
+        for did in [author, recipient] {
+            cleanup_test_data(&pool, did).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_toggle_sequence_keeps_final_like_and_exact_counts() {
+        use crate::indexer::bulk::PostCopyRow;
+        use crate::types::{IndexJob, WriteAction};
+
+        let pool = setup_test_pool();
+        let liker = "did:plc:wintermute-test-toggle-liker";
+        let author = "did:plc:wintermute-test-toggle-author";
+        for did in [liker, author] {
+            cleanup_test_data(&pool, did).await;
+        }
+
+        let client = pool.get().await.unwrap();
+        for did in [liker, author] {
+            client
+                .execute(
+                    "INSERT INTO actor (did, \"indexedAt\") VALUES ($1, NOW()) \
+                     ON CONFLICT (did) DO NOTHING",
+                    &[&did],
+                )
+                .await
+                .unwrap();
+        }
+
+        let post_uri = format!("at://{author}/app.bsky.feed.post/togglepost");
+        let cid = "bafyreihhl5mpvjkrhnnagen2fomozzhnhhdq2jr6cego2nzbvmwewv5rd4".to_owned();
+        let ts = "2026-07-31T00:00:00.000Z".to_owned();
+        client
+            .execute("DELETE FROM post_agg WHERE uri = $1", &[&post_uri])
+            .await
+            .unwrap();
+        crate::indexer::bulk::copy_insert_posts(
+            &client,
+            &[PostCopyRow {
+                uri: post_uri.clone(),
+                cid: cid.clone(),
+                creator: author.to_owned(),
+                text: "toggle target".to_owned(),
+                reply_root: None,
+                reply_root_cid: None,
+                reply_parent: None,
+                reply_parent_cid: None,
+                created_at: ts.clone(),
+                indexed_at: ts.clone(),
+                langs: None,
+                tags: None,
+            }],
+            true,
+        )
+        .await
+        .unwrap();
+
+        let like_record = serde_json::json!({
+            "$type": "app.bsky.feed.like",
+            "subject": {"uri": post_uri, "cid": cid},
+            "createdAt": ts,
+        });
+        let like_uri = |rkey: &str| format!("at://{liker}/app.bsky.feed.like/{rkey}");
+        let job = |rkey: &str, action: WriteAction, rev: &str, with_record: bool| IndexJob {
+            uri: like_uri(rkey),
+            cid: cid.clone(),
+            action,
+            record: with_record.then(|| like_record.clone()),
+            indexed_at: ts.clone(),
+            rev: rev.to_owned(),
+            provenance: None,
+        };
+
+        // like, unlike, re-like within ONE drain batch: the phase split
+        // (creates before deletes) must not eat the final like.
+        let jobs = vec![
+            (
+                b"k1".to_vec(),
+                job("toggle1", WriteAction::Create, "3a", true),
+            ),
+            (
+                b"k2".to_vec(),
+                job("toggle1", WriteAction::Delete, "3b", false),
+            ),
+            (
+                b"k3".to_vec(),
+                job("toggle2", WriteAction::Create, "3c", true),
+            ),
+        ];
+        let (results, batch_failed) =
+            IndexerManager::process_jobs_batch(&pool, &jobs, false, false).await;
+        assert!(!batch_failed);
+        assert_eq!(results.len(), 3);
+        for (_, r) in &results {
+            assert!(r.is_ok(), "job failed: {r:?}");
+        }
+
+        let final_like: Option<String> = client
+            .query_opt(
+                "SELECT uri FROM \"like\" WHERE creator = $1 AND subject = $2",
+                &[&liker, &post_uri],
+            )
+            .await
+            .unwrap()
+            .map(|r| r.get(0));
+        assert_eq!(
+            final_like.as_deref(),
+            Some(like_uri("toggle2").as_str()),
+            "the re-like must survive the toggle sequence"
+        );
+        let agg: i64 = client
+            .query_one(
+                "SELECT \"likeCount\" FROM post_agg WHERE uri = $1",
+                &[&post_uri],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(agg, 1, "likeCount must be exactly 1 after toggle");
+
+        // Cross-batch toggle: unlike toggle2 and re-like as toggle3 in ONE
+        // batch (the create of toggle2 was a prior batch). Deletes must run
+        // before creates or toggle3 dies on the (subject, creator) conflict
+        // with toggle2's still-present row.
+        let cross_jobs = vec![
+            (
+                b"k4".to_vec(),
+                job("toggle2", WriteAction::Delete, "3d", false),
+            ),
+            (
+                b"k5".to_vec(),
+                job("toggle3", WriteAction::Create, "3e", true),
+            ),
+        ];
+        let (results, batch_failed) =
+            IndexerManager::process_jobs_batch(&pool, &cross_jobs, false, false).await;
+        assert!(!batch_failed);
+        assert!(results.iter().all(|(_, r)| r.is_ok()));
+
+        let final_like: Option<String> = client
+            .query_opt(
+                "SELECT uri FROM \"like\" WHERE creator = $1 AND subject = $2",
+                &[&liker, &post_uri],
+            )
+            .await
+            .unwrap()
+            .map(|r| r.get(0));
+        assert_eq!(
+            final_like.as_deref(),
+            Some(like_uri("toggle3").as_str()),
+            "the cross-batch re-like must survive the phase split"
+        );
+        let agg: i64 = client
+            .query_one(
+                "SELECT \"likeCount\" FROM post_agg WHERE uri = $1",
+                &[&post_uri],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            agg, 1,
+            "likeCount must be exactly 1 after cross-batch toggle"
+        );
+
+        // Final unlike in its own batch: the batch delete path must decrement.
+        let delete_jobs = vec![(
+            b"k6".to_vec(),
+            job("toggle3", WriteAction::Delete, "3f", false),
+        )];
+        let (results, batch_failed) =
+            IndexerManager::process_jobs_batch(&pool, &delete_jobs, false, false).await;
+        assert!(!batch_failed);
+        assert!(results.iter().all(|(_, r)| r.is_ok()));
+
+        let remaining: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM \"like\" WHERE creator = $1 AND subject = $2",
+                &[&liker, &post_uri],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(remaining, 0, "unlike must delete the like row");
+        let agg: i64 = client
+            .query_one(
+                "SELECT \"likeCount\" FROM post_agg WHERE uri = $1",
+                &[&post_uri],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(agg, 0, "likeCount must return to exactly 0 after unlike");
+
+        // A batch reply must notify the parent author via the set-based walk.
+        let reply_uri = format!("at://{liker}/app.bsky.feed.post/togglereply");
+        let reply_record = serde_json::json!({
+            "$type": "app.bsky.feed.post",
+            "text": "reply via batch",
+            "reply": {
+                "root": {"uri": post_uri, "cid": cid},
+                "parent": {"uri": post_uri, "cid": cid},
+            },
+            "createdAt": ts,
+        });
+        let reply_jobs = vec![(
+            b"k7".to_vec(),
+            IndexJob {
+                uri: reply_uri.clone(),
+                cid: cid.clone(),
+                action: WriteAction::Create,
+                record: Some(reply_record),
+                indexed_at: ts.clone(),
+                rev: "3g".to_owned(),
+                provenance: None,
+            },
+        )];
+        let (results, batch_failed) =
+            IndexerManager::process_jobs_batch(&pool, &reply_jobs, false, false).await;
+        assert!(!batch_failed);
+        assert!(results.iter().all(|(_, r)| r.is_ok()));
+
+        let reply_notif: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM notification \
+                 WHERE did = $1 AND \"recordUri\" = $2 AND reason = 'reply'",
+                &[&author, &reply_uri],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            reply_notif, 1,
+            "parent author must get a reply notification"
+        );
+
+        client
+            .execute("DELETE FROM post_agg WHERE uri = $1", &[&post_uri])
+            .await
+            .unwrap();
+        for did in [liker, author] {
+            cleanup_test_data(&pool, did).await;
+        }
+    }
+
+    #[test]
+    fn shard_live_jobs_is_deterministic_and_did_sticky() {
+        use crate::types::{IndexJob, WriteAction};
+
+        let job = |did: &str, rkey: &str| IndexJob {
+            uri: format!("at://{did}/app.bsky.feed.post/{rkey}"),
+            cid: "cid".to_owned(),
+            action: WriteAction::Create,
+            record: None,
+            indexed_at: "2026-08-01T00:00:00.000Z".to_owned(),
+            rev: "3a".to_owned(),
+            provenance: None,
+        };
+        let batch: Vec<(Vec<u8>, IndexJob)> = (0u8..40)
+            .map(|i| {
+                let did = format!("did:plc:sharddid{}", i % 7);
+                (vec![i], job(&did, &format!("r{i}")))
+            })
+            .collect();
+
+        let single = IndexerManager::shard_live_jobs(batch.clone(), 1);
+        assert_eq!(single.len(), 1);
+        assert_eq!(single[0].len(), 40);
+
+        let shards = IndexerManager::shard_live_jobs(batch.clone(), 4);
+        assert_eq!(shards.len(), 4);
+        assert_eq!(shards.iter().map(Vec::len).sum::<usize>(), 40);
+
+        let mut did_to_shard = std::collections::HashMap::new();
+        for (idx, shard) in shards.iter().enumerate() {
+            for (_, j) in shard {
+                let did = j.uri.split('/').nth(2).unwrap().to_owned();
+                if let Some(prev) = did_to_shard.insert(did, idx) {
+                    assert_eq!(prev, idx, "did split across shards");
+                }
+            }
+        }
+        assert!(
+            did_to_shard
+                .values()
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                > 1,
+            "test dids all hashed to one shard"
+        );
+
+        let again = IndexerManager::shard_live_jobs(batch, 4);
+        for (a, b) in shards.iter().zip(again.iter()) {
+            assert!(
+                a.iter().map(|(k, _)| k).eq(b.iter().map(|(k, _)| k)),
+                "shard assignment not deterministic"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn live_enqueue_wakes_waiting_drain() {
+        use crate::types::{IndexJob, WriteAction};
+
+        let (storage, _dir) = setup_test_storage();
+        let storage = Arc::new(storage);
+        let job = IndexJob {
+            uri: "at://did:plc:wintermute-test-wakeup/app.bsky.feed.post/r1".to_owned(),
+            cid: "cid".to_owned(),
+            action: WriteAction::Create,
+            record: None,
+            indexed_at: "2026-08-01T00:00:00.000Z".to_owned(),
+            rev: "3a".to_owned(),
+            provenance: None,
+        };
+
+        // An enqueue from a plain thread stores a permit even with no waiter,
+        // so the subsequent wait completes without consuming the timeout.
+        let enqueuer = {
+            let storage = Arc::clone(&storage);
+            let job = job.clone();
+            std::thread::spawn(move || storage.enqueue_firehose_live(&job).unwrap())
+        };
+        enqueuer.join().unwrap();
+
+        let start = std::time::Instant::now();
+        storage
+            .wait_for_live_enqueue(std::time::Duration::from_secs(5))
+            .await;
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(1),
+            "stored notify permit did not wake the waiter"
+        );
+
+        let start = std::time::Instant::now();
+        storage
+            .wait_for_live_enqueue(std::time::Duration::from_millis(20))
+            .await;
+        assert!(start.elapsed() >= std::time::Duration::from_millis(20));
+    }
+
+    async fn shard_pass_snapshot(
+        pool: &Pool,
+        post_uris: &[String],
+        authors: &[String],
+    ) -> (Vec<i64>, Vec<i64>, Vec<i64>) {
+        let client = pool.get().await.unwrap();
+        let mut like_rows = Vec::new();
+        let mut like_counts = Vec::new();
+        for uri in post_uris {
+            let rows: i64 = client
+                .query_one("SELECT COUNT(*) FROM \"like\" WHERE subject = $1", &[&uri])
+                .await
+                .unwrap()
+                .get(0);
+            like_rows.push(rows);
+            let agg: i64 = client
+                .query_one(
+                    "SELECT COALESCE((SELECT \"likeCount\" FROM post_agg WHERE uri = $1), 0)",
+                    &[&uri],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            like_counts.push(agg);
+        }
+        let mut notif_counts = Vec::new();
+        for did in authors {
+            let n: i64 = client
+                .query_one(
+                    "SELECT COUNT(*) FROM notification WHERE did = $1 AND reason = 'like'",
+                    &[&did],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            notif_counts.push(n);
+        }
+        (like_rows, like_counts, notif_counts)
+    }
+
+    async fn run_shard_pass(
+        pool: &Pool,
+        jobs: &[(Vec<u8>, crate::types::IndexJob)],
+        shards: usize,
+    ) {
+        let shard_batches = IndexerManager::shard_live_jobs(jobs.to_vec(), shards);
+        let results = IndexerManager::process_live_shards(pool, &shard_batches, false).await;
+        assert_eq!(results.len(), jobs.len());
+        for (_, r) in &results {
+            assert!(r.is_ok(), "job failed: {r:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn sharded_live_drain_matches_single_shard_results() {
+        use crate::types::{IndexJob, WriteAction};
+
+        let pool = setup_test_pool();
+        let authors: Vec<String> = (0..3)
+            .map(|i| format!("did:plc:wintermute-test-shard-author{i}"))
+            .collect();
+        let likers: Vec<String> = (0..3)
+            .map(|i| format!("did:plc:wintermute-test-shard-liker{i}"))
+            .collect();
+        let all_dids: Vec<&str> = authors
+            .iter()
+            .chain(likers.iter())
+            .map(String::as_str)
+            .collect();
+
+        let cid = "bafyreihhl5mpvjkrhnnagen2fomozzhnhhdq2jr6cego2nzbvmwewv5rd4".to_owned();
+        let ts = "2026-08-01T00:00:00.000Z".to_owned();
+        let post_uris: Vec<String> = authors
+            .iter()
+            .enumerate()
+            .map(|(i, a)| format!("at://{a}/app.bsky.feed.post/shardpost{i}"))
+            .collect();
+        let toggle_uri = format!("at://{}/app.bsky.feed.like/shardtoggle", likers[0]);
+
+        let mut jobs: Vec<(Vec<u8>, IndexJob)> = Vec::new();
+        let mut key = 0u8;
+        let mut push = |jobs: &mut Vec<(Vec<u8>, IndexJob)>,
+                        uri: String,
+                        action: WriteAction,
+                        record: Option<serde_json::Value>,
+                        rev: &str| {
+            key += 1;
+            jobs.push((
+                vec![key],
+                IndexJob {
+                    uri,
+                    cid: cid.clone(),
+                    action,
+                    record,
+                    indexed_at: ts.clone(),
+                    rev: rev.to_owned(),
+                    provenance: None,
+                },
+            ));
+        };
+        for (i, uri) in post_uris.iter().enumerate() {
+            let record = serde_json::json!({
+                "$type": "app.bsky.feed.post",
+                "text": format!("shard post {i}"),
+                "createdAt": ts,
+            });
+            push(
+                &mut jobs,
+                uri.clone(),
+                WriteAction::Create,
+                Some(record),
+                "3a",
+            );
+        }
+        for (i, post_uri) in post_uris.iter().enumerate() {
+            for (j, liker) in likers.iter().enumerate() {
+                let record = serde_json::json!({
+                    "$type": "app.bsky.feed.like",
+                    "subject": {"uri": post_uri, "cid": cid},
+                    "createdAt": ts,
+                });
+                push(
+                    &mut jobs,
+                    format!("at://{liker}/app.bsky.feed.like/sl{i}{j}"),
+                    WriteAction::Create,
+                    Some(record),
+                    "3a",
+                );
+            }
+        }
+        let second_toggle_uri = format!("at://{}/app.bsky.feed.like/shardtoggle2", likers[1]);
+        for (uri, subject) in [
+            (&toggle_uri, &post_uris[0]),
+            (&second_toggle_uri, &post_uris[1]),
+        ] {
+            let record = serde_json::json!({
+                "$type": "app.bsky.feed.like",
+                "subject": {"uri": subject, "cid": cid},
+                "createdAt": ts,
+            });
+            push(
+                &mut jobs,
+                uri.clone(),
+                WriteAction::Create,
+                Some(record),
+                "3a",
+            );
+            push(&mut jobs, uri.clone(), WriteAction::Delete, None, "3b");
+        }
+
+        let mut snapshots = Vec::new();
+        for shards in [1usize, 3] {
+            for did in &all_dids {
+                cleanup_test_data(&pool, did).await;
+            }
+            let client = pool.get().await.unwrap();
+            for did in &all_dids {
+                client
+                    .execute(
+                        "INSERT INTO actor (did, \"indexedAt\") VALUES ($1, NOW()) \
+                         ON CONFLICT (did) DO NOTHING",
+                        &[&did],
+                    )
+                    .await
+                    .unwrap();
+            }
+            drop(client);
+
+            run_shard_pass(&pool, &jobs, shards).await;
+
+            let snap = shard_pass_snapshot(&pool, &post_uris, &authors).await;
+            // Exact counts: 3 likes per post; the toggled like must be gone.
+            assert_eq!(snap.0, vec![3, 3, 3], "like rows wrong at shards={shards}");
+            assert_eq!(snap.1, vec![3, 3, 3], "likeCount wrong at shards={shards}");
+            let client = pool.get().await.unwrap();
+            for uri in [&toggle_uri, &second_toggle_uri] {
+                let toggle_left: i64 = client
+                    .query_one("SELECT COUNT(*) FROM \"like\" WHERE uri = $1", &[uri])
+                    .await
+                    .unwrap()
+                    .get(0);
+                assert_eq!(toggle_left, 0, "toggled like survived at shards={shards}");
+            }
+            snapshots.push(snap);
+        }
+        assert_eq!(
+            snapshots[0], snapshots[1],
+            "sharded results diverge from single-shard results"
+        );
+
+        for did in &all_dids {
+            cleanup_test_data(&pool, did).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn via_attribution_persists_from_batch_path() {
+        use crate::types::{IndexJob, WriteAction};
+
+        let pool = setup_test_pool();
+        let author = "did:plc:wintermute-test-via-author";
+        let actor = "did:plc:wintermute-test-via-actor";
+        for did in [author, actor] {
+            cleanup_test_data(&pool, did).await;
+        }
+        let client = pool.get().await.unwrap();
+        for did in [author, actor] {
+            client
+                .execute(
+                    "INSERT INTO actor (did, \"indexedAt\") VALUES ($1, NOW()) \
+                     ON CONFLICT (did) DO NOTHING",
+                    &[&did],
+                )
+                .await
+                .unwrap();
+        }
+        drop(client);
+
+        let cid = "bafyreihhl5mpvjkrhnnagen2fomozzhnhhdq2jr6cego2nzbvmwewv5rd4";
+        let ts = "2026-08-03T00:00:00.000Z";
+        let post_uri = format!("at://{author}/app.bsky.feed.post/viapost");
+        let via_uri = format!("at://{author}/app.bsky.feed.repost/viasource");
+        let subject = serde_json::json!({"uri": post_uri, "cid": cid});
+        let via = serde_json::json!({"uri": via_uri, "cid": cid});
+
+        let job = |coll: &str, rkey: &str, record: serde_json::Value| IndexJob {
+            uri: format!("at://{actor}/{coll}/{rkey}"),
+            cid: cid.to_owned(),
+            action: WriteAction::Create,
+            record: Some(record),
+            indexed_at: ts.to_owned(),
+            rev: "3a".to_owned(),
+            provenance: None,
+        };
+        let jobs = vec![
+            (
+                b"v1".to_vec(),
+                job(
+                    "app.bsky.feed.like",
+                    "withvia",
+                    serde_json::json!({"$type": "app.bsky.feed.like", "subject": subject, "via": via, "createdAt": ts}),
+                ),
+            ),
+            (
+                b"v2".to_vec(),
+                job(
+                    "app.bsky.feed.like",
+                    "novia",
+                    serde_json::json!({"$type": "app.bsky.feed.like", "subject": {"uri": format!("at://{author}/app.bsky.feed.post/viapost2"), "cid": cid}, "createdAt": ts}),
+                ),
+            ),
+            (
+                b"v3".to_vec(),
+                job(
+                    "app.bsky.feed.repost",
+                    "withvia",
+                    serde_json::json!({"$type": "app.bsky.feed.repost", "subject": subject, "via": via, "createdAt": ts}),
+                ),
+            ),
+            (
+                b"v4".to_vec(),
+                job(
+                    "app.bsky.graph.follow",
+                    "withvia",
+                    serde_json::json!({"$type": "app.bsky.graph.follow", "subject": author, "via": via, "createdAt": ts}),
+                ),
+            ),
+        ];
+        let (results, batch_failed) =
+            IndexerManager::process_jobs_batch(&pool, &jobs, false, false).await;
+        assert!(!batch_failed);
+        for (_, r) in &results {
+            assert!(r.is_ok(), "job failed: {r:?}");
+        }
+
+        let client = pool.get().await.unwrap();
+        for (table, coll, rkey, expect_via) in [
+            ("\"like\"", "app.bsky.feed.like", "withvia", true),
+            ("\"like\"", "app.bsky.feed.like", "novia", false),
+            ("repost", "app.bsky.feed.repost", "withvia", true),
+            ("follow", "app.bsky.graph.follow", "withvia", true),
+        ] {
+            let uri = format!("at://{actor}/{coll}/{rkey}");
+            let row = client
+                .query_one(
+                    &format!("SELECT via, \"viaCid\" FROM {table} WHERE uri = $1"),
+                    &[&uri],
+                )
+                .await
+                .unwrap();
+            let got_via: Option<String> = row.get(0);
+            let got_via_cid: Option<String> = row.get(1);
+            if expect_via {
+                assert_eq!(got_via.as_deref(), Some(via_uri.as_str()), "{uri}");
+                assert_eq!(got_via_cid.as_deref(), Some(cid), "{uri}");
+            } else {
+                assert!(got_via.is_none() && got_via_cid.is_none(), "{uri}");
+            }
+        }
+        drop(client);
+
+        for did in [author, actor] {
+            cleanup_test_data(&pool, did).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn skip_boilerplate_omits_record_rows_with_exact_effects() {
+        use crate::types::{IndexJob, WriteAction};
+
+        let pool = setup_test_pool();
+        let author = "did:plc:wintermute-test-skip-author";
+        let liker = "did:plc:wintermute-test-skip-liker";
+        for did in [author, liker] {
+            cleanup_test_data(&pool, did).await;
+        }
+        let client = pool.get().await.unwrap();
+        for did in [author, liker] {
+            client
+                .execute(
+                    "INSERT INTO actor (did, \"indexedAt\") VALUES ($1, NOW()) \
+                     ON CONFLICT (did) DO NOTHING",
+                    &[&did],
+                )
+                .await
+                .unwrap();
+        }
+        drop(client);
+
+        let cid = "bafyreihhl5mpvjkrhnnagen2fomozzhnhhdq2jr6cego2nzbvmwewv5rd4";
+        let ts = "2026-08-04T00:00:00.000Z";
+        let post_uri = format!("at://{author}/app.bsky.feed.post/skippost");
+        let like_uri = format!("at://{liker}/app.bsky.feed.like/skiplike");
+
+        let jobs = vec![
+            (
+                b"s1".to_vec(),
+                IndexJob {
+                    uri: post_uri.clone(),
+                    cid: cid.to_owned(),
+                    action: WriteAction::Create,
+                    record: Some(serde_json::json!({
+                        "$type": "app.bsky.feed.post", "text": "skip test", "createdAt": ts
+                    })),
+                    indexed_at: ts.to_owned(),
+                    rev: "3a".to_owned(),
+                    provenance: None,
+                },
+            ),
+            (
+                b"s2".to_vec(),
+                IndexJob {
+                    uri: like_uri.clone(),
+                    cid: cid.to_owned(),
+                    action: WriteAction::Create,
+                    record: Some(serde_json::json!({
+                        "$type": "app.bsky.feed.like",
+                        "subject": {"uri": post_uri, "cid": cid},
+                        "createdAt": ts
+                    })),
+                    indexed_at: ts.to_owned(),
+                    rev: "3a".to_owned(),
+                    provenance: None,
+                },
+            ),
+        ];
+
+        let (results, batch_failed) =
+            IndexerManager::process_jobs_batch(&pool, &jobs, false, true).await;
+        assert!(!batch_failed);
+        for (_, r) in &results {
+            assert!(r.is_ok(), "job failed: {r:?}");
+        }
+
+        let client = pool.get().await.unwrap();
+        let record_rows: i64 = client
+            .query_one(
+                "SELECT count(*) FROM record WHERE uri = ANY($1)",
+                &[&vec![post_uri.clone(), like_uri.clone()]],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(record_rows, 1, "only the post belongs in the record table");
+        let post_record: i64 = client
+            .query_one("SELECT count(*) FROM record WHERE uri = $1", &[&post_uri])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(post_record, 1);
+        let like_row: i64 = client
+            .query_one("SELECT count(*) FROM \"like\" WHERE uri = $1", &[&like_uri])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(like_row, 1, "typed like row must exist without record row");
+        let like_count: i64 = client
+            .query_one(
+                "SELECT COALESCE((SELECT \"likeCount\" FROM post_agg WHERE uri = $1), 0)",
+                &[&post_uri],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(like_count, 1);
+        let notif: i64 = client
+            .query_one(
+                "SELECT count(*) FROM notification WHERE did = $1 AND \"recordUri\" = $2",
+                &[&author, &like_uri],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(notif, 1, "like notification must exist");
+        drop(client);
+
+        // Replay: idempotent without the record gate.
+        let (replay_results, replay_failed) =
+            IndexerManager::process_jobs_batch(&pool, &jobs, false, true).await;
+        assert!(!replay_failed);
+        for (_, r) in &replay_results {
+            assert!(r.is_ok());
+        }
+        let client = pool.get().await.unwrap();
+        let like_count: i64 = client
+            .query_one(
+                "SELECT COALESCE((SELECT \"likeCount\" FROM post_agg WHERE uri = $1), 0)",
+                &[&post_uri],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(like_count, 1, "replay must not double count");
+        drop(client);
+
+        // Delete the like with the flag on: typed row gone, count exact.
+        let delete_jobs = vec![(
+            b"s3".to_vec(),
+            IndexJob {
+                uri: like_uri.clone(),
+                cid: String::new(),
+                action: WriteAction::Delete,
+                record: None,
+                indexed_at: ts.to_owned(),
+                rev: "3b".to_owned(),
+                provenance: None,
+            },
+        )];
+        let (del_results, del_failed) =
+            IndexerManager::process_jobs_batch(&pool, &delete_jobs, false, true).await;
+        assert!(!del_failed);
+        for (_, r) in &del_results {
+            assert!(r.is_ok());
+        }
+        let client = pool.get().await.unwrap();
+        let like_row: i64 = client
+            .query_one("SELECT count(*) FROM \"like\" WHERE uri = $1", &[&like_uri])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(like_row, 0, "typed like row must be deleted");
+        let like_count: i64 = client
+            .query_one(
+                "SELECT COALESCE((SELECT \"likeCount\" FROM post_agg WHERE uri = $1), 0)",
+                &[&post_uri],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(like_count, 0, "likeCount must return to zero");
+        drop(client);
+
+        for did in [author, liker] {
+            cleanup_test_data(&pool, did).await;
+        }
     }
 }

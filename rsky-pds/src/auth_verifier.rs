@@ -1,14 +1,17 @@
 use crate::account_manager::helpers::account::{ActorAccount, AvailabilityFlags};
-use crate::account_manager::helpers::auth::CustomClaimObj;
+use crate::account_manager::helpers::auth::{
+    SessionTokenError, SessionVerifyOptions, ACCESS_TOKEN_TYP, PDS_JWT_SIGNER, REFRESH_TOKEN_TYP,
+};
 use crate::account_manager::AccountManager;
 use crate::apis::ApiError;
-use crate::config::configured_entryway_did;
+use crate::permission_set::SharedPermissionSets;
 use crate::xrpc_server::auth::{verify_jwt as verify_service_jwt_server, ServiceJwtPayload};
 use crate::SharedIdResolver;
 use anyhow::{bail, Result};
-use base64::{engine::general_purpose::STANDARD as base64pad, Engine as _};
-use jwt_simple::claims::Audiences;
-use jwt_simple::prelude::*;
+use base64::{
+    engine::general_purpose::{STANDARD as base64pad, URL_SAFE_NO_PAD as base64url},
+    Engine as _,
+};
 use rocket::http::Status;
 use rocket::request::{FromRequest, Outcome, Request};
 use rocket::State;
@@ -16,27 +19,19 @@ use rsky_common::env::env_str;
 use rsky_common::get_verification_material;
 use rsky_identity::did::atproto_data::get_did_key_from_multibase;
 use rsky_identity::types::DidDocument;
-use secp256k1::{Keypair, Secp256k1, SecretKey};
 use std::env;
 use std::str;
 use thiserror::Error;
 
-const INFINITY: u64 = u64::MAX;
+pub mod scope;
 
-/// True when `err` is jwt-simple's expiry error (`JWTError::TokenHasExpired`),
-/// as opposed to a signature/format/other verification failure.
-///
-/// jwt-simple's `Error` is an `anyhow::Error` that wraps the `JWTError` enum
-/// (raised via `ensure!(..., JWTError::TokenHasExpired)`), so we recover the
-/// concrete cause with `downcast_ref`. This lets an expired token surface as an
-/// `ExpiredToken` code instead of being masked by the repo-key fallback or
-/// collapsed into a generic `BadJwt`. jwt-simple verifies the signature *before*
-/// validating claims, so a token signed by a different key fails at signature
-/// (never expiry) -- the repo-key service-auth path is unaffected.
+/// True when `err` is the session-token expiry error, as opposed to a
+/// signature, format, or other verification failure, so an expired token
+/// surfaces as `ExpiredToken` instead of being collapsed into `BadJwt`.
 pub(crate) fn is_expired_jwt(err: &anyhow::Error) -> bool {
     matches!(
-        err.downcast_ref::<jwt_simple::JWTError>(),
-        Some(jwt_simple::JWTError::TokenHasExpired)
+        err.downcast_ref::<SessionTokenError>(),
+        Some(SessionTokenError::Expired)
     )
 }
 
@@ -47,6 +42,9 @@ pub enum AuthScope {
     AppPass,
     AppPassPrivileged,
     SignupQueued,
+    /// A session on a taken-down account, limited to the methods that let
+    /// the account recover or export itself.
+    Takendown,
 }
 
 impl AuthScope {
@@ -57,9 +55,11 @@ impl AuthScope {
             AuthScope::AppPass => "com.atproto.appPass",
             AuthScope::AppPassPrivileged => "com.atproto.appPassPrivileged",
             AuthScope::SignupQueued => "com.atproto.signupQueued",
+            AuthScope::Takendown => "com.atproto.takendown",
         }
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(scope: &str) -> Result<Self> {
         match scope {
             "com.atproto.access" => Ok(AuthScope::Access),
@@ -67,8 +67,17 @@ impl AuthScope {
             "com.atproto.appPass" => Ok(AuthScope::AppPass),
             "com.atproto.appPassPrivileged" => Ok(AuthScope::AppPassPrivileged),
             "com.atproto.signupQueued" => Ok(AuthScope::SignupQueued),
+            "com.atproto.takendown" => Ok(AuthScope::Takendown),
             _ => bail!("Invalid AuthScope: `{scope:?}` is not a valid auth scope"),
         }
+    }
+
+    /// Whether a session carrying this scope is "privileged" -- i.e. allowed
+    /// to request service-auth tokens for privileged methods
+    /// (`chat.bsky.*`, `com.atproto.server.createAccount`). True only for a
+    /// full `Access` session or an `AppPassPrivileged` app password.
+    pub fn is_privileged(&self) -> bool {
+        matches!(self, AuthScope::Access | AuthScope::AppPassPrivileged)
     }
 }
 
@@ -83,6 +92,11 @@ pub struct Credentials {
     pub r#type: String,
     pub did: Option<String>,
     pub scope: Option<AuthScope>,
+    /// The scope strings the session was actually granted, when it came from
+    /// the OAuth provider. `None` for sessions that predate the scope model
+    /// (app passwords, legacy access tokens), which carry no scope grammar to
+    /// evaluate.
+    pub granted_scopes: Option<Vec<String>>,
     pub audience: Option<String>,
     pub token_id: Option<String>,
     pub aud: Option<String>,
@@ -134,16 +148,24 @@ pub struct BasicAuth {
 pub struct JwtPayload {
     pub scope: AuthScope,
     pub sub: Option<String>,
-    pub aud: Option<Audiences>,
-    pub exp: Option<Duration>,
-    pub iat: Option<Duration>,
+    pub aud: Option<String>,
+    pub exp: Option<u64>,
+    pub iat: Option<u64>,
     pub jti: Option<String>,
 }
 
-#[derive(Error, Debug)]
+#[derive(Error, Debug, Clone)]
 pub enum AuthError {
-    #[error("ExpiredToken: `Token is expired`")]
+    #[error("ExpiredToken: `Token has expired`")]
     ExpiredToken,
+    #[error("AuthMissing: `Authentication Required`")]
+    AuthMissing,
+    /// A rejected OAuth credential, rendered with its OAuth error code.
+    #[error("{0}: `{1}`")]
+    OAuth(String, String),
+    /// A credential kind the method does not accept.
+    #[error("Forbidden: `{0}`")]
+    Forbidden(String),
     #[error("BadJwt: `{0}`")]
     BadJwt(String),
     #[error("BadJwtAudience: `{0}`")]
@@ -173,17 +195,19 @@ impl<'r> FromRequest<'r> for Refresh {
     type Error = AuthError;
 
     async fn from_request(req: &'r Request<'_>) -> Outcome<Self, Self::Error> {
-        let mut options = VerificationOptions::default();
-        options.allowed_audiences = Some(HashSet::from_strings(&[
-            env::var("PDS_SERVICE_DID").unwrap()
-        ]));
+        let options = SessionVerifyOptions {
+            audience: Some(env::var("PDS_SERVICE_DID").unwrap()),
+            allow_expired: false,
+        };
+
         let ValidatedBearer {
             did,
             scope,
             token,
             payload,
             audience,
-        } = match validate_bearer_token(req, vec![AuthScope::Refresh], Some(options)).await {
+        } = match validate_bearer_token(req, vec![AuthScope::Refresh], REFRESH_TOKEN_TYP, &options)
+        {
             Ok(result) => {
                 let payload = result.payload.clone();
                 match payload.jti {
@@ -198,21 +222,18 @@ impl<'r> FromRequest<'r> for Refresh {
             }
             Err(error) => {
                 // The refresh guard bypasses `access_check`, so map expiry here
-                // too: an expired REFRESH token on refreshSession must yield
+                // too: an expired REFRESH token on refreshSession must surface as
                 // ExpiredToken so clients know the session is unrecoverable.
-                let error = if is_expired_jwt(&error) {
-                    AuthError::ExpiredToken
-                } else {
-                    AuthError::BadJwt(error.to_string())
-                };
+                let (status, error) = bearer_failure(error);
                 req.local_cache(|| Some(ApiError::from(&error)));
-                return Outcome::Error((Status::BadRequest, error));
+                return Outcome::Error((status, error));
             }
         };
         Outcome::Success(Refresh {
             access: AccessOutput {
                 credentials: Some(Credentials {
                     r#type: "refresh".to_string(),
+                    granted_scopes: None,
                     did: Some(did),
                     scope: Some(scope),
                     audience,
@@ -227,8 +248,8 @@ impl<'r> FromRequest<'r> for Refresh {
     }
 }
 
-pub async fn access_check<'r>(
-    req: &'r Request<'_>,
+pub async fn access_check(
+    req: &Request<'_>,
     scopes: Vec<AuthScope>,
     opts: Option<ValidateAccessTokenOpts>,
 ) -> Outcome<AccessOutput, AuthError> {
@@ -247,16 +268,32 @@ pub async fn access_check<'r>(
                 Status::BadRequest,
                 AuthError::AccountTakedown(error.to_string()),
             )),
-            _ if is_expired_jwt(&error) => {
-                Outcome::Error((Status::BadRequest, AuthError::ExpiredToken))
-            }
-            _ => Outcome::Error((Status::BadRequest, AuthError::BadJwt(error.to_string()))),
+            Some(AuthError::AuthRequired(error)) => Outcome::Error((
+                Status::Unauthorized,
+                AuthError::AuthRequired(error.to_string()),
+            )),
+            Some(AuthError::OAuth(code, description)) => Outcome::Error((
+                Status::Unauthorized,
+                AuthError::OAuth(code.clone(), description.clone()),
+            )),
+            _ => Outcome::Error(bearer_failure(error)),
         },
     }
 }
 
+/// Maps a bearer-token failure onto the status and error the reference PDS
+/// answers with: a missing header is 401 `AuthMissing`, an expired token 400
+/// `ExpiredToken`, anything else 400 `InvalidToken`.
+fn bearer_failure(error: anyhow::Error) -> (Status, AuthError) {
+    match error.downcast_ref::<AuthError>() {
+        Some(AuthError::AuthMissing) => (Status::Unauthorized, AuthError::AuthMissing),
+        _ if is_expired_jwt(&error) => (Status::BadRequest, AuthError::ExpiredToken),
+        _ => (Status::BadRequest, AuthError::BadJwt(error.to_string())),
+    }
+}
+
 pub struct AccessFullImport {
-    pub access: AccessOutput,
+    access: AccessOutput,
 }
 
 #[rocket::async_trait]
@@ -268,7 +305,7 @@ impl<'r> FromRequest<'r> for AccessFullImport {
             check_takedown: Some(true),
             check_deactivated: Some(false),
         };
-        match access_check(req, vec![AuthScope::Access], Some(opts)).await {
+        match access_check(req, full_access_scopes(req, vec![]), Some(opts)).await {
             Outcome::Success(access) => Outcome::Success(AccessFullImport { access }),
             Outcome::Error(error) => Outcome::Error(error),
             Outcome::Forward(_) => panic!("Outcome::Forward returned"),
@@ -276,17 +313,50 @@ impl<'r> FromRequest<'r> for AccessFullImport {
     }
 }
 
-pub struct AccessFull {
+/// Auth for the permissioned-space session surface.
+///
+/// A full session passes. So does an OAuth session that speaks the granular
+/// scope grammar -- its `space:` grants (inline or resolved from an
+/// `include:` permission set) are the actual authority, enforced per-request
+/// by `space_auth::session_permits`. An app-password session is refused: the
+/// space methods are OAuth-gated per the proposal, and an app password can
+/// carry no grant to evaluate.
+pub struct AccessSpace {
     pub access: AccessOutput,
 }
 
 #[rocket::async_trait]
-impl<'r> FromRequest<'r> for AccessFull {
+impl<'r> FromRequest<'r> for AccessSpace {
     type Error = AuthError;
 
     async fn from_request(req: &'r Request<'_>) -> Outcome<Self, Self::Error> {
-        match access_check(req, vec![AuthScope::Access], None).await {
-            Outcome::Success(access) => Outcome::Success(AccessFull { access }),
+        let outcome = access_check(
+            req,
+            vec![
+                AuthScope::Access,
+                AuthScope::AppPass,
+                AuthScope::AppPassPrivileged,
+            ],
+            None,
+        )
+        .await;
+        match outcome {
+            Outcome::Success(access) => {
+                let credentials = access.credentials.as_ref();
+                let is_full =
+                    credentials.and_then(|c| c.scope.as_ref()) == Some(&AuthScope::Access);
+                let speaks_grammar = credentials
+                    .map(|c| c.granted_scopes.is_some())
+                    .unwrap_or(false);
+                if is_full || speaks_grammar {
+                    Outcome::Success(AccessSpace { access })
+                } else {
+                    let error =
+                        AuthError::BadJwt("space methods require an OAuth session".to_string());
+                    req.local_cache(|| Some(ApiError::from(&error)));
+                    Outcome::Error((Status::BadRequest, error))
+                }
+            }
             Outcome::Error(error) => {
                 req.local_cache(|| Some(ApiError::from(&error.1)));
                 Outcome::Error(error)
@@ -296,8 +366,91 @@ impl<'r> FromRequest<'r> for AccessFull {
     }
 }
 
-pub struct AccessPrivileged {
+pub struct AccessFull {
+    access: AccessOutput,
+}
+
+/// The legacy scopes a full-access method admits: `Access` plus `extra`. An
+/// OAuth session is admitted regardless, as the reference does; whether it
+/// may act is the route's scope declaration to decide (`OAuthForbidden`,
+/// `IdentityFull`, `AccountRepo`, ...), never the base guard's.
+fn full_access_scopes(req: &Request<'_>, extra: Vec<AuthScope>) -> Vec<AuthScope> {
+    if dpop_token_from_req(req).is_some() {
+        return vec![];
+    }
+    let mut scopes = vec![AuthScope::Access];
+    scopes.extend(extra);
+    scopes
+}
+
+async fn full_access_check(
+    req: &Request<'_>,
+    extra: Vec<AuthScope>,
+    opts: Option<ValidateAccessTokenOpts>,
+) -> Outcome<AccessOutput, AuthError> {
+    let scopes = full_access_scopes(req, extra);
+    match access_check(req, scopes, opts).await {
+        Outcome::Success(access) => Outcome::Success(access),
+        Outcome::Error(error) => {
+            req.local_cache(|| Some(ApiError::from(&error.1)));
+            Outcome::Error(error)
+        }
+        Outcome::Forward(_) => panic!("Outcome::Forward returned"),
+    }
+}
+
+#[rocket::async_trait]
+impl<'r> FromRequest<'r> for AccessFull {
+    type Error = AuthError;
+
+    async fn from_request(req: &'r Request<'_>) -> Outcome<Self, Self::Error> {
+        full_access_check(req, vec![], None)
+            .await
+            .map(|access| AccessFull { access })
+    }
+}
+
+/// Full access, also open to a taken-down account's recovery session.
+pub struct AccessFullAllowTakendown {
     pub access: AccessOutput,
+}
+
+#[rocket::async_trait]
+impl<'r> FromRequest<'r> for AccessFullAllowTakendown {
+    type Error = AuthError;
+
+    async fn from_request(req: &'r Request<'_>) -> Outcome<Self, Self::Error> {
+        full_access_check(req, vec![AuthScope::Takendown], None)
+            .await
+            .map(|access| AccessFullAllowTakendown { access })
+    }
+}
+
+/// Full access from an account that is not taken down.
+pub struct AccessFullCheckTakedown {
+    pub access: AccessOutput,
+}
+
+#[rocket::async_trait]
+impl<'r> FromRequest<'r> for AccessFullCheckTakedown {
+    type Error = AuthError;
+
+    async fn from_request(req: &'r Request<'_>) -> Outcome<Self, Self::Error> {
+        full_access_check(
+            req,
+            vec![],
+            Some(ValidateAccessTokenOpts {
+                check_deactivated: None,
+                check_takedown: Some(true),
+            }),
+        )
+        .await
+        .map(|access| AccessFullCheckTakedown { access })
+    }
+}
+
+pub struct AccessPrivileged {
+    access: AccessOutput,
 }
 
 #[rocket::async_trait]
@@ -323,38 +476,54 @@ impl<'r> FromRequest<'r> for AccessPrivileged {
 }
 
 pub struct AccessStandard {
-    pub access: AccessOutput,
+    access: AccessOutput,
 }
+
+/// One access verification per request, shared between guards. The
+/// pipethrough guard and a handler's own `AccessStandard` both verify the
+/// same request; without this cache the second verification replays the
+/// DPoP proof into the jti guard and every doubled route 400s.
+struct CachedAccessStandard(Result<AccessOutput, (Status, AuthError)>);
 
 #[rocket::async_trait]
 impl<'r> FromRequest<'r> for AccessStandard {
     type Error = AuthError;
 
     async fn from_request(req: &'r Request<'_>) -> Outcome<Self, Self::Error> {
-        match access_check(
-            req,
-            vec![
-                AuthScope::Access,
-                AuthScope::AppPass,
-                AuthScope::AppPassPrivileged,
-            ],
-            None,
-        )
-        .await
-        {
-            Outcome::Success(access) => Outcome::Success(AccessStandard { access }),
-            Outcome::Error(error) => {
-                req.local_cache(|| Some(ApiError::from(&error.1)));
-                Outcome::Error(error)
+        let cached: &CachedAccessStandard = req
+            .local_cache_async(async {
+                match access_check(
+                    req,
+                    vec![
+                        AuthScope::Access,
+                        AuthScope::AppPass,
+                        AuthScope::AppPassPrivileged,
+                    ],
+                    None,
+                )
+                .await
+                {
+                    Outcome::Success(access) => CachedAccessStandard(Ok(access)),
+                    Outcome::Error(error) => CachedAccessStandard(Err(error)),
+                    Outcome::Forward(_) => panic!("Outcome::Forward returned"),
+                }
+            })
+            .await;
+        match &cached.0 {
+            Ok(access) => Outcome::Success(AccessStandard {
+                access: access.clone(),
+            }),
+            Err((status, error)) => {
+                req.local_cache(|| Some(ApiError::from(error)));
+                Outcome::Error((*status, error.clone()))
             }
-            Outcome::Forward(_) => panic!("Outcome::Forward returned"),
         }
     }
 }
 
 #[derive(Clone)]
 pub struct AccessStandardIncludeChecks {
-    pub access: AccessOutput,
+    access: AccessOutput,
 }
 
 #[rocket::async_trait]
@@ -388,7 +557,7 @@ impl<'r> FromRequest<'r> for AccessStandardIncludeChecks {
 
 #[derive(Clone)]
 pub struct AccessStandardCheckTakedown {
-    pub access: AccessOutput,
+    access: AccessOutput,
 }
 
 #[rocket::async_trait]
@@ -421,7 +590,7 @@ impl<'r> FromRequest<'r> for AccessStandardCheckTakedown {
 }
 
 pub struct AccessStandardSignupQueued {
-    pub access: AccessOutput,
+    access: AccessOutput,
 }
 
 #[rocket::async_trait]
@@ -460,9 +629,13 @@ impl<'r> FromRequest<'r> for RevokeRefreshToken {
     type Error = AuthError;
 
     async fn from_request(req: &'r Request<'_>) -> Outcome<Self, Self::Error> {
-        let mut options = VerificationOptions::default();
-        options.max_validity = Some(Duration::from_secs(INFINITY));
-        match validate_bearer_token(req, vec![AuthScope::Refresh], Some(options)).await {
+        // a session may be deleted with an expired refresh token
+        let options = SessionVerifyOptions {
+            audience: Some(env::var("PDS_SERVICE_DID").unwrap()),
+            allow_expired: true,
+        };
+
+        match validate_bearer_token(req, vec![AuthScope::Refresh], REFRESH_TOKEN_TYP, &options) {
             Ok(result) => match result.payload.jti {
                 Some(jti) => Outcome::Success(RevokeRefreshToken { id: jti }),
                 None => {
@@ -472,15 +645,9 @@ impl<'r> FromRequest<'r> for RevokeRefreshToken {
                 }
             },
             Err(error) => {
-                // RevokeRefreshToken also bypasses `access_check`; surface
-                // expiry rather than collapsing it to BadJwt.
-                let error = if is_expired_jwt(&error) {
-                    AuthError::ExpiredToken
-                } else {
-                    AuthError::BadJwt(error.to_string())
-                };
+                let (status, error) = bearer_failure(error);
                 req.local_cache(|| Some(ApiError::from(&error)));
-                Outcome::Error((Status::BadRequest, error))
+                Outcome::Error((status, error))
             }
         }
     }
@@ -490,41 +657,108 @@ pub struct UserDidAuth {
     pub access: AccessOutput,
 }
 
+/// Verifies a service JWT addressed to this PDS and signed by the issuing
+/// account's own key.
+async fn verify_user_service_jwt(req: &Request<'_>) -> Result<VerifiedServiceJwt> {
+    let id_resolver = req.guard::<&State<SharedIdResolver>>().await.unwrap();
+    verify_service_jwt(
+        req,
+        id_resolver,
+        ServiceJwtOpts {
+            aud: Some(env::var("PDS_SERVICE_DID").unwrap()),
+            iss: None,
+        },
+    )
+    .await
+}
+
+fn service_jwt_credentials(
+    r#type: &str,
+    did: Option<String>,
+    jwt: VerifiedServiceJwt,
+) -> AccessOutput {
+    AccessOutput {
+        credentials: Some(Credentials {
+            r#type: r#type.to_string(),
+            granted_scopes: None,
+            did,
+            scope: None,
+            audience: None,
+            token_id: None,
+            aud: Some(jwt.aud),
+            iss: Some(jwt.iss),
+            is_privileged: None,
+        }),
+        artifacts: None,
+    }
+}
+
+fn bad_jwt_outcome<T>(req: &Request<'_>, error: anyhow::Error) -> Outcome<T, AuthError> {
+    let error = AuthError::BadJwt(error.to_string());
+    req.local_cache(|| Some(ApiError::from(&error)));
+    Outcome::Error((Status::BadRequest, error))
+}
+
 #[rocket::async_trait]
 impl<'r> FromRequest<'r> for UserDidAuth {
     type Error = AuthError;
 
     async fn from_request(req: &'r Request<'_>) -> Outcome<Self, Self::Error> {
-        let id_resolver = req.guard::<&State<SharedIdResolver>>().await.unwrap();
-        match verify_service_jwt(
-            req,
-            id_resolver,
-            ServiceJwtOpts {
-                aud: Some(env::var("PDS_SERVICE_DID").unwrap()),
-                iss: None,
-            },
-        )
-        .await
-        {
-            Ok(payload) => Outcome::Success(UserDidAuth {
-                access: AccessOutput {
-                    credentials: Some(Credentials {
-                        r#type: "user_did".to_string(),
-                        did: None,
-                        scope: None,
-                        audience: None,
-                        token_id: None,
-                        aud: Some(payload.aud),
-                        iss: Some(payload.iss),
-                        is_privileged: None,
-                    }),
-                    artifacts: None,
-                },
+        match verify_user_service_jwt(req).await {
+            Ok(jwt) => Outcome::Success(UserDidAuth {
+                access: service_jwt_credentials("user_did", None, jwt),
             }),
-            Err(error) => {
-                req.local_cache(|| Some(ApiError::from(&AuthError::BadJwt(error.to_string()))));
-                Outcome::Error((Status::BadRequest, AuthError::BadJwt(error.to_string())))
-            }
+            Err(error) => bad_jwt_outcome(req, error),
+        }
+    }
+}
+
+/// Whether a JWT payload carries the `lxm` claim only service tokens have.
+/// The payload is decoded, not verified; the caller verifies.
+fn jwt_names_method(jwt: &str) -> bool {
+    jwt.split('.')
+        .nth(1)
+        .and_then(|payload| {
+            base64url
+                .decode(payload)
+                .or_else(|_| base64pad.decode(payload))
+                .ok()
+        })
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .is_some_and(|payload| payload.get("lxm").is_some_and(|lxm| !lxm.is_null()))
+}
+
+fn is_definitely_service_auth(req: &Request<'_>) -> bool {
+    matches!(bearer_token_from_req(req), Ok(Some(jwt)) if jwt_names_method(&jwt))
+}
+
+/// Auth for methods a remote service may call on an account's behalf with a
+/// token the account minted through `getServiceAuth`, such as a video
+/// service uploading the transcoded blob. A bearer token naming a method is
+/// service auth; anything else is an ordinary session. `did` is the acting
+/// account either way.
+#[derive(Clone)]
+pub struct AccessOrUserServiceAuth {
+    pub access: AccessOutput,
+}
+
+#[rocket::async_trait]
+impl<'r> FromRequest<'r> for AccessOrUserServiceAuth {
+    type Error = AuthError;
+
+    async fn from_request(req: &'r Request<'_>) -> Outcome<Self, Self::Error> {
+        if !is_definitely_service_auth(req) {
+            return AccessStandardCheckTakedown::from_request(req)
+                .await
+                .map(|session| AccessOrUserServiceAuth {
+                    access: session.access,
+                });
+        }
+        match verify_user_service_jwt(req).await {
+            Ok(jwt) => Outcome::Success(AccessOrUserServiceAuth {
+                access: service_jwt_credentials("user_service_auth", Some(jwt.iss.clone()), jwt),
+            }),
+            Err(error) => bad_jwt_outcome(req, error),
         }
     }
 }
@@ -566,7 +800,6 @@ impl<'r> FromRequest<'r> for ModService {
     async fn from_request(req: &'r Request<'_>) -> Outcome<Self, Self::Error> {
         if let Some(mod_service_did) = env_str("PDS_MOD_SERVICE_DID") {
             let id_resolver = req.guard::<&State<SharedIdResolver>>().await.unwrap();
-            let entryway_did = configured_entryway_did();
             match verify_service_jwt(
                 req,
                 id_resolver,
@@ -580,42 +813,42 @@ impl<'r> FromRequest<'r> for ModService {
             )
             .await
             {
-                Ok(payload) => {
-                    let is_service_aud = Some(payload.aud.clone()) == env_str("PDS_SERVICE_DID");
-                    let is_entryway_aud = entryway_did.as_ref() == Some(&payload.aud);
-                    if !is_service_aud && !is_entryway_aud {
-                        let error = AuthError::BadJwtAudience(
-                            "jwt audience does not match service did".to_string(),
-                        );
-                        req.local_cache(|| Some(ApiError::from(&error)));
-                        Outcome::Error((Status::BadRequest, error))
-                    } else {
-                        Outcome::Success(ModService {
-                            access: AccessOutput {
-                                credentials: Some(Credentials {
-                                    r#type: "mod_service".to_string(),
-                                    did: None,
-                                    scope: None,
-                                    audience: None,
-                                    token_id: None,
-                                    aud: Some(payload.aud),
-                                    iss: Some(payload.iss),
-                                    is_privileged: None,
-                                }),
-                                artifacts: None,
-                            },
-                        })
-                    }
+                Ok(payload)
+                    if Some(payload.aud.clone()) != env_str("PDS_SERVICE_DID")
+                        && (env_str("PDS_ENTRYWAY_DID").is_none()
+                            || Some(payload.aud.clone()) != env_str("PDS_ENTRYWAY_DID")) =>
+                {
+                    let error = AuthError::BadJwtAudience(
+                        "jwt audience does not match service did".to_string(),
+                    );
+                    req.local_cache(|| Some(ApiError::InvalidRequest(error.to_string())));
+                    Outcome::Error((Status::BadRequest, error))
                 }
+                Ok(payload) => Outcome::Success(ModService {
+                    access: AccessOutput {
+                        credentials: Some(Credentials {
+                            r#type: "mod_service".to_string(),
+                            granted_scopes: None,
+                            did: None,
+                            scope: None,
+                            audience: None,
+                            token_id: None,
+                            aud: Some(payload.aud),
+                            iss: Some(payload.iss),
+                            is_privileged: None,
+                        }),
+                        artifacts: None,
+                    },
+                }),
                 Err(error) => {
                     let error = AuthError::BadJwt(error.to_string());
-                    req.local_cache(|| Some(ApiError::from(&error)));
+                    req.local_cache(|| Some(ApiError::InvalidRequest(error.to_string())));
                     Outcome::Error((Status::BadRequest, AuthError::BadJwt(error.to_string())))
                 }
             }
         } else {
             let error = AuthError::UntrustedIss("Untrusted issuer".to_string());
-            req.local_cache(|| Some(ApiError::from(&error)));
+            req.local_cache(|| Some(ApiError::InvalidRequest(error.to_string())));
             Outcome::Error((Status::BadRequest, error))
         }
     }
@@ -660,12 +893,6 @@ pub struct AdminToken {
     pub access: AccessOutput,
 }
 
-fn admin_password_from_env() -> Option<String> {
-    env::var("PDS_ADMIN_PASSWORD")
-        .ok()
-        .or_else(|| env::var("PDS_ADMIN_PASS").ok())
-}
-
 #[rocket::async_trait]
 impl<'r> FromRequest<'r> for AdminToken {
     type Error = AuthError;
@@ -679,24 +906,23 @@ impl<'r> FromRequest<'r> for AdminToken {
             )),
             Some(parsed) => {
                 let BasicAuth { username, password } = parsed;
-                let expected_password = match admin_password_from_env() {
-                    Some(password) => password,
-                    None => {
-                        let error = AuthError::AuthRequired("BadAuth".to_string());
-                        req.local_cache(|| Some(ApiError::from(&error)));
-                        return Outcome::Error((Status::BadRequest, error));
-                    }
-                };
 
-                if username != "admin" || password != expected_password {
+                let Some(admin_password) = admin_password_from_env() else {
+                    tracing::error!("admin password is not configured");
                     let error = AuthError::AuthRequired("BadAuth".to_string());
-                    req.local_cache(|| Some(ApiError::from(&error)));
+                    req.local_cache(|| Some(ApiError::InvalidRequest(error.to_string())));
+                    return Outcome::Error((Status::InternalServerError, error));
+                };
+                if username != "admin" || password != admin_password {
+                    let error = AuthError::AuthRequired("BadAuth".to_string());
+                    req.local_cache(|| Some(ApiError::InvalidRequest(error.to_string())));
                     Outcome::Error((Status::BadRequest, error))
                 } else {
                     Outcome::Success(AdminToken {
                         access: AccessOutput {
                             credentials: Some(Credentials {
                                 r#type: "admin_token".to_string(),
+                                granted_scopes: None,
                                 did: None,
                                 scope: None,
                                 audience: None,
@@ -725,7 +951,10 @@ impl<'r> FromRequest<'r> for OptionalAccessOrAdminToken {
 
     async fn from_request(req: &'r Request<'_>) -> Outcome<Self, Self::Error> {
         if is_bearer_token(req) {
-            match AccessFull::from_request(req).await {
+            // The reference's optional authorization accepts every session
+            // scope here, app passwords included; only the routes that act
+            // on the account narrow it further.
+            match AccessStandard::from_request(req).await {
                 Outcome::Success(output) => Outcome::Success(OptionalAccessOrAdminToken {
                     access: Some(output.access),
                 }),
@@ -752,25 +981,27 @@ impl<'r> FromRequest<'r> for OptionalAccessOrAdminToken {
     }
 }
 
-pub async fn validate_bearer_access_token<'r>(
-    request: &'r Request<'_>,
+pub async fn validate_bearer_access_token(
+    request: &Request<'_>,
     scopes: Vec<AuthScope>,
 ) -> Result<AccessOutput> {
-    let mut options = VerificationOptions::default();
-    options.allowed_audiences = Some(HashSet::from_strings(&[
-        env::var("PDS_SERVICE_DID").unwrap()
-    ]));
+    let options = SessionVerifyOptions {
+        audience: Some(env::var("PDS_SERVICE_DID")?),
+        allow_expired: false,
+    };
+
     let ValidatedBearer {
         did,
         scope,
         token,
         audience,
         ..
-    } = validate_bearer_token(request, scopes, Some(options)).await?;
-    let is_privileged = vec![AuthScope::Access, AuthScope::AppPassPrivileged].contains(&scope);
+    } = validate_bearer_token(request, scopes, ACCESS_TOKEN_TYP, &options)?;
+    let is_privileged = scope.is_privileged();
     Ok(AccessOutput {
         credentials: Some(Credentials {
             r#type: "access".to_string(),
+            granted_scopes: None,
             did: Some(did),
             scope: Some(scope),
             audience,
@@ -783,219 +1014,338 @@ pub async fn validate_bearer_access_token<'r>(
     })
 }
 
-pub async fn validate_bearer_token<'r>(
-    request: &'r Request<'_>,
+pub fn validate_bearer_token(
+    request: &Request,
     scopes: Vec<AuthScope>,
-    verify_options: Option<VerificationOptions>,
+    expected_typ: &str,
+    options: &SessionVerifyOptions,
 ) -> Result<ValidatedBearer> {
-    let token = bearer_token_from_req(request)?;
-    if let Some(token) = token {
-        let secp = Secp256k1::new();
-        // Try JWT key first (for session tokens)
-        let jwt_private_key = env::var("PDS_JWT_KEY_K256_PRIVATE_KEY_HEX").unwrap();
-        let jwt_secret_key =
-            SecretKey::from_slice(&hex::decode(jwt_private_key.as_bytes()).unwrap()).unwrap();
-        let jwt_key = Keypair::from_secret_key(&secp, &jwt_secret_key);
-        let payload = match verify_jwt(token.clone(), jwt_key, verify_options.clone()).await {
-            Ok(payload) => payload,
-            Err(jwt_err) => {
-                // An expired session token must surface AS expiry. The repo-key
-                // fallback below would re-verify it and fail at *signature*,
-                // replacing the expiry error with a misleading "bad signature"
-                // -- so clients could never tell an expired token from a
-                // malformed one. Bail with the original expiry error instead.
-                // Safe for the video service-auth path: jwt-simple checks the
-                // signature before claims, so a repo-key-signed token fails the
-                // JWT-key attempt at signature (not expiry) and still falls
-                // through to the repo-key verification below.
-                if is_expired_jwt(&jwt_err) {
-                    return Err(jwt_err);
-                }
-                // Fall back to repo signing key (for service auth tokens
-                // that come back from external services like video.bsky.app)
-                let repo_key_hex =
-                    env::var("PDS_REPO_SIGNING_KEY_K256_PRIVATE_KEY_HEX").unwrap_or_default();
-                if repo_key_hex.is_empty() {
-                    return Err(jwt_err);
-                }
-                let repo_secret_key =
-                    SecretKey::from_slice(&hex::decode(repo_key_hex.as_bytes()).unwrap()).unwrap();
-                let repo_key = Keypair::from_secret_key(&secp, &repo_secret_key);
-                verify_jwt(token.clone(), repo_key, verify_options).await?
-            }
-        };
-        let JwtPayload {
-            sub, aud, scope, ..
-        } = payload.clone();
-        // Service auth tokens use 'iss' (mapped to 'sub' by jwt_simple) but may also
-        // have it only in the issuer field. Fall back to empty if not present.
-        let sub = match sub {
-            Some(s) => s,
-            None => bail!("BadJwt: missing sub/iss in token"),
-        };
-        let aud = match aud {
-            Some(a) => a,
-            None => bail!("BadJwt: missing aud in token"),
-        };
-        if !sub.starts_with("did:") {
-            bail!("Malformed token")
-        }
-        if let Audiences::AsString(aud) = aud {
-            if !aud.starts_with("did:") {
-                bail!("Malformed token")
-            }
-            if scopes.len() > 0 && !scopes.contains(&scope) {
-                bail!("Bad token scope")
-                /*{
-                    "error": "InvalidToken",
-                    "message": "Bad token scope"
-                }*/
-            }
-            Ok(ValidatedBearer {
-                did: sub,
-                scope,
-                audience: Some(aud),
-                token,
-                payload,
-            })
-        } else {
-            bail!("Malformed token")
-        }
+    let Some(token) = bearer_token_from_req(request)? else {
+        return Err(anyhow::Error::new(AuthError::AuthMissing));
+    };
+    let payload = verify_jwt(&token, expected_typ, options)?;
+    let JwtPayload {
+        sub, aud, scope, ..
+    } = payload.clone();
+    let sub = match sub {
+        Some(sub) if sub.starts_with("did:") => sub,
+        _ => bail!("Malformed token"),
+    };
+    if !scopes.is_empty() && !scopes.contains(&scope) {
+        bail!("Bad token scope")
+    }
+    Ok(ValidatedBearer {
+        did: sub,
+        scope,
+        audience: aud,
+        token,
+        payload,
+    })
+}
+
+/// Maps the granted OAuth scopes onto the closest legacy [`AuthScope`],
+/// mirroring the upstream transition-scope semantics: `transition:generic`
+/// is app-password-equivalent access and `transition:chat.bsky` raises it
+/// to privileged app-password access.
+///
+/// A session granted permission-set scopes (`repo:`, `blob:`, `rpc:`,
+/// `include:`, `space:`) carries no `transition:` grant, so it maps to the
+/// same app-password level rather than being refused. That level is a
+/// ceiling, not the grant itself: what those scopes actually permit is
+/// decided at the resource, which is where the collection, blob and space
+/// constraints live. Refusing here would reject every client built against
+/// the permission-set model before it ever reached that check.
+pub fn oauth_scopes_to_auth_scope(scopes: &[String]) -> Result<AuthScope> {
+    let granted = crate::oauth_scope::GrantedScopes::parse(scopes);
+    if !granted.has_atproto() {
+        bail!("Bad token scope")
+    }
+    if granted.has_transition("chat.bsky") {
+        Ok(AuthScope::AppPassPrivileged)
+    } else if granted.has_transition("generic") || granted.has_permission_grant() {
+        Ok(AuthScope::AppPass)
     } else {
-        bail!("AuthMissing")
+        bail!("Bad token scope")
     }
 }
 
-// @TODO: Implement DPop/OAuth
-pub async fn validate_access_token<'r>(
-    request: &'r Request<'_>,
+pub fn dpop_token_from_req(request: &Request) -> Option<String> {
+    match request.headers().get_one("authorization") {
+        Some(header)
+            if header.len() > DPOP.len() && header[..DPOP.len()].eq_ignore_ascii_case(DPOP) =>
+        {
+            Some(header[DPOP.len()..].to_string())
+        }
+        _ => None,
+    }
+}
+
+/// Validates a DPoP-bound OAuth access token against the provider,
+/// mapping the granted scopes onto the legacy [`AuthScope`] model.
+async fn validate_dpop_access_token(
+    request: &Request<'_>,
+    token: String,
     scopes: Vec<AuthScope>,
     opts: Option<ValidateAccessTokenOpts>,
 ) -> Result<AccessOutput> {
-    let mut options = VerificationOptions::default();
-    options.allowed_audiences = Some(HashSet::from_strings(&[
-        env::var("PDS_SERVICE_DID").unwrap()
-    ]));
+    let Some(shared) = request
+        .rocket()
+        .state::<crate::oauth::SharedOAuthProvider>()
+    else {
+        bail!("OAuth provider is not configured")
+    };
+    let Some(cfg) = request.rocket().state::<crate::config::ServerConfig>() else {
+        bail!("Server config is not available")
+    };
+    let provider = &shared.provider;
+    let now = crate::oauth::now_secs();
+    let uri = format!("{}{}", cfg.service.public_url, request.uri());
+    let dpop_headers: Vec<String> = request.headers().get("dpop").map(String::from).collect();
+    let dpop_refs: Vec<&str> = dpop_headers.iter().map(String::as_str).collect();
+    let verified = provider
+        .verify_access_token(
+            &token,
+            &rsky_oauth::DpopRequest {
+                method: request.method().as_str(),
+                uri: &uri,
+                dpop_headers: &dpop_refs,
+                access_token: Some(&token),
+            },
+            now,
+        )
+        .await;
+    let verified = match verified {
+        Ok(verified) => {
+            crate::oauth::stage_oauth_headers(
+                request,
+                crate::oauth::OAuthResponseHeaders {
+                    dpop_nonce: provider.next_dpop_nonce(now),
+                    www_authenticate: None,
+                },
+            );
+            verified
+        }
+        Err(error) => {
+            crate::oauth::stage_oauth_headers(
+                request,
+                crate::oauth::OAuthResponseHeaders {
+                    dpop_nonce: provider.next_dpop_nonce(now),
+                    www_authenticate: Some(format!(
+                        "DPoP error=\"{}\", error_description=\"{}\"",
+                        error.error_code(),
+                        error.error_description()
+                    )),
+                },
+            );
+            // A rejected access token (invalid signature, or revoked/unknown
+            // in the token store) is an authentication failure, surfaced as
+            // 401 with its OAuth error code like the reference PDS.
+            return Err(anyhow::Error::new(AuthError::OAuth(
+                error.error_code().to_string(),
+                error.error_description().to_string(),
+            )));
+        }
+    };
+    let scope = oauth_scopes_to_auth_scope(&verified.scopes)?;
+    // An `include:` names a permission set whose contents are the grants; a
+    // session carrying one and nothing else has no grants to evaluate until it
+    // is fetched. Expanding here means the resolved permissions are parsed by
+    // the same code as an inline `space:` scope.
+    let granted_scopes = match request.rocket().state::<SharedPermissionSets>() {
+        Some(shared) => {
+            crate::permission_set::expand_includes(&shared.resolver, &verified.scopes).await
+        }
+        None => verified.scopes.clone(),
+    };
+    if !scopes.is_empty() && !scopes.contains(&scope) {
+        bail!("Bad token scope")
+    }
+    let ValidateAccessTokenOpts {
+        check_takedown,
+        check_deactivated,
+    } = opts.unwrap_or(ValidateAccessTokenOpts {
+        check_takedown: Some(false),
+        check_deactivated: Some(false),
+    });
+    check_account_status(
+        request,
+        &verified.did,
+        check_takedown.unwrap_or(false),
+        check_deactivated.unwrap_or(false),
+    )
+    .await?;
+    let is_privileged = scope.is_privileged();
+    Ok(AccessOutput {
+        credentials: Some(Credentials {
+            r#type: "oauth".to_string(),
+            granted_scopes: Some(granted_scopes),
+            did: Some(verified.did),
+            scope: Some(scope),
+            audience: Some(env::var("PDS_SERVICE_DID")?),
+            token_id: Some(verified.token_id),
+            aud: None,
+            iss: None,
+            is_privileged: Some(is_privileged),
+        }),
+        artifacts: Some(token),
+    })
+}
+
+async fn check_account_status(
+    request: &Request<'_>,
+    did: &str,
+    check_takedown: bool,
+    check_deactivated: bool,
+) -> Result<()> {
+    if !check_takedown && !check_deactivated {
+        return Ok(());
+    }
+    let account_manager = match request.guard::<AccountManager>().await {
+        Outcome::Success(account_manager) => account_manager,
+        _ => {
+            return Err(anyhow::Error::new(AuthError::InternalServerError(
+                "Unexpected Error Occurred".to_string(),
+            )))
+        }
+    };
+    let found: ActorAccount = match account_manager
+        .get_account(
+            did,
+            Some(AvailabilityFlags {
+                include_deactivated: Some(true),
+                include_taken_down: Some(true),
+            }),
+        )
+        .await
+    {
+        Ok(Some(found)) => found,
+        _ => {
+            return Err(anyhow::Error::new(AuthError::AccountNotFound(
+                "Account not found".to_string(),
+            )))
+        }
+    };
+    if check_takedown && found.takedown_ref.is_some() {
+        return Err(anyhow::Error::new(AuthError::AccountTakedown(
+            "Account has been taken down".to_string(),
+        )));
+    }
+    if check_deactivated && found.deactivated_at.is_some() {
+        return Err(anyhow::Error::new(AuthError::AccountDeactivated(
+            "Account is deactivated".to_string(),
+        )));
+    }
+    Ok(())
+}
+
+pub async fn validate_access_token(
+    request: &Request<'_>,
+    scopes: Vec<AuthScope>,
+    opts: Option<ValidateAccessTokenOpts>,
+) -> Result<AccessOutput> {
+    if let Some(token) = dpop_token_from_req(request) {
+        return validate_dpop_access_token(request, token, scopes, opts).await;
+    }
+    let options = SessionVerifyOptions {
+        audience: Some(env::var("PDS_SERVICE_DID")?),
+        allow_expired: false,
+    };
+
     let ValidatedBearer {
         did,
         scope,
         token,
         audience,
         ..
-    } = validate_bearer_token(request, scopes, Some(options)).await?;
+    } = validate_bearer_token(request, scopes, ACCESS_TOKEN_TYP, &options)?;
     let ValidateAccessTokenOpts {
         check_takedown,
         check_deactivated,
-    } = opts.unwrap_or_else(|| ValidateAccessTokenOpts {
+    } = opts.unwrap_or(ValidateAccessTokenOpts {
         check_takedown: Some(false),
         check_deactivated: Some(false),
     });
-    let check_takedown = check_takedown.unwrap_or(false);
-    let check_deactivated = check_deactivated.unwrap_or(false);
-
-    let account_manager = match request
-        .guard::<AccountManager>()
-        .await
-        .map(|account_manager| account_manager)
-    {
-        Outcome::Success(account_manager) => account_manager,
-        Outcome::Error(_) => {
-            return Err(anyhow::Error::new(AuthError::InternalServerError(
-                "Unexpected Error Occurred".to_string(),
-            )))
-        }
-        Outcome::Forward(_) => {
-            return Err(anyhow::Error::new(AuthError::InternalServerError(
-                "Unexpected Error Occurred".to_string(),
-            )))
-        }
-    };
-    if check_takedown || check_deactivated {
-        let found: ActorAccount = match account_manager
-            .get_account(
-                &did,
-                Some(AvailabilityFlags {
-                    include_deactivated: Some(true),
-                    include_taken_down: Some(true),
-                }),
-            )
-            .await
-        {
-            Ok(Some(found)) => found,
-            _ => {
-                return Err(anyhow::Error::new(AuthError::AccountNotFound(
-                    "Account not found".to_string(),
-                )))
-            }
-        };
-        if check_takedown && found.takedown_ref.is_some() {
-            return Err(anyhow::Error::new(AuthError::AccountTakedown(
-                "Account has been taken down".to_string(),
-            )));
-        }
-        if check_deactivated && found.deactivated_at.is_some() {
-            return Err(anyhow::Error::new(AuthError::AccountDeactivated(
-                "Account is deactivated".to_string(),
-            )));
-        }
-    }
+    check_account_status(
+        request,
+        &did,
+        check_takedown.unwrap_or(false),
+        check_deactivated.unwrap_or(false),
+    )
+    .await?;
+    let is_privileged = scope.is_privileged();
     Ok(AccessOutput {
         credentials: Some(Credentials {
             r#type: "access".to_string(),
+            granted_scopes: None,
             did: Some(did),
             scope: Some(scope),
             audience,
             token_id: None,
             aud: None,
             iss: None,
-            is_privileged: None,
+            is_privileged: Some(is_privileged),
         }),
         artifacts: Some(token),
     })
 }
 
-pub async fn verify_service_jwt<'r>(
-    request: &'r Request<'_>,
+pub async fn verify_service_jwt(
+    request: &Request<'_>,
     id_resolver: &State<SharedIdResolver>,
     opts: ServiceJwtOpts,
 ) -> Result<VerifiedServiceJwt> {
-    let get_signing_key = |iss: String, force_refresh: bool| -> Result<String> {
-        match &opts.iss {
-            Some(opts_iss) if opts_iss.contains(&iss) => bail!("UntrustedIss: Untrusted issuer"),
-            _ => (),
-        }
-        let parts = iss.split("#").collect::<Vec<&str>>();
-        if let (Some(did), Some(service_id)) = (parts.get(0), parts.get(1)) {
-            let (did, service_id) = (did.to_string(), *service_id);
-            let key_id = if service_id == "atproto_labeler" {
-                "atproto_label"
-            } else {
-                "atproto"
-            };
-            let mut lock = futures::executor::block_on(id_resolver.id_resolver.write());
-            let did_doc: Result<DidDocument> =
-                futures::executor::block_on(lock.did.ensure_resolve(&did, Some(force_refresh)));
-            let did_doc: DidDocument = match did_doc {
-                Err(err) => bail!("could not resolve iss did: `{err}`"),
-                Ok(res) => res,
-            };
-            match get_verification_material(&did_doc, &key_id.to_string()) {
-                None => bail!("missing or bad key in did doc"),
-                Some(parsed_key) => match get_did_key_from_multibase(parsed_key)? {
-                    None => bail!("missing or bad key in did doc"),
-                    Some(did_key) => Ok(did_key),
-                },
+    let get_signing_key = |iss: String, force_refresh: bool| {
+        let opts_iss = opts.iss.clone();
+        async move {
+            match &opts_iss {
+                Some(opts_iss) if opts_iss.contains(&iss) => {
+                    bail!("UntrustedIss: Untrusted issuer")
+                }
+                _ => (),
             }
-        } else {
-            bail!("could not resolve iss did")
+            // `iss` is a bare DID for ordinary service tokens; only labelers
+            // suffix a service fragment.
+            let mut parts = iss.splitn(2, '#');
+            if let Some(did) = parts.next().filter(|did| !did.is_empty()) {
+                let did = did.to_string();
+                let key_id = if parts.next() == Some("atproto_labeler") {
+                    "atproto_label"
+                } else {
+                    "atproto"
+                };
+                let lock = id_resolver.id_resolver.read().await;
+                let did_doc: DidDocument =
+                    match lock.did.ensure_resolve(&did, Some(force_refresh)).await {
+                        Err(err) => bail!("could not resolve iss did: `{err}`"),
+                        Ok(res) => res,
+                    };
+                match get_verification_material(&did_doc, key_id) {
+                    None => bail!("missing or bad key in did doc"),
+                    Some(parsed_key) => match get_did_key_from_multibase(parsed_key)? {
+                        None => bail!("missing or bad key in did doc"),
+                        Some(did_key) => Ok(did_key),
+                    },
+                }
+            } else {
+                bail!("could not resolve iss did")
+            }
         }
     };
 
+    // The method being called, so a token bound to one cannot be spent on
+    // another.
+    let lxm = request
+        .uri()
+        .path()
+        .as_str()
+        .strip_prefix("/xrpc/")
+        .map(str::to_string);
     match bearer_token_from_req(request)? {
         None => bail!("MissingJwt: missing jwt"),
         Some(jwt_str) => {
             let payload: ServiceJwtPayload =
-                verify_service_jwt_server(jwt_str, opts.aud, get_signing_key).await?;
+                verify_service_jwt_server(jwt_str, opts.aud, lxm.as_deref(), get_signing_key)
+                    .await?;
             Ok(VerifiedServiceJwt {
                 iss: payload.iss,
                 aud: payload.aud,
@@ -1017,6 +1367,7 @@ pub fn is_user_or_admin(auth: AccessOutput, did: &String) -> bool {
 
 const BEARER: &str = "Bearer ";
 const BASIC: &str = "Basic ";
+const DPOP: &str = "DPoP ";
 
 pub fn is_bearer_token(request: &Request) -> bool {
     match request.headers().get_one("Authorization") {
@@ -1043,41 +1394,41 @@ pub fn bearer_token_from_req(request: &Request) -> Result<Option<String>> {
     }
 }
 
-pub async fn verify_jwt(
-    jwt: String,
-    jwt_key: Keypair,
-    verify_options: Option<VerificationOptions>,
+/// Verifies a session token with the process's signing key. A scope the
+/// server does not know is reported as a bad scope, like the reference PDS.
+pub fn verify_jwt(
+    jwt: &str,
+    expected_typ: &str,
+    options: &SessionVerifyOptions,
 ) -> Result<JwtPayload> {
-    let key = ES256kKeyPair::from_bytes(jwt_key.secret_bytes().as_slice())?;
-    let public_key = key.public_key();
-    let claims = public_key.verify_token::<CustomClaimObj>(&jwt, verify_options)?;
-
-    let scope = if claims.custom.scope.is_empty() {
-        // Service auth tokens (from video.bsky.app etc.) don't have scope,
-        // they have lxm instead. Default to Access scope.
-        AuthScope::Access
-    } else {
-        AuthScope::from_str(&claims.custom.scope)?
-    };
-    // Service auth tokens (e.g. from video.bsky.app) use 'iss' instead of 'sub'.
-    // Fall back to issuer when subject is absent.
-    let sub = claims.subject.or_else(|| claims.issuer.clone());
+    let claims = PDS_JWT_SIGNER.verify(jwt, expected_typ, options)?;
+    let scope =
+        AuthScope::from_str(&claims.scope).map_err(|_| anyhow::anyhow!("Bad token scope"))?;
     Ok(JwtPayload {
         scope,
-        sub,
-        aud: claims.audiences,
-        exp: claims.expires_at,
-        iat: claims.issued_at,
-        jti: claims.jwt_id,
+        aud: claims.audience(),
+        sub: claims.sub,
+        exp: claims.exp,
+        iat: claims.iat,
+        jti: claims.jti,
     })
 }
 
+pub fn admin_password_from_env() -> Option<String> {
+    env::var("PDS_ADMIN_PASSWORD")
+        .or_else(|_| env::var("PDS_ADMIN_PASS"))
+        .ok()
+}
+
 pub fn parse_basic_auth(token: &str) -> Option<BasicAuth> {
-    if !token.starts_with(BASIC) {
+    let mut parts = token.split_whitespace();
+    if parts.next() != Some("Basic") {
         return None;
     }
-
-    let b64 = &token[BASIC.len()..];
+    let b64 = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
     let decoded: Vec<u8> = match base64pad.decode(b64) {
         Err(_) => return None,
         Ok(decoded) => decoded,
@@ -1086,13 +1437,186 @@ pub fn parse_basic_auth(token: &str) -> Option<BasicAuth> {
         Err(_) => return None,
         Ok(res) => res,
     };
-    let parsed_parts = parsed_str.split(":").collect::<Vec<&str>>();
+    let (username, password) = parsed_str.split_once(':')?;
+    Some(BasicAuth {
+        username: username.to_string(),
+        password: password.to_string(),
+    })
+}
 
-    match (parsed_parts.get(0), parsed_parts.get(1)) {
-        (Some(username), Some(password)) => Some(BasicAuth {
-            username: username.to_string(),
-            password: password.to_string(),
-        }),
-        _ => None,
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // base64("admin:password")
+    const CREDS: &str = "YWRtaW46cGFzc3dvcmQ=";
+
+    fn jwt_with_payload(payload: &str) -> String {
+        format!("eyJhbGciOiJFUzI1NksifQ.{}.sig", base64url.encode(payload))
+    }
+
+    #[test]
+    fn only_a_payload_naming_a_method_is_service_auth() {
+        assert!(jwt_names_method(&jwt_with_payload(
+            r#"{"iss":"did:web:a.invalid","lxm":"com.atproto.repo.uploadBlob"}"#
+        )));
+        assert!(!jwt_names_method(&jwt_with_payload(r#"{"lxm":null}"#)));
+        assert!(!jwt_names_method(&jwt_with_payload(
+            r#"{"sub":"did:web:a.invalid","scope":"com.atproto.access"}"#
+        )));
+        // standard base64 payloads from older builds are still decoded
+        assert!(jwt_names_method(&format!(
+            "h.{}.s",
+            base64pad.encode(r#"{"lxm":"com.example.a"}"#)
+        )));
+        assert!(!jwt_names_method(&jwt_with_payload("not json")));
+        assert!(!jwt_names_method("h.%%%.s"));
+        assert!(!jwt_names_method("no-dots"));
+    }
+
+    #[test]
+    fn auth_scopes_round_trip_through_their_wire_names() {
+        for scope in [
+            AuthScope::Access,
+            AuthScope::Refresh,
+            AuthScope::AppPass,
+            AuthScope::AppPassPrivileged,
+            AuthScope::SignupQueued,
+            AuthScope::Takendown,
+        ] {
+            assert_eq!(AuthScope::from_str(scope.as_str()).unwrap(), scope);
+        }
+        assert!(AuthScope::from_str("com.atproto.nope").is_err());
+        assert!(!AuthScope::Takendown.is_privileged());
+    }
+
+    #[test]
+    fn oauth_scope_mapping_follows_transition_semantics() {
+        let scopes = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        assert_eq!(
+            oauth_scopes_to_auth_scope(&scopes(&["atproto", "transition:generic"])).unwrap(),
+            AuthScope::AppPass
+        );
+        assert_eq!(
+            oauth_scopes_to_auth_scope(&scopes(&[
+                "atproto",
+                "transition:generic",
+                "transition:chat.bsky"
+            ]))
+            .unwrap(),
+            AuthScope::AppPassPrivileged
+        );
+        // chat access alone still maps to privileged app-password access
+        assert_eq!(
+            oauth_scopes_to_auth_scope(&scopes(&["atproto", "transition:chat.bsky"])).unwrap(),
+            AuthScope::AppPassPrivileged
+        );
+        // atproto alone grants no legacy access level
+        assert!(oauth_scopes_to_auth_scope(&scopes(&["atproto"])).is_err());
+        // missing the mandatory atproto scope is rejected outright
+        assert!(oauth_scopes_to_auth_scope(&scopes(&["transition:generic"])).is_err());
+        assert!(oauth_scopes_to_auth_scope(&[]).is_err());
+    }
+
+    #[test]
+    fn oauth_scope_mapping_accepts_permission_set_sessions() {
+        let scopes = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        // The exact base scope a permission-set client declares: no
+        // transition grant, so this was refused before the modern forms
+        // were recognised.
+        assert_eq!(
+            oauth_scopes_to_auth_scope(&scopes(&[
+                "atproto",
+                "include:app.bulleted.authFull",
+                "blob:image/*"
+            ]))
+            .unwrap(),
+            AuthScope::AppPass
+        );
+        // each permission-grant form on its own is sufficient
+        for grant in [
+            "repo:app.bsky.feed.post",
+            "blob:image/*",
+            "rpc:com.example.method",
+            "include:app.example.set",
+            "space:app.bulleted.space?action=read",
+        ] {
+            assert_eq!(
+                oauth_scopes_to_auth_scope(&scopes(&["atproto", grant])).unwrap(),
+                AuthScope::AppPass,
+                "{grant} should map to app-password level"
+            );
+        }
+        // a chat transition still wins over a permission grant
+        assert_eq!(
+            oauth_scopes_to_auth_scope(&scopes(&[
+                "atproto",
+                "include:app.bulleted.authFull",
+                "transition:chat.bsky"
+            ]))
+            .unwrap(),
+            AuthScope::AppPassPrivileged
+        );
+        // an unrecognised token is not a permission grant
+        assert!(oauth_scopes_to_auth_scope(&scopes(&["atproto", "nonsense"])).is_err());
+    }
+
+    fn assert_admin(parsed: Option<BasicAuth>) {
+        let parsed = parsed.expect("expected successful parse");
+        assert_eq!(parsed.username, "admin");
+        assert_eq!(parsed.password, "password");
+    }
+
+    #[test]
+    fn parses_normal_basic_auth() {
+        assert_admin(parse_basic_auth(&format!("Basic {CREDS}")));
+    }
+
+    #[test]
+    fn tolerates_extra_whitespace() {
+        assert_admin(parse_basic_auth(&format!("Basic  {CREDS}")));
+        assert_admin(parse_basic_auth(&format!("Basic \t {CREDS}")));
+    }
+
+    #[test]
+    fn tolerates_trailing_whitespace() {
+        assert_admin(parse_basic_auth(&format!("Basic {CREDS} ")));
+        assert_admin(parse_basic_auth(&format!("  Basic {CREDS}  ")));
+    }
+
+    #[test]
+    fn preserves_colons_in_password() {
+        // base64("admin:pass:word")
+        let parsed = parse_basic_auth("Basic YWRtaW46cGFzczp3b3Jk").expect("expected parse");
+        assert_eq!(parsed.username, "admin");
+        assert_eq!(parsed.password, "pass:word");
+    }
+
+    // Single test: sequential env mutation stays deterministic across threads
+    #[test]
+    fn admin_password_prefers_upstream_env_name() {
+        env::remove_var("PDS_ADMIN_PASSWORD");
+        env::remove_var("PDS_ADMIN_PASS");
+        assert_eq!(admin_password_from_env(), None);
+
+        env::set_var("PDS_ADMIN_PASS", "legacy");
+        assert_eq!(admin_password_from_env(), Some("legacy".to_string()));
+
+        env::set_var("PDS_ADMIN_PASSWORD", "standard");
+        assert_eq!(admin_password_from_env(), Some("standard".to_string()));
+
+        env::remove_var("PDS_ADMIN_PASSWORD");
+        env::remove_var("PDS_ADMIN_PASS");
+    }
+
+    #[test]
+    fn rejects_garbage() {
+        assert!(parse_basic_auth("").is_none());
+        assert!(parse_basic_auth("Basic").is_none());
+        assert!(parse_basic_auth("Basic not-base64!").is_none());
+        assert!(parse_basic_auth(&format!("Bearer {CREDS}")).is_none());
+        assert!(parse_basic_auth(&format!("Basic {CREDS} extra")).is_none());
+        // base64("no-colon")
+        assert!(parse_basic_auth("Basic bm8tY29sb24=").is_none());
     }
 }

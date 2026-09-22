@@ -20,7 +20,7 @@ use crate::{
     bunny::WebhookPayload,
     db::{self, job_state},
     error::{Error, Result},
-    pds,
+    media_signing, pds,
 };
 
 /// Query parameters for getUploadLimits
@@ -98,6 +98,7 @@ pub async fn get_upload_limits(
 pub struct UploadVideoParams {
     pub did: String,
     pub name: String,
+    pub private: Option<String>,
 }
 
 /// Response for uploadVideo
@@ -150,6 +151,7 @@ pub async fn upload_video(
     }
 
     let user_did = &params.did;
+    let private = is_private_upload(params.private.as_deref());
     let file_size = body.len() as i64;
 
     info!(
@@ -187,11 +189,76 @@ pub async fn upload_video(
         user_did,
         Some(&params.name),
         Some(file_size),
+        private,
     )
     .await?;
 
     let job_id = job.job_id;
     info!("Created job: {}", job_id);
+
+    // Normalize every upload to a re-encoded H.264/AAC MP4 before either
+    // upload below.
+    //
+    // Bunny cannot transcode GIF input at all, and the PDS tags blobs by
+    // sniffing their bytes rather than the content-type we send -- so a
+    // QuickTime `.mov` (every iPhone capture), an `M4V ` export or a `3g*`
+    // capture would come back tagged something other than `video/mp4` and be
+    // rejected by app.bsky.embed.video, which accepts only `video/mp4`.
+    //
+    // Re-encoding (rather than passthrough for MP4 and stream copy for the
+    // rest, as this used to do) is load-bearing for federation: copy-mode
+    // edits (trim / frame removal in Apple's tooling, Twitter rips) leave
+    // irregular frame timestamps that Bluesky's federated video ingest
+    // permanently rejects -- the video plays on Blacksky but 404s on
+    // video.bsky.app forever, with no retry. A re-encode regenerates the
+    // timeline and those same videos ingest within a minute. Bluesky's own
+    // video service re-encodes every upload for the same reason. See
+    // reencode_to_mp4 and the 2026-07-31 experiment it cites.
+    let body = if crate::transcode::is_gif(&body) {
+        match crate::transcode::gif_to_mp4(&body).await {
+            Ok(mp4) => Bytes::from(mp4),
+            Err(e) => {
+                error!("GIF transcode failed: {}", e);
+                db::fail_job(
+                    &state.db_pool,
+                    job_id,
+                    &format!("GIF transcode failed: {}", e),
+                )
+                .await?;
+                return Err(e);
+            }
+        }
+    } else {
+        match crate::transcode::reencode_to_mp4(&body).await {
+            Ok(mp4) => Bytes::from(mp4),
+            Err(e) => {
+                error!("Video normalize failed: {}", e);
+                db::fail_job(
+                    &state.db_pool,
+                    job_id,
+                    &format!("Video normalize failed: {}", e),
+                )
+                .await?;
+                return Err(e);
+            }
+        }
+    };
+
+    // The size gate above measured the *input*, but the PDS and Bunny receive
+    // the re-encoded output, which can be larger than an already-tightly-
+    // compressed source. Re-check here so an inflated encode fails now with a
+    // clear error instead of shipping a blob that app.bsky.embed.video (whose
+    // maxSize matches max_video_size) rejects after all the work is done.
+    if body.len() as u64 > state.config.max_video_size {
+        let msg = format!(
+            "normalized video ({} bytes) exceeds the maximum allowed size ({} bytes)",
+            body.len(),
+            state.config.max_video_size
+        );
+        error!("{}", msg);
+        db::fail_job(&state.db_pool, job_id, &msg).await?;
+        return Err(Error::VideoTooLarge(msg));
+    }
 
     // STEP 1: Upload blob to user's PDS FIRST
     // Forward the client's service auth token to the PDS.
@@ -403,25 +470,82 @@ pub struct VideoProxyPath {
     pub cid: String,
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub struct VideoProxyQuery {
+    pub space: Option<String>,
+    pub exp: Option<String>,
+    pub sig: Option<String>,
+}
+
+fn is_private_upload(value: Option<&str>) -> bool {
+    value == Some("true")
+}
+
+fn reject_unsigned_private(private: bool, signed: Option<(i64, i64)>) -> Result<()> {
+    if private && signed.is_none() {
+        return Err(Error::NotFound("Not found".to_string()));
+    }
+    Ok(())
+}
+
+fn verify_video_proxy_query(
+    query: &VideoProxyQuery,
+    did: &str,
+    cid: &str,
+    secret: Option<&str>,
+) -> Result<Option<(i64, i64)>> {
+    if query.space.is_none() && query.exp.is_none() && query.sig.is_none() {
+        return Ok(None);
+    }
+
+    let (Some(space), Some(exp), Some(sig)) = (&query.space, &query.exp, &query.sig) else {
+        return Err(Error::NotFound("Not found".to_string()));
+    };
+    let Ok(exp) = exp.parse::<i64>() else {
+        return Err(Error::NotFound("Not found".to_string()));
+    };
+    let now = chrono::Utc::now().timestamp();
+    if !media_signing::verify(space, did, cid, exp, sig, now, secret) {
+        return Err(Error::NotFound("Not found".to_string()));
+    }
+    Ok(Some((exp, now)))
+}
+
 /// GET /stream/:did/:cid/playlist.m3u8 - Proxy HLS playlist
 pub async fn proxy_playlist(
     State(state): State<Arc<AppState>>,
     Path(path): Path<VideoProxyPath>,
+    Query(query): Query<VideoProxyQuery>,
 ) -> Result<Response> {
     let did = urlencoding::decode(&path.did)
         .map_err(|_| Error::BadRequest("Invalid DID encoding".to_string()))?;
     let cid = urlencoding::decode(&path.cid)
         .map_err(|_| Error::BadRequest("Invalid CID encoding".to_string()))?;
+    let signed = verify_video_proxy_query(
+        &query,
+        &did,
+        &cid,
+        state.config.media_signing_secret.as_deref(),
+    )?;
 
     debug!("Proxy playlist: did={}, cid={}", did, cid);
 
     // Look up the bunny video ID in our database
     let redirect_url = match db::get_bunny_video_id(&state.db_pool, &did, &cid).await? {
-        Some(bunny_video_id) => {
+        Some((bunny_video_id, private)) => {
+            reject_unsigned_private(private, signed)?;
             // Video is in our system - redirect to Bunny CDN
-            state.bunny_client.get_playlist_url(&bunny_video_id)
+            match signed {
+                Some((exp, _)) => state
+                    .bunny_client
+                    .get_playlist_url_until(&bunny_video_id, exp),
+                None => state.bunny_client.get_playlist_url(&bunny_video_id),
+            }
         }
         None => {
+            if signed.is_some() {
+                return Err(Error::NotFound("Not found".to_string()));
+            }
             // Video not in our system - fallback to Bluesky's video CDN
             debug!(
                 "Video not in our DB, falling back to Bluesky CDN: did={}, cid={}",
@@ -434,7 +558,15 @@ pub async fn proxy_playlist(
     Ok(Response::builder()
         .status(StatusCode::TEMPORARY_REDIRECT)
         .header(header::LOCATION, redirect_url)
-        .header(header::CACHE_CONTROL, "public, max-age=3600")
+        .header(
+            header::CACHE_CONTROL,
+            format!(
+                "public, max-age={}",
+                signed
+                    .map(|(exp, now)| state.config.playlist_redirect_max_age_secs.min(exp - now))
+                    .unwrap_or(state.config.playlist_redirect_max_age_secs)
+            ),
+        )
         .body(Body::empty())
         .unwrap())
 }
@@ -443,21 +575,37 @@ pub async fn proxy_playlist(
 pub async fn proxy_thumbnail(
     State(state): State<Arc<AppState>>,
     Path(path): Path<VideoProxyPath>,
+    Query(query): Query<VideoProxyQuery>,
 ) -> Result<Response> {
     let did = urlencoding::decode(&path.did)
         .map_err(|_| Error::BadRequest("Invalid DID encoding".to_string()))?;
     let cid = urlencoding::decode(&path.cid)
         .map_err(|_| Error::BadRequest("Invalid CID encoding".to_string()))?;
+    let signed = verify_video_proxy_query(
+        &query,
+        &did,
+        &cid,
+        state.config.media_signing_secret.as_deref(),
+    )?;
 
     debug!("Proxy thumbnail: did={}, cid={}", did, cid);
 
     // Look up the bunny video ID in our database
     let redirect_url = match db::get_bunny_video_id(&state.db_pool, &did, &cid).await? {
-        Some(bunny_video_id) => {
+        Some((bunny_video_id, private)) => {
+            reject_unsigned_private(private, signed)?;
             // Video is in our system - redirect to Bunny CDN
-            state.bunny_client.get_thumbnail_url(&bunny_video_id)
+            match signed {
+                Some((exp, _)) => state
+                    .bunny_client
+                    .get_thumbnail_url_until(&bunny_video_id, exp),
+                None => state.bunny_client.get_thumbnail_url(&bunny_video_id),
+            }
         }
         None => {
+            if signed.is_some() {
+                return Err(Error::NotFound("Not found".to_string()));
+            }
             // Video not in our system - fallback to Bluesky's video CDN
             debug!(
                 "Video not in our DB, falling back to Bluesky CDN: did={}, cid={}",
@@ -470,7 +618,41 @@ pub async fn proxy_thumbnail(
     Ok(Response::builder()
         .status(StatusCode::TEMPORARY_REDIRECT)
         .header(header::LOCATION, redirect_url)
-        .header(header::CACHE_CONTROL, "public, max-age=86400")
+        .header(
+            header::CACHE_CONTROL,
+            format!(
+                "public, max-age={}",
+                signed
+                    .map(|(exp, now)| state.config.thumbnail_redirect_max_age_secs.min(exp - now))
+                    .unwrap_or(state.config.thumbnail_redirect_max_age_secs)
+            ),
+        )
         .body(Body::empty())
         .unwrap())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_private_upload, reject_unsigned_private};
+
+    #[test]
+    fn private_upload_requires_exact_true_value() {
+        assert!(is_private_upload(Some("true")));
+        assert!(!is_private_upload(None));
+        assert!(!is_private_upload(Some("false")));
+        assert!(!is_private_upload(Some("TRUE")));
+        assert!(!is_private_upload(Some("1")));
+    }
+
+    #[test]
+    fn unsigned_private_video_is_not_found() {
+        let error = reject_unsigned_private(true, None).unwrap_err();
+        assert!(matches!(error, crate::error::Error::NotFound(message) if message == "Not found"));
+    }
+
+    #[test]
+    fn signed_private_and_unsigned_public_videos_are_allowed() {
+        assert!(reject_unsigned_private(true, Some((123, 100))).is_ok());
+        assert!(reject_unsigned_private(false, None).is_ok());
+    }
 }

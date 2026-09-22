@@ -1,0 +1,145 @@
+{
+  "lexicon": 1,
+  "id": "com.atproto.space.applyWrites",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Apply a batch transaction of creates, updates, and deletes to the caller's permissioned repo for a space, atomically. Requires auth, implemented by PDS.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "space",
+            "repo",
+            "writes"
+          ],
+          "properties": {
+            "space": {
+              "type": "string",
+              "description": "Permissioned space URI, in the form at://{authority}/space/{spaceType}/{skey}. Not a standard at-uri."
+            },
+            "repo": {
+              "type": "string",
+              "format": "did",
+              "description": "The DID of the repo to write to. Must be the authenticated account."
+            },
+            "validate": {
+              "type": "boolean",
+              "description": "Can be set to 'false' to skip Lexicon schema validation of record data across all operations, 'true' to require it, or leave unset to validate only for known Lexicons."
+            },
+            "writes": {
+              "type": "array",
+              "description": "The batch of write operations, applied atomically under one commit.",
+              "items": {
+                "type": "ref",
+                "ref": "#writeOp"
+              }
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [],
+          "properties": {
+            "commit": {
+              "type": "ref",
+              "ref": "com.atproto.space.defs#commitMeta"
+            },
+            "results": {
+              "type": "array",
+              "items": {
+                "type": "union",
+                "refs": [
+                  "#createResult",
+                  "#updateResult",
+                  "#deleteResult"
+                ],
+                "closed": true
+              }
+            }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "SpaceNotFound"
+        }
+      ]
+    },
+    "createResult": {
+      "type": "object",
+      "required": [
+        "uri",
+        "cid"
+      ],
+      "properties": {
+        "uri": {
+          "type": "string",
+          "description": "Permissioned record URI, in the form at://{authority}/space/{spaceType}/{skey}/{authorDid}/{collection}/{rkey}. Not a standard at-uri."
+        },
+        "cid": {
+          "type": "string",
+          "format": "cid"
+        }
+      }
+    },
+    "updateResult": {
+      "type": "object",
+      "required": [
+        "uri",
+        "cid"
+      ],
+      "properties": {
+        "uri": {
+          "type": "string",
+          "description": "Permissioned record URI, in the form at://{authority}/space/{spaceType}/{skey}/{authorDid}/{collection}/{rkey}. Not a standard at-uri."
+        },
+        "cid": {
+          "type": "string",
+          "format": "cid"
+        }
+      }
+    },
+    "deleteResult": {
+      "type": "object",
+      "required": [],
+      "properties": {}
+    },
+    "writeOp": {
+      "type": "object",
+      "required": [
+        "action",
+        "collection"
+      ],
+      "properties": {
+        "action": {
+          "type": "string",
+          "enum": [
+            "create",
+            "update",
+            "delete"
+          ],
+          "description": "The operation kind."
+        },
+        "collection": {
+          "type": "string",
+          "format": "nsid"
+        },
+        "rkey": {
+          "type": "string",
+          "format": "record-key",
+          "maxLength": 512,
+          "description": "Required for update and delete; auto-TID for create when omitted."
+        },
+        "value": {
+          "type": "unknown",
+          "description": "The record. Omitted for delete."
+        }
+      }
+    }
+  }
+}

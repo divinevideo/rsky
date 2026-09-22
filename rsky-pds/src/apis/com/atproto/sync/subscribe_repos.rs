@@ -1,14 +1,12 @@
 use crate::config::ServerConfig;
-use crate::crawlers::Crawlers;
 use crate::sequencer::events::{
     AccountEvt, CommitEvt, IdentityEvt, SeqEvt, SyncEvt, TypedAccountEvt, TypedCommitEvt,
     TypedIdentityEvt, TypedSyncEvt,
 };
-use crate::sequencer::outbox::{Outbox, OutboxOpts};
-use crate::sequencer::Sequencer;
+use crate::sequencer::outbox::{Outbox, OutboxError};
 use crate::xrpc_server::stream::frames::{ErrorFrame, Frame, MessageFrame, MessageFrameOpts};
-use crate::xrpc_server::stream::types::ErrorFrameBody;
-use crate::SeqEventBroadcast;
+use crate::xrpc_server::stream::types::{ErrorFrameBody, InfoFrameBody};
+use crate::SharedSequencer;
 use chrono::offset::Utc as UtcOffset;
 use chrono::{DateTime, Duration};
 use futures::{pin_mut, StreamExt};
@@ -28,36 +26,44 @@ use ws::Message;
 fn get_backfill_limit(ms: u64) -> String {
     let system_time = SystemTime::now();
     let mut dt: DateTime<UtcOffset> = system_time.into();
-    dt = dt - Duration::milliseconds(ms as i64);
+    dt -= Duration::milliseconds(ms as i64);
     format!("{}", dt.format(RFC3339_VARIANT))
+}
+
+/// Counts the connection for as long as its stream lives.
+struct SubscriberGauge;
+
+impl SubscriberGauge {
+    fn new() -> Self {
+        crate::metrics::METRICS.firehose_subscribers.inc();
+        SubscriberGauge
+    }
+}
+
+impl Drop for SubscriberGauge {
+    fn drop(&mut self) {
+        crate::metrics::METRICS.firehose_subscribers.dec();
+    }
 }
 
 /// Repository event stream, aka Firehose endpoint. Outputs repo commits with diff data,
 /// and identity update events, for all repositories on the current server. See the atproto
 /// specifications for details around stream sequencing, repo versioning, CAR diff format, and more.
 /// Public and does not require auth; implemented by PDS and Relay.
+#[allow(clippy::needless_lifetimes)]
 #[rocket::get("/xrpc/com.atproto.sync.subscribeRepos?<cursor>")]
 #[allow(unused_variables)]
 pub async fn subscribe_repos<'a>(
     cursor: Option<i64>,
     cfg: &'a State<ServerConfig>,
-    broadcast: &'a State<SeqEventBroadcast>,
+    sequencer: &'a State<SharedSequencer>,
     mut shutdown: Shutdown,
     ws: ws::WebSocket,
 ) -> ws::Stream!['a] {
     ws::Stream! { ws =>
-        let sequencer_lock = Sequencer::new(
-            Crawlers::new(cfg.service.hostname.clone(), cfg.crawlers.clone()),
-            None,
-        );
-        let broadcast_rx = broadcast.sender.subscribe();
-        let mut outbox = Outbox::new(
-            sequencer_lock.clone(),
-            Some(OutboxOpts {
-                max_buffer_size: cfg.subscription.repo_backfill_limit_ms as usize,
-            }),
-            broadcast_rx,
-        );
+        let _subscriber = SubscriberGauge::new();
+        let sequencer_lock = sequencer.sequencer.read().await.clone();
+        let outbox = Outbox::new(sequencer_lock.clone());
 
         tracing::debug!("@LOG DEBUG: request to com.atproto.sync.subscribeRepos; Cursor={cursor:?}");
         let backfill_time = get_backfill_limit(cfg.subscription.repo_backfill_limit_ms);
@@ -93,14 +99,25 @@ pub async fn subscribe_repos<'a>(
                         message: Some("Cursor in the future.".to_string()),
                     });
                     yield Message::Binary(error_frame.to_bytes().expect("couldn't translate error to binary."));
+                    return;
                 },
                 false => match next {
                     Some(next) if next.sequenced_at < backfill_time => {
-                        let error_frame = ErrorFrame::new(ErrorFrameBody {
-                            error: "OutdatedCursor".to_string(),
-                            message: Some("Requested cursor exceeded limit. Possibly missing events.".to_string()),
-                        });
-                        yield Message::Binary(error_frame.to_bytes().expect("couldn't translate error to binary."));
+                        let info_frame = MessageFrame::new(InfoFrameBody {
+                            name: "OutdatedCursor".to_string(),
+                            message: Some("Requested cursor exceeded limit. Possibly missing events".to_string()),
+                        }, Some(MessageFrameOpts { r#type: Some("#info".to_string()) }));
+                        match info_frame.to_bytes() {
+                            Ok(binary) => yield Message::Binary(binary),
+                            Err(_) => {
+                                let error_frame = ErrorFrame::new(ErrorFrameBody {
+                                    error: "SerializationError".to_string(),
+                                    message: Some("Failed to serialize info frame.".to_string()),
+                                });
+                                yield Message::Binary(error_frame.to_bytes().expect("couldn't translate error to binary."));
+                                return;
+                            }
+                        }
                         match sequencer_lock.earliest_after_time(backfill_time).await {
                             Ok(Some(start_evt)) if start_evt.seq.is_some() => outbox_cursor = Some(start_evt.seq.unwrap() - 1),
                             Ok(None) => outbox_cursor = None,
@@ -132,8 +149,12 @@ pub async fn subscribe_repos<'a>(
                     let evt = match evt {
                         Some(Ok(evt)) => evt,
                         Some(Err(err)) => {
+                            let name = match err.downcast_ref::<OutboxError>() {
+                                Some(OutboxError::ConsumerTooSlow(_)) => "ConsumerTooSlow",
+                                _ => "EventStreamError",
+                            };
                             let error_frame = ErrorFrame::new(ErrorFrameBody {
-                                error: "EventStreamError".to_string(),
+                                error: name.to_string(),
                                 message: Some(err.to_string()),
                             });
                             yield Message::Binary(error_frame.to_bytes().expect("couldn't translate error to binary."));
@@ -151,11 +172,14 @@ pub async fn subscribe_repos<'a>(
 
                     match evt {
                         SeqEvt::TypedCommitEvt(commit) => {
-                            let TypedCommitEvt { r#type, seq, time, evt } = commit;
+                            let TypedCommitEvt { r#type, seq, time, evt } = *commit;
                             let CommitEvt { rebase, too_big, repo, commit, prev, rev, since, blocks, ops, blobs, prev_data} = evt;
                             let subscribe_commit_evt = SubscribeReposCommit {
                                 seq,
-                                time: from_str_to_utc(&time),
+                                time: from_str_to_utc(&time).unwrap_or_else(|e| {
+                                tracing::warn!("failed to parse event timestamp {:?}: {}", time, e);
+                                chrono::Utc::now()
+                            }),
                                 rebase,
                                 too_big,
                                 repo,
@@ -166,13 +190,12 @@ pub async fn subscribe_repos<'a>(
                                 blocks,
                                 ops: ops.into_iter().map(|op| SubscribeReposCommitOperation {
                                     path: op.path,
-                                    cid: match op.cid {
-                                        None => None,
-                                        Some(cid) => Some(cid)
-                                    },
+                                    cid: op.cid,
+                                    prev: op.prev,
                                     action: op.action.to_string()
                                 }).collect::<Vec<SubscribeReposCommitOperation>>(),
-                                blobs: blobs.into_iter().map(|blob| blob.to_string()).collect::<Vec<String>>(),
+                                blobs,
+                                prev_data,
                             };
                             let message_frame = MessageFrame::new(subscribe_commit_evt, Some(MessageFrameOpts { r#type: Some(format!("#{0}",r#type)) }));
                             let binary = match message_frame.to_bytes() {
@@ -195,7 +218,10 @@ pub async fn subscribe_repos<'a>(
                                 did,
                                 seq,
                                 handle,
-                                time: from_str_to_utc(&time),
+                                time: from_str_to_utc(&time).unwrap_or_else(|e| {
+                                tracing::warn!("failed to parse event timestamp {:?}: {}", time, e);
+                                chrono::Utc::now()
+                            }),
                             };
                             let message_frame = MessageFrame::new(subscribe_identity_evt, Some(MessageFrameOpts { r#type: Some(format!("#{0}",r#type)) }));
                             let binary = match message_frame.to_bytes() {
@@ -219,7 +245,10 @@ pub async fn subscribe_repos<'a>(
                                 seq,
                                 status,
                                 active,
-                                time: from_str_to_utc(&time),
+                                time: from_str_to_utc(&time).unwrap_or_else(|e| {
+                                tracing::warn!("failed to parse event timestamp {:?}: {}", time, e);
+                                chrono::Utc::now()
+                            }),
                             };
                             let message_frame = MessageFrame::new(subscribe_account_evt, Some(MessageFrameOpts { r#type: Some(format!("#{0}",r#type)) }));
                             let binary = match message_frame.to_bytes() {
@@ -243,7 +272,10 @@ pub async fn subscribe_repos<'a>(
                                 did,
                                 blocks,
                                 rev,
-                                time: from_str_to_utc(&time),
+                                time: from_str_to_utc(&time).unwrap_or_else(|e| {
+                                tracing::warn!("failed to parse event timestamp {:?}: {}", time, e);
+                                chrono::Utc::now()
+                            }),
                             };
                             let message_frame = MessageFrame::new(subscribe_sync_evt, Some(MessageFrameOpts { r#type: Some(format!("#{0}",r#type)) }));
                             let binary = match message_frame.to_bytes() {
@@ -307,5 +339,21 @@ pub async fn subscribe_repos<'a>(
                 _ = &mut shutdown => break
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SubscriberGauge;
+
+    #[test]
+    fn the_gauge_follows_the_connection() {
+        let gauge = &crate::metrics::METRICS.firehose_subscribers;
+        let before = gauge.get();
+        let guard = SubscriberGauge::new();
+        assert_eq!(gauge.get(), before + 1);
+        drop(guard);
+        assert_eq!(gauge.get(), before);
+        assert!(!super::get_backfill_limit(1000).is_empty());
     }
 }

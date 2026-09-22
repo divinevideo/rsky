@@ -1,16 +1,14 @@
 use crate::account_manager::AccountManager;
-use crate::actor_store::aws::s3::S3BlobStore;
+use crate::actor_store::blobstore::BlobstoreFactory;
 use crate::actor_store::ActorStore;
 use crate::apis::ApiError;
-use crate::db::DbConn;
-use anyhow::{bail, Result};
-use aws_config::SdkConfig;
+use anyhow::Result;
 use rocket::serde::json::Json;
 use rocket::State;
 use rsky_lexicon::com::atproto::repo::{ListRecordsOutput, Record};
 use rsky_syntax::aturi::AtUri;
 
-#[allow(non_snake_case)]
+#[allow(non_snake_case, clippy::too_many_arguments)]
 async fn inner_list_records(
     // The handle or DID of the repo.
     repo: String,
@@ -25,56 +23,67 @@ async fn inner_list_records(
     rkeyEnd: Option<String>,
     // Flag to reverse the order of the returned records.
     reverse: bool,
-    s3_config: &State<SdkConfig>,
-    db: DbConn,
+    blobstore_factory: &State<BlobstoreFactory>,
+    actor_store: &State<ActorStore>,
     account_manager: AccountManager,
-) -> Result<ListRecordsOutput> {
+) -> Result<ListRecordsOutput, ApiError> {
     if limit > 100 {
-        bail!("Error: limit can not be greater than 100")
+        return Err(ApiError::InvalidRequest(format!(
+            "Invalid com.atproto.repo.listRecords params: integer too big (maximum 100, got {limit})"
+        )));
     }
     let did = account_manager.get_did_for_actor(&repo, None).await?;
     if let Some(did) = did {
-        let mut actor_store =
-            ActorStore::new(did.clone(), S3BlobStore::new(did.clone(), s3_config), db);
+        let mut actor_store = actor_store
+            .read(did.clone(), blobstore_factory.blobstore(did.clone()))
+            .await?;
 
-        let records: Vec<Record> = actor_store
+        let rows = actor_store
             .record
             .list_records_for_collection(
                 collection,
-                limit as i64,
+                i64::from(limit),
                 reverse,
                 cursor,
                 rkeyStart,
                 rkeyEnd,
                 None,
             )
-            .await?
+            .await?;
+        let records: Vec<Record> = rows
             .into_iter()
             .map(|record| {
                 Ok(Record {
                     uri: record.uri.clone(),
                     cid: record.cid.clone(),
-                    value: serde_json::to_value(record)?,
+                    // The record body only. Serializing the whole row here
+                    // double-wraps it as {uri, cid, value}, which no atproto
+                    // client can read; getRecord serializes record.value too.
+                    value: serde_json::to_value(record.value)?,
                 })
             })
             .collect::<Result<Vec<Record>>>()?;
 
-        let last_record = records.last();
-        let cursor: Option<String>;
-        if let Some(last_record) = last_record {
-            let last_at_uri: AtUri = last_record.uri.clone().try_into()?;
-            cursor = Some(last_at_uri.get_rkey());
-        } else {
-            cursor = None;
-        }
+        // The reference answers every non-empty page with the last rkey as
+        // the cursor, final pages included; clients built against it expect
+        // the same shape from either implementation.
+        let cursor = match records.last() {
+            Some(last_record) => {
+                let last_at_uri: AtUri = last_record.uri.clone().try_into()?;
+                Some(last_at_uri.get_rkey())
+            }
+            None => None,
+        };
         Ok(ListRecordsOutput { records, cursor })
     } else {
-        bail!("Could not find repo: {repo}")
+        Err(ApiError::InvalidRequest(format!(
+            "Could not find repo: {repo}"
+        )))
     }
 }
 
 #[tracing::instrument(skip_all)]
-#[allow(non_snake_case)]
+#[allow(non_snake_case, clippy::too_many_arguments)]
 #[rocket::get("/xrpc/com.atproto.repo.listRecords?<repo>&<collection>&<limit>&<cursor>&<rkeyStart>&<rkeyEnd>&<reverse>")]
 pub async fn list_records(
     // The handle or DID of the repo.
@@ -90,8 +99,8 @@ pub async fn list_records(
     rkeyEnd: Option<String>,
     // Flag to reverse the order of the returned records.
     reverse: Option<bool>,
-    s3_config: &State<SdkConfig>,
-    db: DbConn,
+    blobstore_factory: &State<BlobstoreFactory>,
+    actor_store: &State<ActorStore>,
     account_manager: AccountManager,
 ) -> Result<Json<ListRecordsOutput>, ApiError> {
     let limit = limit.unwrap_or(50);
@@ -105,16 +114,16 @@ pub async fn list_records(
         rkeyStart,
         rkeyEnd,
         reverse,
-        s3_config,
-        db,
+        blobstore_factory,
+        actor_store,
         account_manager,
     )
     .await
     {
         Ok(res) => Ok(Json(res)),
         Err(error) => {
-            tracing::error!("@LOG: ERROR: {error}");
-            Err(ApiError::RuntimeError)
+            tracing::error!("@LOG: ERROR: {error:?}");
+            Err(error)
         }
     }
 }

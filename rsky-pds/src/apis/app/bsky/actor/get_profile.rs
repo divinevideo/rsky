@@ -1,15 +1,15 @@
 use crate::account_manager::AccountManager;
+use crate::actor_store::blobstore::BlobstoreFactory;
+use crate::actor_store::ActorStore;
 use crate::apis::ApiError;
-use crate::auth_verifier::AccessStandard;
+use crate::auth_verifier::scope::{RpcProxy, Scoped};
 use crate::config::ServerConfig;
-use crate::db::DbConn;
 use crate::read_after_write::types::LocalRecords;
 use crate::read_after_write::util::{handle_read_after_write, ReadAfterWriteResponse};
 use crate::read_after_write::viewer::LocalViewer;
 use crate::xrpc_server::types::HandlerPipeThrough;
 use crate::SharedLocalViewer;
 use anyhow::Result;
-use aws_config::SdkConfig;
 use rocket::State;
 use rsky_lexicon::app::bsky::actor::ProfileViewDetailed;
 
@@ -18,17 +18,14 @@ const METHOD_NSID: &str = "app.bsky.actor.getProfile";
 pub async fn inner_get_profile(
     // Forwarded by original url in pipethrough
     _actor: String,
-    auth: AccessStandard,
+    auth: Scoped<RpcProxy>,
     res: HandlerPipeThrough,
-    s3_config: &State<SdkConfig>,
+    blobstore_factory: &State<BlobstoreFactory>,
     state_local_viewer: &State<SharedLocalViewer>,
-    db: DbConn,
+    actor_store: &State<ActorStore>,
     account_manager: AccountManager,
 ) -> Result<ReadAfterWriteResponse<ProfileViewDetailed>, ApiError> {
-    let requester: Option<String> = match auth.access.credentials {
-        None => None,
-        Some(credentials) => credentials.did,
-    };
+    let requester: Option<String> = auth.did_opt().await?;
     match requester {
         None => Ok(ReadAfterWriteResponse::HandlerPipeThrough(res)),
         Some(requester) => {
@@ -37,9 +34,9 @@ pub async fn inner_get_profile(
                 requester,
                 res,
                 get_profile_munge,
-                s3_config,
+                blobstore_factory,
                 state_local_viewer,
-                db,
+                actor_store,
                 account_manager,
             )
             .await?;
@@ -50,17 +47,18 @@ pub async fn inner_get_profile(
 
 /// Get detailed profile view of an actor. Does not require auth,
 /// but contains relevant metadata with auth.
+#[allow(clippy::too_many_arguments)]
 #[tracing::instrument(skip_all)]
 #[rocket::get("/xrpc/app.bsky.actor.getProfile?<actor>")]
 pub async fn get_profile(
     // Handle or DID of account to fetch profile of.
     actor: String,
-    auth: AccessStandard,
+    auth: Scoped<RpcProxy>,
     res: HandlerPipeThrough,
-    s3_config: &State<SdkConfig>,
+    blobstore_factory: &State<BlobstoreFactory>,
     state_local_viewer: &State<SharedLocalViewer>,
     cfg: &State<ServerConfig>,
-    db: DbConn,
+    actor_store: &State<ActorStore>,
     account_manager: AccountManager,
 ) -> Result<ReadAfterWriteResponse<ProfileViewDetailed>, ApiError> {
     match cfg.bsky_app_view {
@@ -70,9 +68,9 @@ pub async fn get_profile(
                 actor,
                 auth,
                 res,
-                s3_config,
+                blobstore_factory,
                 state_local_viewer,
-                db,
+                actor_store,
                 account_manager,
             )
             .await
@@ -96,7 +94,7 @@ pub fn get_profile_munge(
             if original.did != requester {
                 return Ok(original);
             }
-            Ok(local_viewer.update_profile_detailed(original, profile.record))
+            Ok(local_viewer.update_profile_detailed(original, profile.record, local.posts.len()))
         }
     }
 }

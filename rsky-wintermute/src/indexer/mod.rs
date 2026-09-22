@@ -1,4 +1,4 @@
-mod bulk;
+pub(crate) mod bulk;
 mod tests;
 
 use crate::SHUTDOWN;
@@ -7,13 +7,17 @@ use crate::config::{
     HANDLE_REINDEX_INTERVAL_VALID, HANDLE_RESOLUTION_BATCH_SIZE, HANDLE_RESOLUTION_CONCURRENCY,
     IDENTITY_RESOLVER_TIMEOUT, INLINE_CONCURRENCY, WORKERS_INDEXER,
 };
-use crate::config::{INDEXER_BATCH_SIZE, INDEXER_BATCH_WORKERS};
+use crate::config::{
+    FIREHOSE_LIVE_DRAIN_BATCH, FIREHOSE_LIVE_SHARDS, INDEXER_BATCH_SIZE, INDEXER_BATCH_WORKERS,
+    LIVE_LIKE_SERIALIZE,
+};
+use crate::reconcile::{Admission, Gate, GateMode};
 use crate::storage::Storage;
 #[cfg(test)]
 use crate::types::LabelEvent;
 use crate::types::{IndexJob, WintermuteError, WriteAction};
 use dashmap::DashMap;
-use deadpool_postgres::{Config, ManagerConfig, Pool, RecyclingMethod, Runtime};
+use deadpool_postgres::Pool;
 use futures::FutureExt;
 use futures::stream::{FuturesUnordered, StreamExt};
 use rsky_identity::IdResolver;
@@ -23,7 +27,6 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::sync::Semaphore;
-use tokio_postgres::NoTls;
 
 // Global semaphore to serialize like inserts across all workers.
 // The like table has a 133GB index that causes severe contention when
@@ -37,6 +40,8 @@ static LIKE_INSERT_SEMAPHORE: std::sync::LazyLock<Semaphore> =
 static ACTOR_CACHE: std::sync::LazyLock<DashMap<String, ()>> =
     std::sync::LazyLock::new(DashMap::new);
 const ACTOR_CACHE_MAX_SIZE: usize = 2_000_000;
+/// How long a loop waits before retrying work deferred by a fence.
+const FENCE_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)]
@@ -51,9 +56,8 @@ pub enum QueueSource {
 type IndexJobWithMetadata = (Vec<u8>, IndexJob, QueueSource);
 #[cfg(test)]
 type LabelJobWithMetadata = (Vec<u8>, LabelEvent);
+#[cfg(test)]
 type JobTaskResult = (Vec<u8>, QueueSource, Result<(), WintermuteError>);
-type JobTaskJoinResult = Result<JobTaskResult, tokio::task::JoinError>;
-type JobTaskHandle = tokio::task::JoinHandle<JobTaskResult>;
 type LabelTaskResult = (Vec<u8>, Result<(), WintermuteError>);
 type LabelTaskHandle = tokio::task::JoinHandle<LabelTaskResult>;
 
@@ -92,12 +96,20 @@ impl IndexerManager {
         // Create separate pools for each stream to prevent starvation
         // Backfill gets 50% of connections since it's the main bottleneck
         let backfill_pool_size = pool_size / 2;
-        let live_pool_size = pool_size / 4;
+        // Each live shard can hold up to 8 connections at once and deadpool has
+        // no acquire timeout, so the pool must always cover every shard fully.
+        let live_shards = *FIREHOSE_LIVE_SHARDS;
+        let live_pool_size = if live_shards > 1 {
+            (pool_size / 4).max(live_shards * 8)
+        } else {
+            pool_size / 4
+        };
         let labels_pool_size = pool_size / 4;
 
         tracing::info!(
-            "indexer DB pools: live={}, backfill={}, labels={}",
+            "indexer DB pools: live={} (shards={}), backfill={}, labels={}",
             live_pool_size,
+            live_shards,
             backfill_pool_size,
             labels_pool_size
         );
@@ -105,6 +117,10 @@ impl IndexerManager {
         let pool_live = Self::create_pool(database_url, live_pool_size.max(5))?;
         let pool_backfill = Self::create_pool(database_url, backfill_pool_size.max(10))?;
         let pool_labels = Self::create_pool(database_url, labels_pool_size.max(5))?;
+
+        crate::metrics::register_pool("indexer_live", &pool_live);
+        crate::metrics::register_pool("indexer_backfill", &pool_backfill);
+        crate::metrics::register_pool("indexer_labels", &pool_labels);
 
         let id_resolver = IdResolver::new(IdentityResolverOpts {
             timeout: Some(IDENTITY_RESOLVER_TIMEOUT),
@@ -127,16 +143,7 @@ impl IndexerManager {
     }
 
     fn create_pool(database_url: &str, size: usize) -> Result<Pool, WintermuteError> {
-        let mut pg_config = Config::new();
-        pg_config.url = Some(database_url.to_owned());
-        pg_config.manager = Some(ManagerConfig {
-            recycling_method: RecyclingMethod::Fast,
-        });
-        pg_config.pool = Some(deadpool_postgres::PoolConfig::new(size));
-
-        pg_config
-            .create_pool(Some(Runtime::Tokio1), NoTls)
-            .map_err(|e| WintermuteError::Other(format!("pool creation failed: {e}")))
+        crate::config::create_pg_pool(database_url, crate::config::pg_pool_config(size))
     }
 
     pub fn run(self) -> Result<(), WintermuteError> {
@@ -155,7 +162,7 @@ impl IndexerManager {
             // Spawn each processor as independent task for true parallelism
             let live_handle = {
                 let mgr = manager.clone();
-                tokio::spawn(async move { mgr.process_firehose_live_loop().await })
+                tokio::spawn(async move { Box::pin(mgr.process_firehose_live_loop()).await })
             };
 
             let backfill_handle = {
@@ -334,99 +341,164 @@ impl IndexerManager {
     }
 
     async fn process_firehose_live_loop(&self) {
-        let max_concurrent = *INLINE_CONCURRENCY;
+        let batch_size = *FIREHOSE_LIVE_DRAIN_BATCH;
 
-        tracing::info!(max_concurrent, "firehose_live processor started");
-        let mut in_flight: FuturesUnordered<JobTaskHandle> = FuturesUnordered::new();
+        tracing::info!(batch_size, "firehose_live processor started (batch drain)");
         let mut processed_count = 0u64;
         let mut last_processed_count = 0u64;
         let mut last_log = std::time::Instant::now();
 
+        // Seed queue gauges once off the hot path: recomputing them per
+        // iteration is an O(n) partition scan that dominated the drain cycle.
+        // The gauges stay current via inc/sub in enqueue/dequeue.
+        let metrics_storage = Arc::clone(&self.storage);
+        drop(tokio::task::spawn_blocking(move || {
+            Self::update_queue_metrics_for(&metrics_storage);
+        }));
+
+        // The dequeue walks and removes thousands of Fjall entries per batch;
+        // it runs on a blocking thread and is prefetched while the previous
+        // batch's database work is in flight, so neither cost serializes
+        // behind the other.
+        let dequeue = |storage: Arc<Storage>| {
+            tokio::task::spawn_blocking(move || {
+                storage
+                    .dequeue_firehose_live_batch(batch_size)
+                    .map_err(|e| {
+                        tracing::error!("failed to dequeue firehose_live batch: {e}");
+                    })
+            })
+        };
+        let mut prefetched: Option<Vec<(Vec<u8>, IndexJob)>> = None;
+
         loop {
             if SHUTDOWN.load(Ordering::Relaxed) {
-                tracing::info!(
-                    "shutdown requested for firehose_live processor, draining {} in-flight tasks",
-                    in_flight.len()
-                );
-                // Drain with timeout to avoid hanging forever
-                let drain_start = std::time::Instant::now();
-                while !in_flight.is_empty() && drain_start.elapsed() < Duration::from_secs(5) {
-                    tokio::select! {
-                        Some(result) = in_flight.next() => {
-                            self.handle_single_job_result(result);
-                        }
-                        () = tokio::time::sleep(Duration::from_millis(100)) => {}
-                    }
-                }
-                if !in_flight.is_empty() {
-                    tracing::warn!(
-                        "firehose_live: {} tasks still in-flight after drain timeout",
-                        in_flight.len()
-                    );
-                }
+                tracing::info!("shutdown requested for firehose_live processor");
                 break;
             }
 
-            self.update_queue_metrics();
+            let batch: Vec<(Vec<u8>, IndexJob)> = match prefetched.take() {
+                Some(jobs) => jobs,
+                None => dequeue(Arc::clone(&self.storage))
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .unwrap_or_default(),
+            };
 
-            // First, drain all completed tasks (non-blocking)
-            while let Some(result) = in_flight.next().now_or_never().flatten() {
-                self.handle_single_job_result(result);
+            if batch.is_empty() {
+                self.storage
+                    .wait_for_live_enqueue(Duration::from_millis(50))
+                    .await;
+                continue;
+            }
+
+            let prefetch = dequeue(Arc::clone(&self.storage));
+            let bulk_mode = !*crate::config::LIVE_AGGREGATES;
+            let shard_batches = Self::shard_live_jobs(batch, *FIREHOSE_LIVE_SHARDS);
+            let results =
+                Self::process_live_shards(&self.pool_live, &shard_batches, bulk_mode).await;
+            prefetched = prefetch.await.ok().and_then(Result::ok);
+            let jobs_by_key: std::collections::HashMap<&[u8], &IndexJob> = shard_batches
+                .iter()
+                .flatten()
+                .map(|(k, j)| (k.as_slice(), j))
+                .collect();
+            let mut deferred = 0usize;
+            for (key, result) in results {
                 processed_count += 1;
-            }
-
-            // Dequeue jobs up to max concurrent limit (matches pool capacity)
-            while in_flight.len() < max_concurrent {
-                if SHUTDOWN.load(Ordering::Relaxed) {
-                    break;
-                }
-                match self.storage.dequeue_firehose_live() {
-                    Ok(Some((key, job))) => {
-                        let pool = self.pool_live.clone();
-                        let task = tokio::spawn(async move {
-                            let result = Self::process_job(&pool, &job).await;
-                            (key, QueueSource::FirehoseLive, result)
-                        });
-                        in_flight.push(task);
+                if let Err(e) = result {
+                    crate::metrics::INDEXER_RECORDS_FAILED_TOTAL.inc();
+                    let msg = e.to_string();
+                    // Dequeue already removed the entry, so a failed job must be
+                    // re-enqueued or the event is lost; only unparseable jobs
+                    // can never succeed and are dropped.
+                    if msg.contains("invalid uri") {
+                        tracing::error!("dropping unprocessable firehose_live job: {msg}");
+                    } else if let WintermuteError::StaleGeneration(did) = &e {
+                        self.refetch_stale(did);
+                    } else if let Some(job) = jobs_by_key.get(key.as_slice()) {
+                        if matches!(e, WintermuteError::Fenced(_)) {
+                            deferred += 1;
+                        } else {
+                            tracing::warn!(
+                                "requeueing failed firehose_live job {}: {msg}",
+                                job.uri
+                            );
+                        }
+                        if let Err(e2) = self.storage.enqueue_firehose_live(job) {
+                            tracing::error!("failed to requeue firehose_live job: {e2}");
+                        }
                     }
-                    Ok(None) => break,
-                    Err(e) => {
-                        tracing::error!("failed to dequeue firehose_live job: {e}");
-                        break;
-                    }
                 }
             }
-
-            // Wait for at least one task to complete before next iteration
-            if in_flight.is_empty() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            } else if in_flight.len() >= max_concurrent {
-                // At capacity - wait for one to complete
-                if let Some(result) = in_flight.next().await {
-                    self.handle_single_job_result(result);
-                    processed_count += 1;
-                }
-            } else {
-                tokio::task::yield_now().await;
+            if deferred > 0 {
+                tokio::time::sleep(FENCE_RETRY_DELAY).await;
             }
 
-            // Log progress periodically - only if work was done
             if last_log.elapsed() > Duration::from_secs(5) {
                 let elapsed_secs = last_log.elapsed().as_secs_f64();
                 #[allow(clippy::cast_precision_loss)]
                 let rate = (processed_count - last_processed_count) as f64 / elapsed_secs;
                 if processed_count > last_processed_count {
                     tracing::info!(
-                        "firehose_live: {} indexed ({:.1}/s), {} in_flight",
-                        processed_count - last_processed_count,
-                        rate,
-                        in_flight.len()
+                        "firehose_live: {} indexed ({:.1}/s), queue draining in batches",
+                        processed_count,
+                        rate
                     );
                 }
                 last_processed_count = processed_count;
                 last_log = std::time::Instant::now();
             }
         }
+    }
+
+    /// Partition a live batch by repo DID so each shard owns every job for its
+    /// repos: per-repo ordering and same-URI pairing survive concurrent shards.
+    fn shard_live_jobs(
+        batch: Vec<(Vec<u8>, IndexJob)>,
+        shards: usize,
+    ) -> Vec<Vec<(Vec<u8>, IndexJob)>> {
+        if shards <= 1 {
+            return vec![batch];
+        }
+        let mut out: Vec<Vec<(Vec<u8>, IndexJob)>> = (0..shards).map(|_| Vec::new()).collect();
+        let shard_count = shards as u64;
+        for entry in batch {
+            let shard = {
+                let did = entry.1.uri.split('/').nth(2).unwrap_or(&entry.1.uri);
+                let mut hasher = std::hash::DefaultHasher::new();
+                std::hash::Hash::hash(did, &mut hasher);
+                usize::try_from(std::hash::Hasher::finish(&hasher) % shard_count).unwrap_or(0)
+            };
+            out[shard].push(entry);
+        }
+        out
+    }
+
+    /// Run `process_jobs_batch` for every non-empty shard concurrently and
+    /// merge the per-job results. Awaiting all shards before the next dequeue
+    /// keeps per-repo ordering intact across batches.
+    async fn process_live_shards(
+        pool: &Pool,
+        shard_batches: &[Vec<(Vec<u8>, IndexJob)>],
+        bulk_mode: bool,
+    ) -> Vec<(Vec<u8>, Result<(), WintermuteError>)> {
+        let skip_boilerplate = *crate::config::RECORD_SKIP_BOILERPLATE;
+        futures::future::join_all(shard_batches.iter().filter(|shard| !shard.is_empty()).map(
+            |shard| {
+                Box::pin(Self::process_jobs_batch(
+                    pool,
+                    shard,
+                    bulk_mode,
+                    skip_boilerplate,
+                ))
+            },
+        ))
+        .await
+        .into_iter()
+        .flat_map(|(results, _batch_failed)| results)
+        .collect()
     }
 
     async fn process_firehose_backfill_loop(&self) {
@@ -452,7 +524,10 @@ impl IndexerManager {
             let processed = Arc::clone(&processed_total);
 
             let handle = tokio::spawn(async move {
-                Self::backfill_worker_loop(worker_id, storage, pool, batch_size, processed).await;
+                Box::pin(Self::backfill_worker_loop(
+                    worker_id, storage, pool, batch_size, processed,
+                ))
+                .await;
             });
             worker_handles.push(handle);
         }
@@ -557,14 +632,39 @@ impl IndexerManager {
 
             // Process the entire batch with batch INSERT statements
             let process_start = Instant::now();
-            let results = Self::process_jobs_batch(&pool, &jobs).await;
+            let bulk_mode = !*crate::config::LIVE_AGGREGATES;
+            let (results, _batch_failed) = Self::process_jobs_batch(
+                &pool,
+                &jobs,
+                bulk_mode,
+                *crate::config::RECORD_SKIP_BOILERPLATE,
+            )
+            .await;
             let process_ms = process_start.elapsed().as_millis();
 
             // Handle results - remove jobs from queue
             let remove_start = Instant::now();
+            let mut deferred = 0usize;
             for (key, result) in results {
-                if let Err(e) = &result {
-                    tracing::error!("worker {}: firehose_backfill job failed: {e}", worker_id);
+                match &result {
+                    Err(WintermuteError::Fenced(_)) => {
+                        deferred += 1;
+                        if let Some((_, job)) = jobs.iter().find(|(k, _)| *k == key) {
+                            if let Err(e) = storage.enqueue_firehose_backfill(job) {
+                                tracing::error!(
+                                    "worker {}: failed to requeue fenced job: {e}",
+                                    worker_id
+                                );
+                            }
+                        }
+                    }
+                    Err(WintermuteError::StaleGeneration(did)) => {
+                        Self::refetch_stale_with(&storage, did);
+                    }
+                    Err(e) => {
+                        tracing::error!("worker {}: firehose_backfill job failed: {e}", worker_id);
+                    }
+                    Ok(()) => {}
                 }
                 if let Err(e) = storage.remove_firehose_backfill(&key) {
                     if e.is_storage_corrupted() {
@@ -582,6 +682,9 @@ impl IndexerManager {
                 }
             }
             let remove_ms = remove_start.elapsed().as_millis();
+            if deferred > 0 {
+                tokio::time::sleep(FENCE_RETRY_DELAY).await;
+            }
 
             tracing::info!(
                 "worker {}: dequeue={}ms, process={}ms, remove={}ms, batch={}",
@@ -707,16 +810,21 @@ impl IndexerManager {
         }
     }
 
+    #[cfg(test)]
     fn update_queue_metrics(&self) {
-        if let Ok(live_len) = self.storage.firehose_live_len() {
+        Self::update_queue_metrics_for(&self.storage);
+    }
+
+    fn update_queue_metrics_for(storage: &Storage) {
+        if let Ok(live_len) = storage.firehose_live_len() {
             crate::metrics::INGESTER_FIREHOSE_LIVE_LENGTH
                 .set(i64::try_from(live_len).unwrap_or(i64::MAX));
         }
-        if let Ok(backfill_len) = self.storage.firehose_backfill_len() {
+        if let Ok(backfill_len) = storage.firehose_backfill_len() {
             crate::metrics::INGESTER_FIREHOSE_BACKFILL_LENGTH
                 .set(i64::try_from(backfill_len).unwrap_or(i64::MAX));
         }
-        if let Ok(label_len) = self.storage.label_live_len() {
+        if let Ok(label_len) = storage.label_live_len() {
             crate::metrics::INGESTER_LABEL_LIVE_LENGTH
                 .set(i64::try_from(label_len).unwrap_or(i64::MAX));
         }
@@ -782,28 +890,6 @@ impl IndexerManager {
         (jobs, label_jobs)
     }
 
-    fn handle_single_job_result(&self, result: JobTaskJoinResult) {
-        match result {
-            Ok((key, source, Ok(()))) => {
-                let remove_result = match source {
-                    QueueSource::FirehoseLive => self.storage.remove_firehose_live(&key),
-                    QueueSource::FirehoseBackfill => self.storage.remove_firehose_backfill(&key),
-                    QueueSource::LabelLive => self.storage.remove_label_live(&key),
-                };
-                if let Err(e) = remove_result {
-                    tracing::error!("failed to remove index job from {:?}: {e}", source);
-                }
-            }
-            Ok((_, _, Err(e))) => {
-                crate::metrics::INDEXER_RECORDS_FAILED_TOTAL.inc();
-                tracing::error!("index job failed: {e}");
-            }
-            Err(e) => {
-                tracing::error!("task panicked: {e}");
-            }
-        }
-    }
-
     #[cfg(test)]
     async fn spawn_index_job_tasks(
         &self,
@@ -819,7 +905,8 @@ impl IndexerManager {
             let pool = self.pool_backfill.clone();
 
             let task = tokio::spawn(async move {
-                let result = Self::process_job(&pool, &job).await;
+                let result =
+                    Self::process_job(&pool, &job, *crate::config::RECORD_SKIP_BOILERPLATE).await;
                 drop(permit);
                 (key, source, result)
             });
@@ -845,6 +932,9 @@ impl IndexerManager {
                         tracing::error!("failed to remove index job from {:?}: {e}", source);
                     }
                 }
+                Ok((_, _, Err(WintermuteError::StaleGeneration(did)))) => {
+                    self.refetch_stale(&did);
+                }
                 Ok((_, _, Err(e))) => {
                     crate::metrics::INDEXER_RECORDS_FAILED_TOTAL.inc();
                     tracing::error!("index job failed: {e}");
@@ -853,6 +943,23 @@ impl IndexerManager {
                     tracing::error!("task panicked: {e}");
                 }
             }
+        }
+    }
+
+    /// Asks for the actor's repository again under its current generation
+    /// after a job from an older one was refused.
+    fn refetch_stale(&self, did: &str) {
+        Self::refetch_stale_with(&self.storage, did);
+    }
+
+    fn refetch_stale_with(storage: &Storage, did: &str) {
+        tracing::warn!("refetching {did}: job from a superseded generation");
+        if let Err(e) = storage.enqueue_backfill_priority(&crate::types::BackfillJob {
+            did: did.to_owned(),
+            retry_count: 0,
+            priority: true,
+        }) {
+            tracing::error!("failed to enqueue refetch for {did}: {e}");
         }
     }
 
@@ -917,7 +1024,7 @@ impl IndexerManager {
         // Resolve DID document to get handle
         // Clone the resolver so each task gets its own instance without mutex contention
         let did_doc = {
-            let mut resolver = id_resolver.as_ref().clone();
+            let resolver = id_resolver.as_ref().clone();
             match resolver.did.resolve(did.to_owned(), Some(true)).await {
                 Ok(Some(doc)) => doc,
                 Ok(None) => {
@@ -1087,7 +1194,23 @@ impl IndexerManager {
         Ok(result.is_some())
     }
 
-    pub async fn process_job(pool: &Pool, job: &IndexJob) -> Result<(), WintermuteError> {
+    pub async fn process_job(
+        pool: &Pool,
+        job: &IndexJob,
+        skip_boilerplate: bool,
+    ) -> Result<(), WintermuteError> {
+        Self::process_job_with(pool, job, skip_boilerplate, GateMode::Normal).await
+    }
+
+    /// Applies one job under the actor's write gate: fenced actors defer,
+    /// work at or below the boundary or from an older generation is refused,
+    /// and progress is recorded after an applied job.
+    pub async fn process_job_with(
+        pool: &Pool,
+        job: &IndexJob,
+        skip_boilerplate: bool,
+        mode: GateMode,
+    ) -> Result<(), WintermuteError> {
         use crate::metrics;
 
         tracing::debug!(
@@ -1099,25 +1222,88 @@ impl IndexerManager {
 
         metrics::INDEXER_RECORDS_PROCESSED_TOTAL.inc();
 
-        let uri = AtUri::new(job.uri.clone(), None)
-            .map_err(|e| WintermuteError::Other(format!("invalid uri: {e}")))?;
-
-        let did = uri.get_hostname();
-        let collection = uri.get_collection();
-        let rkey = uri.get_rkey();
+        let (did, collection, rkey) = if matches!(job.action, WriteAction::Commit) {
+            (
+                job.uri.trim_start_matches("at://").to_owned(),
+                String::new(),
+                String::new(),
+            )
+        } else {
+            let uri = AtUri::new(job.uri.clone(), None)
+                .map_err(|e| WintermuteError::Other(format!("invalid uri: {e}")))?;
+            (
+                uri.get_hostname().clone(),
+                uri.get_collection(),
+                uri.get_rkey(),
+            )
+        };
 
         tracing::debug!("parsed uri: did={did}, collection={collection}, rkey={rkey}");
+
+        if !matches!(job.action, WriteAction::Commit)
+            && !crate::config::record_collection_allowed(&collection)
+        {
+            metrics::INDEXER_RECORDS_FILTERED_TOTAL.inc();
+            tracing::debug!("skipping non-allowlisted collection: {collection}");
+            return Ok(());
+        }
 
         let client = pool.get().await?;
         tracing::debug!("got database client");
 
+        let gate = Gate::open(&client, &[did.as_str()], mode).await?;
+        let admission = gate.admit(&did, &job.rev, job.provenance.as_ref());
+        metrics::INDEXER_ADMISSION_TOTAL
+            .with_label_values(&[admission.label()])
+            .inc();
+        let outcome = match admission {
+            Admission::Apply => {
+                let applied = if matches!(job.action, WriteAction::Commit) {
+                    crate::reconcile::record_commit_progress(&client, &did, &job.rev, &job.cid)
+                        .await
+                } else {
+                    Self::apply_job(&client, job, skip_boilerplate, &did, &collection, &rkey).await
+                };
+                match applied {
+                    Ok(()) => {
+                        crate::reconcile::record_progress(
+                            &client,
+                            &[(did.clone(), job.rev.clone())],
+                        )
+                        .await
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            Admission::Deferred => Err(WintermuteError::Fenced(did.clone())),
+            Admission::BelowBoundary => Ok(()),
+            Admission::StaleGeneration => Err(WintermuteError::StaleGeneration(did.clone())),
+        };
+        gate.close(&client).await?;
+        outcome
+    }
+
+    async fn apply_job(
+        client: &deadpool_postgres::Client,
+        job: &IndexJob,
+        skip_boilerplate: bool,
+        did: &str,
+        collection: &str,
+        rkey: &str,
+    ) -> Result<(), WintermuteError> {
+        use crate::metrics;
+        let did = did.to_owned();
+        let collection = collection.to_owned();
+        let rkey = rkey.to_owned();
+
         match job.action {
+            WriteAction::Commit => {}
             WriteAction::Create | WriteAction::Update => {
                 tracing::debug!("processing create/update action");
 
                 // Ensure actor row exists for this DID (cached to avoid redundant DB calls)
                 if !ACTOR_CACHE.contains_key(did.as_str()) {
-                    Self::ensure_actor_exists(&client, did.as_str(), &job.indexed_at).await?;
+                    Self::ensure_actor_exists(client, did.as_str(), &job.indexed_at).await?;
                     if ACTOR_CACHE.len() < ACTOR_CACHE_MAX_SIZE {
                         ACTOR_CACHE.insert(did.clone(), ());
                     }
@@ -1127,16 +1313,23 @@ impl IndexerManager {
                     WintermuteError::Other("missing record for create/update".into())
                 })?;
 
-                let applied = Self::insert_generic_record(
-                    &client,
-                    &job.uri,
-                    &job.cid,
-                    did.as_str(),
-                    record_json,
-                    &job.rev,
-                    &job.indexed_at,
-                )
-                .await?;
+                // Boilerplate collections skip the record table once the
+                // dataplane synthesizes them; typed ON CONFLICT absorbs replays.
+                let applied =
+                    if skip_boilerplate && crate::config::boilerplate_collection(&collection) {
+                        true
+                    } else {
+                        Self::insert_generic_record(
+                            client,
+                            &job.uri,
+                            &job.cid,
+                            did.as_str(),
+                            record_json,
+                            &job.rev,
+                            &job.indexed_at,
+                        )
+                        .await?
+                    };
 
                 if !applied {
                     metrics::INDEXER_STALE_WRITES_SKIPPED_TOTAL.inc();
@@ -1152,7 +1345,7 @@ impl IndexerManager {
                     "app.bsky.feed.post" => {
                         metrics::INDEXER_POST_EVENTS_TOTAL.inc();
                         Self::index_post(
-                            &client,
+                            client,
                             did.as_str(),
                             rkey.as_str(),
                             record_json,
@@ -1164,7 +1357,7 @@ impl IndexerManager {
                     "app.bsky.feed.like" => {
                         metrics::INDEXER_LIKE_EVENTS_TOTAL.inc();
                         Self::index_like(
-                            &client,
+                            client,
                             did.as_str(),
                             rkey.as_str(),
                             record_json,
@@ -1176,7 +1369,7 @@ impl IndexerManager {
                     "app.bsky.graph.follow" => {
                         metrics::INDEXER_FOLLOW_EVENTS_TOTAL.inc();
                         Self::index_follow(
-                            &client,
+                            client,
                             did.as_str(),
                             rkey.as_str(),
                             record_json,
@@ -1188,7 +1381,7 @@ impl IndexerManager {
                     "app.bsky.feed.repost" => {
                         metrics::INDEXER_REPOST_EVENTS_TOTAL.inc();
                         Self::index_repost(
-                            &client,
+                            client,
                             did.as_str(),
                             rkey.as_str(),
                             record_json,
@@ -1200,7 +1393,7 @@ impl IndexerManager {
                     "app.bsky.graph.block" => {
                         metrics::INDEXER_BLOCK_EVENTS_TOTAL.inc();
                         Self::index_block(
-                            &client,
+                            client,
                             did.as_str(),
                             rkey.as_str(),
                             record_json,
@@ -1212,7 +1405,7 @@ impl IndexerManager {
                     "app.bsky.actor.profile" => {
                         metrics::INDEXER_PROFILE_EVENTS_TOTAL.inc();
                         Self::index_profile(
-                            &client,
+                            client,
                             did.as_str(),
                             rkey.as_str(),
                             record_json,
@@ -1223,7 +1416,7 @@ impl IndexerManager {
                     }
                     "app.bsky.feed.generator" => {
                         Self::index_feed_generator(
-                            &client,
+                            client,
                             did.as_str(),
                             rkey.as_str(),
                             record_json,
@@ -1234,7 +1427,7 @@ impl IndexerManager {
                     }
                     "app.bsky.graph.list" => {
                         Self::index_list(
-                            &client,
+                            client,
                             did.as_str(),
                             rkey.as_str(),
                             record_json,
@@ -1245,7 +1438,7 @@ impl IndexerManager {
                     }
                     "app.bsky.graph.listitem" => {
                         Self::index_list_item(
-                            &client,
+                            client,
                             did.as_str(),
                             rkey.as_str(),
                             record_json,
@@ -1256,7 +1449,7 @@ impl IndexerManager {
                     }
                     "app.bsky.graph.listblock" => {
                         Self::index_list_block(
-                            &client,
+                            client,
                             did.as_str(),
                             rkey.as_str(),
                             record_json,
@@ -1267,7 +1460,7 @@ impl IndexerManager {
                     }
                     "app.bsky.graph.starterpack" => {
                         Self::index_starter_pack(
-                            &client,
+                            client,
                             did.as_str(),
                             rkey.as_str(),
                             record_json,
@@ -1278,7 +1471,7 @@ impl IndexerManager {
                     }
                     "app.bsky.labeler.service" => {
                         Self::index_labeler(
-                            &client,
+                            client,
                             did.as_str(),
                             rkey.as_str(),
                             record_json,
@@ -1289,7 +1482,7 @@ impl IndexerManager {
                     }
                     "app.bsky.feed.threadgate" => {
                         Self::index_threadgate(
-                            &client,
+                            client,
                             did.as_str(),
                             rkey.as_str(),
                             record_json,
@@ -1300,7 +1493,7 @@ impl IndexerManager {
                     }
                     "app.bsky.feed.postgate" => {
                         Self::index_postgate(
-                            &client,
+                            client,
                             did.as_str(),
                             rkey.as_str(),
                             record_json,
@@ -1311,7 +1504,7 @@ impl IndexerManager {
                     }
                     "chat.bsky.actor.declaration" => {
                         Self::index_chat_declaration(
-                            &client,
+                            client,
                             did.as_str(),
                             rkey.as_str(),
                             record_json,
@@ -1322,7 +1515,7 @@ impl IndexerManager {
                     }
                     "app.bsky.notification.declaration" => {
                         Self::index_notif_declaration(
-                            &client,
+                            client,
                             did.as_str(),
                             rkey.as_str(),
                             record_json,
@@ -1333,7 +1526,7 @@ impl IndexerManager {
                     }
                     "app.bsky.actor.status" => {
                         Self::index_status(
-                            &client,
+                            client,
                             did.as_str(),
                             rkey.as_str(),
                             record_json,
@@ -1344,7 +1537,7 @@ impl IndexerManager {
                     }
                     "app.bsky.graph.verification" => {
                         Self::index_verification(
-                            &client,
+                            client,
                             did.as_str(),
                             rkey.as_str(),
                             record_json,
@@ -1355,7 +1548,7 @@ impl IndexerManager {
                     }
                     "community.blacksky.feed.post" => {
                         Self::index_community_post_stub(
-                            &client,
+                            client,
                             did.as_str(),
                             rkey.as_str(),
                             &job.cid,
@@ -1367,7 +1560,15 @@ impl IndexerManager {
                 }
             }
             WriteAction::Delete => {
-                let applied = Self::delete_generic_record(&client, &job.uri, &job.rev).await?;
+                // Boilerplate deletes bypass the record gate: the typed
+                // delete is idempotent when the row is already absent.
+                let applied =
+                    if skip_boilerplate && crate::config::boilerplate_collection(&collection) {
+                        drop(Self::delete_generic_record(client, &job.uri, &job.rev).await);
+                        true
+                    } else {
+                        Self::delete_generic_record(client, &job.uri, &job.rev).await?
+                    };
 
                 if !applied {
                     return Ok(());
@@ -1375,62 +1576,61 @@ impl IndexerManager {
 
                 match collection.as_str() {
                     "app.bsky.feed.post" => {
-                        Self::delete_post(&client, did.as_str(), rkey.as_str()).await?;
+                        Self::delete_post(client, did.as_str(), rkey.as_str()).await?;
                     }
                     "app.bsky.feed.like" => {
-                        Self::delete_like(&client, did.as_str(), rkey.as_str()).await?;
+                        Self::delete_like(client, did.as_str(), rkey.as_str()).await?;
                     }
                     "app.bsky.graph.follow" => {
-                        Self::delete_follow(&client, did.as_str(), rkey.as_str()).await?;
+                        Self::delete_follow(client, did.as_str(), rkey.as_str()).await?;
                     }
                     "app.bsky.feed.repost" => {
-                        Self::delete_repost(&client, did.as_str(), rkey.as_str()).await?;
+                        Self::delete_repost(client, did.as_str(), rkey.as_str()).await?;
                     }
                     "app.bsky.graph.block" => {
-                        Self::delete_block(&client, did.as_str(), rkey.as_str()).await?;
+                        Self::delete_block(client, did.as_str(), rkey.as_str()).await?;
                     }
                     "app.bsky.actor.profile" => {
-                        Self::delete_profile(&client, did.as_str(), rkey.as_str()).await?;
+                        Self::delete_profile(client, did.as_str(), rkey.as_str()).await?;
                     }
                     "app.bsky.feed.generator" => {
-                        Self::delete_feed_generator(&client, did.as_str(), rkey.as_str()).await?;
+                        Self::delete_feed_generator(client, did.as_str(), rkey.as_str()).await?;
                     }
                     "app.bsky.graph.list" => {
-                        Self::delete_list(&client, did.as_str(), rkey.as_str()).await?;
+                        Self::delete_list(client, did.as_str(), rkey.as_str()).await?;
                     }
                     "app.bsky.graph.listitem" => {
-                        Self::delete_list_item(&client, did.as_str(), rkey.as_str()).await?;
+                        Self::delete_list_item(client, did.as_str(), rkey.as_str()).await?;
                     }
                     "app.bsky.graph.listblock" => {
-                        Self::delete_list_block(&client, did.as_str(), rkey.as_str()).await?;
+                        Self::delete_list_block(client, did.as_str(), rkey.as_str()).await?;
                     }
                     "app.bsky.graph.starterpack" => {
-                        Self::delete_starter_pack(&client, did.as_str(), rkey.as_str()).await?;
+                        Self::delete_starter_pack(client, did.as_str(), rkey.as_str()).await?;
                     }
                     "app.bsky.labeler.service" => {
-                        Self::delete_labeler(&client, did.as_str(), rkey.as_str()).await?;
+                        Self::delete_labeler(client, did.as_str(), rkey.as_str()).await?;
                     }
                     "app.bsky.feed.threadgate" => {
-                        Self::delete_threadgate(&client, did.as_str(), rkey.as_str()).await?;
+                        Self::delete_threadgate(client, did.as_str(), rkey.as_str()).await?;
                     }
                     "app.bsky.feed.postgate" => {
-                        Self::delete_postgate(&client, did.as_str(), rkey.as_str()).await?;
+                        Self::delete_postgate(client, did.as_str(), rkey.as_str()).await?;
                     }
                     "chat.bsky.actor.declaration" => {
-                        Self::delete_chat_declaration(&client, did.as_str(), rkey.as_str()).await?;
+                        Self::delete_chat_declaration(client, did.as_str(), rkey.as_str()).await?;
                     }
                     "app.bsky.notification.declaration" => {
-                        Self::delete_notif_declaration(&client, did.as_str(), rkey.as_str())
-                            .await?;
+                        Self::delete_notif_declaration(client, did.as_str(), rkey.as_str()).await?;
                     }
                     "app.bsky.actor.status" => {
-                        Self::delete_status(&client, did.as_str(), rkey.as_str()).await?;
+                        Self::delete_status(client, did.as_str(), rkey.as_str()).await?;
                     }
                     "app.bsky.graph.verification" => {
-                        Self::delete_verification(&client, did.as_str(), rkey.as_str()).await?;
+                        Self::delete_verification(client, did.as_str(), rkey.as_str()).await?;
                     }
                     "community.blacksky.feed.post" => {
-                        Self::delete_community_post(&client, did.as_str(), rkey.as_str()).await?;
+                        Self::delete_community_post(client, did.as_str(), rkey.as_str()).await?;
                     }
                     _ => {}
                 }
@@ -1446,41 +1646,582 @@ impl IndexerManager {
     pub async fn process_jobs_batch(
         pool: &Pool,
         jobs: &[(Vec<u8>, IndexJob)],
-    ) -> Vec<(Vec<u8>, Result<(), WintermuteError>)> {
-        use crate::metrics;
+        bulk_load: bool,
+        skip_boilerplate: bool,
+    ) -> (Vec<(Vec<u8>, Result<(), WintermuteError>)>, bool) {
+        Self::process_jobs_batch_with(pool, jobs, bulk_load, skip_boilerplate, GateMode::Normal)
+            .await
+    }
 
+    /// The actor of a job's URI, for the write gate.
+    fn job_did(job: &IndexJob) -> &str {
+        let rest = job.uri.trim_start_matches("at://");
+        rest.split('/').next().unwrap_or(rest)
+    }
+
+    /// Runs a batch under the write gate of every actor in it: fenced or
+    /// stale work is answered without touching the appview, and progress
+    /// is recorded for every actor whose jobs were applied.
+    pub async fn process_jobs_batch_with(
+        pool: &Pool,
+        jobs: &[(Vec<u8>, IndexJob)],
+        bulk_load: bool,
+        skip_boilerplate: bool,
+        mode: GateMode,
+    ) -> (Vec<(Vec<u8>, Result<(), WintermuteError>)>, bool) {
         if jobs.is_empty() {
-            return Vec::new();
+            return (Vec::new(), false);
         }
 
+        let all_dids: Vec<&str> = jobs.iter().map(|(_, job)| Self::job_did(job)).collect();
+        let gate_client = match pool.get().await {
+            Ok(client) => client,
+            Err(e) => {
+                let err_msg = format!("pool error: {e}");
+                let results = jobs
+                    .iter()
+                    .map(|(key, _)| (key.clone(), Err(WintermuteError::Other(err_msg.clone()))))
+                    .collect();
+                return (results, true);
+            }
+        };
+        let gate_mode = mode.clone();
+        let gate = match Gate::open(&gate_client, &all_dids, mode).await {
+            Ok(gate) => gate,
+            Err(e) => {
+                let err_msg = format!("write gate failed: {e}");
+                let results = jobs
+                    .iter()
+                    .map(|(key, _)| (key.clone(), Err(WintermuteError::Other(err_msg.clone()))))
+                    .collect();
+                return (results, true);
+            }
+        };
+        let mut results: Vec<(Vec<u8>, Result<(), WintermuteError>)> =
+            Vec::with_capacity(jobs.len());
+        let mut admitted: Vec<(Vec<u8>, IndexJob)> = Vec::with_capacity(jobs.len());
+        let mut commits: Vec<(&Vec<u8>, &IndexJob)> = Vec::new();
+        for (key, job) in jobs {
+            let did = Self::job_did(job);
+            let admission = gate.admit(did, &job.rev, job.provenance.as_ref());
+            crate::metrics::INDEXER_ADMISSION_TOTAL
+                .with_label_values(&[admission.label()])
+                .inc();
+            match admission {
+                Admission::Apply if matches!(job.action, WriteAction::Commit) => {
+                    commits.push((key, job));
+                }
+                Admission::Apply => admitted.push((key.clone(), job.clone())),
+                Admission::Deferred => {
+                    results.push((key.clone(), Err(WintermuteError::Fenced(did.to_owned()))));
+                }
+                Admission::BelowBoundary => results.push((key.clone(), Ok(()))),
+                Admission::StaleGeneration => results.push((
+                    key.clone(),
+                    Err(WintermuteError::StaleGeneration(did.to_owned())),
+                )),
+            }
+        }
+        let (applied, batch_failed) =
+            Self::apply_jobs_batch(pool, &admitted, bulk_load, skip_boilerplate, &gate_mode).await;
+        let mut progress: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+        for (key, result) in &applied {
+            if result.is_ok() {
+                if let Some((_, job)) = admitted.iter().find(|(k, _)| k == key) {
+                    let did = Self::job_did(job);
+                    let entry = progress.entry(did).or_insert(job.rev.as_str());
+                    if job.rev.as_str() > *entry {
+                        *entry = job.rev.as_str();
+                    }
+                }
+            }
+        }
+        let progress: Vec<(String, String)> = progress
+            .iter()
+            .map(|(did, rev)| ((*did).to_owned(), (*rev).to_owned()))
+            .collect();
+        // a commit is acknowledged only once every write of its event
+        // landed and the acknowledgement itself is durable; anything short
+        // of that hands the commit job back to the queue
+        let failed_dids: std::collections::HashSet<&str> = applied
+            .iter()
+            .filter(|(_, result)| result.is_err())
+            .filter_map(|(key, _)| admitted.iter().find(|(k, _)| k == key))
+            .map(|(_, job)| Self::job_did(job))
+            .collect();
+        results.extend(applied);
+        let mut batch_failed = batch_failed;
+        if let Err(e) = crate::reconcile::record_progress(&gate_client, &progress).await {
+            tracing::error!("progress record failed: {e}");
+            batch_failed = true;
+        }
+        for (key, job) in commits {
+            let did = Self::job_did(job);
+            if failed_dids.contains(did) {
+                results.push((
+                    key.clone(),
+                    Err(WintermuteError::Other(format!(
+                        "writes of the event failed before the commit {} could be acknowledged",
+                        job.cid
+                    ))),
+                ));
+                continue;
+            }
+            match crate::reconcile::record_commit_progress(&gate_client, did, &job.rev, &job.cid)
+                .await
+            {
+                Ok(()) => results.push((key.clone(), Ok(()))),
+                Err(e) => {
+                    tracing::error!("commit progress record failed for {did}: {e}");
+                    batch_failed = true;
+                    results.push((
+                        key.clone(),
+                        Err(WintermuteError::Other(format!(
+                            "commit acknowledgement for {} was not recorded: {e}",
+                            job.cid
+                        ))),
+                    ));
+                }
+            }
+        }
+        if let Err(e) = gate.close(&gate_client).await {
+            tracing::error!("write gate release failed: {e}");
+            batch_failed = true;
+        }
+        (results, batch_failed)
+    }
+
+    async fn apply_jobs_batch(
+        pool: &Pool,
+        jobs: &[(Vec<u8>, IndexJob)],
+        bulk_load: bool,
+        skip_boilerplate: bool,
+        mode: &GateMode,
+    ) -> (Vec<(Vec<u8>, Result<(), WintermuteError>)>, bool) {
+        if jobs.is_empty() {
+            return (Vec::new(), false);
+        }
+
+        let mut batch_failed = false;
         let mut results: Vec<(Vec<u8>, Result<(), WintermuteError>)> =
             Vec::with_capacity(jobs.len());
 
-        // Separate creates/updates from deletes
+        // A record created AND deleted within one drain batch cannot be
+        // phase-split at all; those rare same-uri pairs process per-record in
+        // queue order first.
+        let mut create_uris: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut delete_uris: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for (_, job) in jobs {
+            match job.action {
+                WriteAction::Create | WriteAction::Update => {
+                    create_uris.insert(job.uri.as_str());
+                }
+                WriteAction::Delete => {
+                    delete_uris.insert(job.uri.as_str());
+                }
+                WriteAction::Commit => {}
+            }
+        }
+        let conflicted: std::collections::HashSet<&str> =
+            create_uris.intersection(&delete_uris).copied().collect();
+
         let mut creates: Vec<&(Vec<u8>, IndexJob)> = Vec::new();
         let mut deletes: Vec<&(Vec<u8>, IndexJob)> = Vec::new();
+        let mut sequential: Vec<&(Vec<u8>, IndexJob)> = Vec::new();
 
         for job_tuple in jobs {
+            if !bulk_load && conflicted.contains(job_tuple.1.uri.as_str()) {
+                sequential.push(job_tuple);
+                continue;
+            }
             match job_tuple.1.action {
                 WriteAction::Create | WriteAction::Update => creates.push(job_tuple),
                 WriteAction::Delete => deletes.push(job_tuple),
+                WriteAction::Commit => results.push((job_tuple.0.clone(), Ok(()))),
             }
+        }
+
+        // Distinct conflicted uris are independent rows, so their groups run
+        // concurrently; jobs within one uri keep strict queue order.
+        if !sequential.is_empty() {
+            let prepass_start = std::time::Instant::now();
+            let mut uri_groups: Vec<Vec<&(Vec<u8>, IndexJob)>> = Vec::new();
+            let mut group_index: std::collections::HashMap<&str, usize> =
+                std::collections::HashMap::new();
+            for job_tuple in sequential {
+                let uri = job_tuple.1.uri.as_str();
+                if let Some(&idx) = group_index.get(uri) {
+                    uri_groups[idx].push(job_tuple);
+                } else {
+                    group_index.insert(uri, uri_groups.len());
+                    uri_groups.push(vec![job_tuple]);
+                }
+            }
+            let group_count = uri_groups.len();
+            let group_futures: Vec<_> = uri_groups
+                .into_iter()
+                .map(|group| {
+                    Box::pin(async move {
+                        let mut out = Vec::with_capacity(group.len());
+                        for (key, job) in group {
+                            out.push((
+                                key.clone(),
+                                Box::pin(Self::process_job_with(
+                                    pool,
+                                    job,
+                                    skip_boilerplate,
+                                    mode.clone(),
+                                ))
+                                .await,
+                            ));
+                        }
+                        out
+                    })
+                })
+                .collect();
+            let group_results: Vec<_> = futures::stream::iter(group_futures)
+                .buffer_unordered(4)
+                .collect()
+                .await;
+            for group in group_results {
+                for (key, result) in group {
+                    if result.is_err() {
+                        batch_failed = true;
+                    }
+                    results.push((key, result));
+                }
+            }
+            let prepass_ms = prepass_start.elapsed().as_millis();
+            if prepass_ms > 500 {
+                tracing::warn!("SLOW conflicted pre-pass: {prepass_ms}ms for {group_count} uris");
+            }
+        }
+
+        // Deletes run before creates: a user's unlike-then-relike spanning the
+        // phase split must clear the old row first, or the new record is
+        // silently dropped on its (subject, creator)-style unique conflict.
+        if !deletes.is_empty() {
+            let (delete_results, bf) = Box::pin(Self::batch_delete_records(
+                pool,
+                &deletes,
+                bulk_load,
+                skip_boilerplate,
+            ))
+            .await;
+            batch_failed |= bf;
+            results.extend(delete_results);
         }
 
         // Process creates in batch (uses parallel COPY for different collection types)
         if !creates.is_empty() {
-            let batch_results = Self::batch_insert_records(pool, &creates).await;
+            let (batch_results, bf) = Box::pin(Self::batch_insert_records(
+                pool,
+                &creates,
+                bulk_load,
+                skip_boilerplate,
+            ))
+            .await;
+            batch_failed |= bf;
             results.extend(batch_results);
         }
 
-        // Process deletes individually (they're less common and more complex)
-        for (key, job) in deletes {
-            let result = Self::process_job(pool, job).await;
-            metrics::INDEXER_RECORDS_PROCESSED_TOTAL.inc();
-            results.push((key.clone(), result));
+        (results, batch_failed)
+    }
+
+    /// Batch delete records using set-based statements (uri = ANY) instead of
+    /// per-record round-trips, preserving the rev gate and aggregate decrements.
+    async fn batch_delete_records(
+        pool: &Pool,
+        jobs: &[&(Vec<u8>, IndexJob)],
+        bulk_load: bool,
+        skip_boilerplate: bool,
+    ) -> (Vec<(Vec<u8>, Result<(), WintermuteError>)>, bool) {
+        use crate::metrics;
+        use std::collections::{BTreeMap, HashSet};
+        use std::time::Instant;
+
+        struct ParsedDelete<'a> {
+            key: &'a Vec<u8>,
+            job: &'a IndexJob,
+            uri: String,
+            collection: String,
+            did: String,
+            rkey: String,
         }
 
-        results
+        let start = Instant::now();
+        let mut results: Vec<(Vec<u8>, Result<(), WintermuteError>)> =
+            Vec::with_capacity(jobs.len());
+
+        let mut parsed: Vec<ParsedDelete<'_>> = Vec::with_capacity(jobs.len());
+        for (key, job) in jobs {
+            match AtUri::new(job.uri.clone(), None) {
+                Ok(uri) => {
+                    let collection = uri.get_collection();
+                    if crate::config::record_collection_allowed(&collection) {
+                        parsed.push(ParsedDelete {
+                            key,
+                            job,
+                            uri: uri.to_string(),
+                            did: uri.get_hostname().clone(),
+                            rkey: uri.get_rkey().clone(),
+                            collection,
+                        });
+                    } else {
+                        metrics::INDEXER_RECORDS_FILTERED_TOTAL.inc();
+                        results.push(((*key).clone(), Ok(())));
+                    }
+                }
+                Err(e) => {
+                    results.push((
+                        (*key).clone(),
+                        Err(WintermuteError::Other(format!("invalid uri: {e}"))),
+                    ));
+                }
+            }
+        }
+        metrics::INDEXER_RECORDS_PROCESSED_TOTAL.inc_by(parsed.len() as u64);
+
+        if parsed.is_empty() {
+            return (results, false);
+        }
+
+        let client = match pool.get().await {
+            Ok(c) => c,
+            Err(e) => {
+                let err_msg = format!("pool error: {e}");
+                for p in &parsed {
+                    results.push((p.key.clone(), Err(WintermuteError::Other(err_msg.clone()))));
+                }
+                return (results, true);
+            }
+        };
+
+        let uris: Vec<String> = parsed.iter().map(|p| p.uri.clone()).collect();
+        let revs: Vec<String> = parsed.iter().map(|p| p.job.rev.clone()).collect();
+
+        // Rev-gated generic record delete; only applied uris get collection cleanup
+        let mut applied: HashSet<String> = match client
+            .query(
+                "DELETE FROM record r
+                 USING unnest($1::text[], $2::text[]) AS d(uri, rev)
+                 WHERE r.uri = d.uri AND r.rev <= d.rev
+                 RETURNING r.uri",
+                &[&uris, &revs],
+            )
+            .await
+        {
+            Ok(rows) => rows.iter().map(|r| r.get(0)).collect(),
+            Err(e) => {
+                let err_msg = format!("batch record delete failed: {e}");
+                tracing::error!("{err_msg}");
+                for p in &parsed {
+                    results.push((p.key.clone(), Err(WintermuteError::Other(err_msg.clone()))));
+                }
+                return (results, false);
+            }
+        };
+        // Boilerplate deletes bypass the record gate once their rows stop
+        // being written there: the typed DELETE is idempotent on absent rows.
+        if skip_boilerplate {
+            for p in &parsed {
+                if crate::config::boilerplate_collection(&p.collection) {
+                    applied.insert(p.uri.clone());
+                }
+            }
+        }
+
+        if let Err(e) = client
+            .execute("DELETE FROM duplicate_record WHERE uri = ANY($1)", &[&uris])
+            .await
+        {
+            tracing::warn!("batch duplicate_record delete failed: {e}");
+        }
+
+        let mut by_collection: BTreeMap<&str, Vec<&ParsedDelete<'_>>> = BTreeMap::new();
+        for p in &parsed {
+            if applied.contains(&p.uri) {
+                by_collection
+                    .entry(p.collection.as_str())
+                    .or_default()
+                    .push(p);
+            } else {
+                results.push((p.key.clone(), Ok(())));
+            }
+        }
+
+        for (collection, group) in by_collection {
+            let group_uris: Vec<String> = group.iter().map(|p| p.uri.clone()).collect();
+            let group_result: Result<(), WintermuteError> = async {
+                match collection {
+                    "app.bsky.feed.like" => {
+                        let mut subjects: std::collections::HashMap<String, i64> =
+                            std::collections::HashMap::new();
+                        for r in client
+                            .query(
+                                "DELETE FROM \"like\" WHERE uri = ANY($1) RETURNING subject",
+                                &[&group_uris],
+                            )
+                            .await?
+                        {
+                            if let Some(subject) = r.get::<_, Option<String>>(0) {
+                                *subjects.entry(subject).or_insert(0) += 1;
+                            }
+                        }
+                        if !bulk_load {
+                            bulk::decrement_post_agg(&client, "likeCount", subjects).await?;
+                        }
+                    }
+                    "app.bsky.graph.block" => {
+                        client
+                            .execute(
+                                "DELETE FROM actor_block WHERE uri = ANY($1)",
+                                &[&group_uris],
+                            )
+                            .await?;
+                    }
+                    "app.bsky.feed.repost" => {
+                        let mut subjects: std::collections::HashMap<String, i64> =
+                            std::collections::HashMap::new();
+                        for r in client
+                            .query(
+                                "DELETE FROM repost WHERE uri = ANY($1) RETURNING subject",
+                                &[&group_uris],
+                            )
+                            .await?
+                        {
+                            if let Some(subject) = r.get::<_, Option<String>>(0) {
+                                *subjects.entry(subject).or_insert(0) += 1;
+                            }
+                        }
+                        client
+                            .execute("DELETE FROM feed_item WHERE uri = ANY($1)", &[&group_uris])
+                            .await?;
+                        if !bulk_load {
+                            bulk::decrement_post_agg(&client, "repostCount", subjects).await?;
+                        }
+                    }
+                    "app.bsky.feed.post" => {
+                        let deleted = client
+                            .query(
+                                "DELETE FROM post WHERE uri = ANY($1) RETURNING creator, \"replyParent\"",
+                                &[&group_uris],
+                            )
+                            .await?;
+                        let mut creators: std::collections::HashMap<String, i64> =
+                            std::collections::HashMap::new();
+                        let mut parents: std::collections::HashMap<String, i64> =
+                            std::collections::HashMap::new();
+                        for r in &deleted {
+                            if let Some(creator) = r.get::<_, Option<String>>(0) {
+                                *creators.entry(creator).or_insert(0) += 1;
+                            }
+                            if let Some(parent) = r.get::<_, Option<String>>(1) {
+                                *parents.entry(parent).or_insert(0) += 1;
+                            }
+                        }
+                        client
+                            .execute("DELETE FROM feed_item WHERE uri = ANY($1)", &[&group_uris])
+                            .await?;
+                        if !bulk_load {
+                            bulk::decrement_profile_agg(&client, "postsCount", creators).await?;
+                            bulk::decrement_post_agg(&client, "replyCount", parents).await?;
+                        }
+                    }
+                    "app.bsky.graph.follow" => {
+                        let pairs: Vec<(String, String)> = client
+                            .query(
+                                "DELETE FROM follow WHERE uri = ANY($1)
+                                 RETURNING creator, \"subjectDid\"",
+                                &[&group_uris],
+                            )
+                            .await?
+                            .iter()
+                            .map(|r| (r.get(0), r.get(1)))
+                            .collect();
+                        if !bulk_load && !pairs.is_empty() {
+                            let mut creators: std::collections::HashMap<String, i64> =
+                                std::collections::HashMap::new();
+                            let mut subjects: std::collections::HashMap<String, i64> =
+                                std::collections::HashMap::new();
+                            for (c, s) in &pairs {
+                                *creators.entry(c.clone()).or_insert(0) += 1;
+                                *subjects.entry(s.clone()).or_insert(0) += 1;
+                            }
+                            bulk::decrement_profile_agg(&client, "followsCount", creators).await?;
+                            bulk::decrement_profile_agg(&client, "followersCount", subjects)
+                                .await?;
+                        }
+                    }
+                    _ => {
+                        for p in &group {
+                            Self::delete_collection_record(
+                                &client,
+                                collection,
+                                p.did.as_str(),
+                                p.rkey.as_str(),
+                            )
+                            .await?;
+                        }
+                    }
+                }
+                Ok(())
+            }
+            .await;
+
+            match group_result {
+                Ok(()) => {
+                    for p in &group {
+                        results.push((p.key.clone(), Ok(())));
+                    }
+                }
+                Err(e) => {
+                    let err_msg = format!("batch delete for {collection} failed: {e}");
+                    tracing::error!("{err_msg}");
+                    for p in &group {
+                        results.push((p.key.clone(), Err(WintermuteError::Other(err_msg.clone()))));
+                    }
+                }
+            }
+        }
+
+        // Per-batch, same as the timing line above: DEBUG, not INFO.
+        tracing::debug!(
+            "batch deletes: total={}ms, n={}, applied={}",
+            start.elapsed().as_millis(),
+            parsed.len(),
+            applied.len()
+        );
+
+        (results, false)
+    }
+
+    /// Route a low-volume collection delete to its existing per-record helper.
+    async fn delete_collection_record(
+        client: &deadpool_postgres::Client,
+        collection: &str,
+        did: &str,
+        rkey: &str,
+    ) -> Result<(), WintermuteError> {
+        match collection {
+            "app.bsky.actor.profile" => Self::delete_profile(client, did, rkey).await,
+            "app.bsky.feed.generator" => Self::delete_feed_generator(client, did, rkey).await,
+            "app.bsky.graph.list" => Self::delete_list(client, did, rkey).await,
+            "app.bsky.graph.listitem" => Self::delete_list_item(client, did, rkey).await,
+            "app.bsky.graph.listblock" => Self::delete_list_block(client, did, rkey).await,
+            "app.bsky.graph.starterpack" => Self::delete_starter_pack(client, did, rkey).await,
+            "app.bsky.labeler.service" => Self::delete_labeler(client, did, rkey).await,
+            "app.bsky.feed.threadgate" => Self::delete_threadgate(client, did, rkey).await,
+            "app.bsky.feed.postgate" => Self::delete_postgate(client, did, rkey).await,
+            "chat.bsky.actor.declaration" => Self::delete_chat_declaration(client, did, rkey).await,
+            "app.bsky.notification.declaration" => {
+                Self::delete_notif_declaration(client, did, rkey).await
+            }
+            "app.bsky.actor.status" => Self::delete_status(client, did, rkey).await,
+            "app.bsky.graph.verification" => Self::delete_verification(client, did, rkey).await,
+            "community.blacksky.feed.post" => Self::delete_community_post(client, did, rkey).await,
+            _ => Ok(()),
+        }
     }
 
     /// Batch insert records using `PostgreSQL` `COPY` protocol for high throughput.
@@ -1488,11 +2229,15 @@ impl IndexerManager {
     async fn batch_insert_records(
         pool: &Pool,
         jobs: &[&(Vec<u8>, IndexJob)],
-    ) -> Vec<(Vec<u8>, Result<(), WintermuteError>)> {
+        bulk_load: bool,
+        skip_boilerplate: bool,
+    ) -> (Vec<(Vec<u8>, Result<(), WintermuteError>)>, bool) {
         use crate::metrics;
         use std::time::Instant;
 
         let batch_start = Instant::now();
+        // Set on any COPY/connection failure so callers don't treat the batch as persisted.
+        let mut batch_failed = false;
         let mut results: Vec<(Vec<u8>, Result<(), WintermuteError>)> =
             Vec::with_capacity(jobs.len());
 
@@ -1504,7 +2249,7 @@ impl IndexerManager {
                 for (key, _) in jobs {
                     results.push(((*key).clone(), Err(WintermuteError::Other(err_msg.clone()))));
                 }
-                return results;
+                return (results, true);
             }
         };
 
@@ -1537,8 +2282,18 @@ impl IndexerManager {
         }
         let parse_ms = parse_start.elapsed().as_millis();
 
+        parsed_jobs.retain(|p| {
+            if crate::config::record_collection_allowed(&p.collection) {
+                true
+            } else {
+                metrics::INDEXER_RECORDS_FILTERED_TOTAL.inc();
+                results.push(((*p.key).clone(), Ok(())));
+                false
+            }
+        });
+
         if parsed_jobs.is_empty() {
-            return results;
+            return (results, batch_failed);
         }
 
         // Batch 1: Ensure all actors exist using COPY
@@ -1552,15 +2307,24 @@ impl IndexerManager {
 
         if let Err(e) = bulk::copy_ensure_actors(&client, &unique_dids).await {
             tracing::error!("COPY actor insert failed: {e}");
-            // Continue anyway, individual records may still work
+            batch_failed = true;
         }
         let actors_ms = actors_start.elapsed().as_millis();
 
-        // Batch 2: Insert all records into the record table using COPY
+        // Batch 2: Insert records into the record table using COPY. When the
+        // boilerplate skip is on, like/follow/repost/block jobs bypass the
+        // record table entirely: their typed inserts' ON CONFLICT DO NOTHING
+        // absorbs replays, so they count as applied unconditionally.
         let records_start = Instant::now();
+        let record_gated: Vec<bool> = parsed_jobs
+            .iter()
+            .map(|pj| !(skip_boilerplate && crate::config::boilerplate_collection(&pj.collection)))
+            .collect();
         let record_data: Vec<_> = parsed_jobs
             .iter()
-            .map(|pj| {
+            .zip(&record_gated)
+            .filter(|(_, gated)| **gated)
+            .map(|(pj, _)| {
                 (
                     pj.job.uri.clone(),
                     pj.job.cid.clone(),
@@ -1580,16 +2344,32 @@ impl IndexerManager {
             Ok(results) => results,
             Err(e) => {
                 tracing::error!("COPY record insert failed: {e}");
-                vec![false; parsed_jobs.len()]
+                // Fail every job in the batch so callers can requeue; treating
+                // them as stale-skips would silently drop the events.
+                let err_msg = format!("record COPY failed: {e}");
+                for pj in &parsed_jobs {
+                    results.push((
+                        (*pj.key).clone(),
+                        Err(WintermuteError::Other(err_msg.clone())),
+                    ));
+                }
+                return (results, true);
             }
         };
         let records_ms = records_start.elapsed().as_millis();
 
-        // Track which jobs were applied (not stale)
+        // Track which jobs were applied (not stale); gated jobs consume the
+        // record results in order, ungated boilerplate is always applied.
         let mut applied_jobs: Vec<&ParsedJob<'_>> = Vec::new();
-        for (i, applied) in record_results.iter().enumerate() {
-            if *applied {
-                applied_jobs.push(&parsed_jobs[i]);
+        let mut gated_results = record_results.iter();
+        for (i, pj) in parsed_jobs.iter().enumerate() {
+            let applied = if record_gated[i] {
+                *gated_results.next().unwrap_or(&false)
+            } else {
+                true
+            };
+            if applied {
+                applied_jobs.push(pj);
             } else {
                 metrics::INDEXER_STALE_WRITES_SKIPPED_TOTAL.inc();
             }
@@ -1628,16 +2408,20 @@ impl IndexerManager {
             blocks_result,
             profiles_result,
         ) = tokio::join!(
-            Self::parallel_copy_posts(pool, &posts),
-            Self::parallel_copy_likes(pool, &likes),
-            Self::parallel_copy_follows(pool, &follows),
-            Self::parallel_copy_reposts(pool, &reposts),
+            Self::parallel_copy_posts(pool, &posts, bulk_load),
+            Self::parallel_copy_likes(pool, &likes, bulk_load),
+            Self::parallel_copy_follows(pool, &follows, bulk_load),
+            Self::parallel_copy_reposts(pool, &reposts, bulk_load),
             Self::parallel_copy_blocks(pool, &blocks),
             Self::parallel_copy_profiles(pool, &profiles),
         );
 
         // Collect timing results (only include non-empty collections)
         let mut collection_timings: Vec<(String, u128, usize)> = Vec::new();
+        // Jobs from a failed collection copy must surface as per-job errors so
+        // the caller can requeue them; a dropped error here loses the events.
+        let mut failed_jobs: std::collections::HashMap<&[u8], String> =
+            std::collections::HashMap::new();
 
         let (ms, count, err) = posts_result;
         if count > 0 {
@@ -1645,6 +2429,10 @@ impl IndexerManager {
         }
         if let Some(e) = err {
             tracing::error!("COPY batch insert for posts failed: {e}");
+            batch_failed = true;
+            for pj in &posts {
+                failed_jobs.insert(pj.key.as_slice(), e.to_string());
+            }
         }
 
         let (ms, count, err) = likes_result;
@@ -1653,6 +2441,10 @@ impl IndexerManager {
         }
         if let Some(e) = err {
             tracing::error!("COPY batch insert for likes failed: {e}");
+            batch_failed = true;
+            for pj in &likes {
+                failed_jobs.insert(pj.key.as_slice(), e.to_string());
+            }
         }
 
         let (ms, count, err) = follows_result;
@@ -1661,6 +2453,10 @@ impl IndexerManager {
         }
         if let Some(e) = err {
             tracing::error!("COPY batch insert for follows failed: {e}");
+            batch_failed = true;
+            for pj in &follows {
+                failed_jobs.insert(pj.key.as_slice(), e.to_string());
+            }
         }
 
         let (ms, count, err) = reposts_result;
@@ -1669,6 +2465,10 @@ impl IndexerManager {
         }
         if let Some(e) = err {
             tracing::error!("COPY batch insert for reposts failed: {e}");
+            batch_failed = true;
+            for pj in &reposts {
+                failed_jobs.insert(pj.key.as_slice(), e.to_string());
+            }
         }
 
         let (ms, count, err) = blocks_result;
@@ -1677,6 +2477,10 @@ impl IndexerManager {
         }
         if let Some(e) = err {
             tracing::error!("COPY batch insert for blocks failed: {e}");
+            batch_failed = true;
+            for pj in &blocks {
+                failed_jobs.insert(pj.key.as_slice(), e.to_string());
+            }
         }
 
         let (ms, count, err) = profiles_result;
@@ -1685,6 +2489,10 @@ impl IndexerManager {
         }
         if let Some(e) = err {
             tracing::error!("COPY batch insert for profiles failed: {e}");
+            batch_failed = true;
+            for pj in &profiles {
+                failed_jobs.insert(pj.key.as_slice(), e.to_string());
+            }
         }
 
         // Process "other" collection types sequentially (less common)
@@ -1718,35 +2526,45 @@ impl IndexerManager {
         }
         let collections_ms = collections_start.elapsed().as_millis();
 
-        // All creates succeeded (or were stale)
         for pj in &parsed_jobs {
             metrics::INDEXER_RECORDS_PROCESSED_TOTAL.inc();
-            results.push(((*pj.key).clone(), Ok(())));
+            let result = failed_jobs.get(pj.key.as_slice()).map_or_else(
+                || Ok(()),
+                |msg| Err(WintermuteError::Other(format!("batch copy failed: {msg}"))),
+            );
+            results.push(((*pj.key).clone(), result));
         }
 
         let total_ms = batch_start.elapsed().as_millis();
         let applied_count = applied_jobs.len();
 
-        // Log timing breakdown
-        let col_breakdown: String = collection_timings
-            .iter()
-            .map(|(c, ms, n)| format!("{}={}ms({})", c.rsplit('.').next().unwrap_or(c), ms, n))
-            .collect::<Vec<_>>()
-            .join(", ");
+        // Log timing breakdown. One line per batch, so it is DEBUG rather than INFO: a
+        // sharded drain with no sleep floor emits these at the batch rate, which crowds
+        // out every other line and shortens how far back the journal reaches.
+        // `col_breakdown` allocates per collection, so build it inside the level check
+        // rather than before it — otherwise the formatting cost is paid on every batch
+        // whether or not anything records the event.
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let col_breakdown: String = collection_timings
+                .iter()
+                .map(|(c, ms, n)| format!("{}={}ms({})", c.rsplit('.').next().unwrap_or(c), ms, n))
+                .collect::<Vec<_>>()
+                .join(", ");
 
-        tracing::info!(
-            "batch timing: total={}ms, parse={}ms, actors={}ms, records={}ms, collections={}ms [{}] | jobs={}, applied={}",
-            total_ms,
-            parse_ms,
-            actors_ms,
-            records_ms,
-            collections_ms,
-            col_breakdown,
-            jobs.len(),
-            applied_count
-        );
+            tracing::debug!(
+                "batch timing: total={}ms, parse={}ms, actors={}ms, records={}ms, collections={}ms [{}] | jobs={}, applied={}",
+                total_ms,
+                parse_ms,
+                actors_ms,
+                records_ms,
+                collections_ms,
+                col_breakdown,
+                jobs.len(),
+                applied_count
+            );
+        }
 
-        results
+        (results, batch_failed)
     }
 
     // Legacy batch functions - kept as fallbacks (now using COPY protocol)
@@ -2232,6 +3050,16 @@ impl IndexerManager {
             return Ok(());
         }
 
+        // Keep only the last event per uri: duplicates in one batch would make
+        // the single-statement upsert illegal.
+        let mut seen = std::collections::HashSet::new();
+        let mut jobs: Vec<&&ParsedJob<'_>> = jobs
+            .iter()
+            .rev()
+            .filter(|pj| seen.insert(pj.uri.to_string()))
+            .collect();
+        jobs.reverse();
+
         let mut uris: Vec<String> = Vec::with_capacity(jobs.len());
         let mut cids: Vec<String> = Vec::with_capacity(jobs.len());
         let mut creators: Vec<String> = Vec::with_capacity(jobs.len());
@@ -2239,6 +3067,7 @@ impl IndexerManager {
         let mut descriptions: Vec<Option<String>> = Vec::with_capacity(jobs.len());
         let mut avatar_cids: Vec<Option<String>> = Vec::with_capacity(jobs.len());
         let mut banner_cids: Vec<Option<String>> = Vec::with_capacity(jobs.len());
+        let mut created_ats: Vec<String> = Vec::with_capacity(jobs.len());
         let mut indexed_ats: Vec<String> = Vec::with_capacity(jobs.len());
 
         for pj in jobs {
@@ -2258,6 +3087,12 @@ impl IndexerManager {
                     .and_then(|v| v.get("$link"))
                     .and_then(|v| v.as_str())
                     .map(String::from);
+                // profile.createdAt is NOT NULL; records often omit it, so fall back to indexedAt.
+                let created_at = record
+                    .get("createdAt")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&pj.job.indexed_at)
+                    .to_owned();
 
                 uris.push(uri);
                 cids.push(pj.job.cid.clone());
@@ -2266,6 +3101,7 @@ impl IndexerManager {
                 descriptions.push(description);
                 avatar_cids.push(avatar_cid);
                 banner_cids.push(banner_cid);
+                created_ats.push(created_at);
                 indexed_ats.push(pj.job.indexed_at.clone());
 
                 metrics::INDEXER_PROFILE_EVENTS_TOTAL.inc();
@@ -2274,8 +3110,8 @@ impl IndexerManager {
 
         client
             .execute(
-                "INSERT INTO profile (uri, cid, creator, \"displayName\", description, \"avatarCid\", \"bannerCid\", \"indexedAt\")
-                 SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::text[], $8::text[])
+                "INSERT INTO profile (uri, cid, creator, \"displayName\", description, \"avatarCid\", \"bannerCid\", \"createdAt\", \"indexedAt\")
+                 SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::text[], $8::text[], $9::text[])
                  ON CONFLICT (uri) DO UPDATE SET
                    cid = EXCLUDED.cid,
                    \"displayName\" = EXCLUDED.\"displayName\",
@@ -2283,7 +3119,7 @@ impl IndexerManager {
                    \"avatarCid\" = EXCLUDED.\"avatarCid\",
                    \"bannerCid\" = EXCLUDED.\"bannerCid\",
                    \"indexedAt\" = EXCLUDED.\"indexedAt\"",
-                &[&uris, &cids, &creators, &display_names, &descriptions, &avatar_cids, &banner_cids, &indexed_ats],
+                &[&uris, &cids, &creators, &display_names, &descriptions, &avatar_cids, &banner_cids, &created_ats, &indexed_ats],
             )
             .await?;
 
@@ -2296,6 +3132,7 @@ impl IndexerManager {
     async fn parallel_copy_posts(
         pool: &Pool,
         jobs: &[&ParsedJob<'_>],
+        bulk_load: bool,
     ) -> (u128, usize, Option<WintermuteError>) {
         let count = jobs.len();
         if count == 0 {
@@ -2306,13 +3143,16 @@ impl IndexerManager {
             Ok(c) => c,
             Err(e) => return (0, count, Some(WintermuteError::Pool(e))),
         };
-        let err = Self::copy_batch_insert_posts(&client, jobs).await.err();
+        let err = Self::copy_batch_insert_posts(pool, &client, jobs, !bulk_load)
+            .await
+            .err();
         (start.elapsed().as_millis(), count, err)
     }
 
     async fn parallel_copy_likes(
         pool: &Pool,
         jobs: &[&ParsedJob<'_>],
+        bulk_load: bool,
     ) -> (u128, usize, Option<WintermuteError>) {
         let count = jobs.len();
         if count == 0 {
@@ -2320,22 +3160,28 @@ impl IndexerManager {
         }
         let start = std::time::Instant::now();
 
-        // Acquire semaphore to serialize like inserts across workers.
-        // The like table's 133GB index causes severe contention when
-        // multiple workers hit it simultaneously.
-        let _permit = LIKE_INSERT_SEMAPHORE.acquire().await;
+        // Serialize live like inserts across workers (the like index causes contention).
+        // The bulk CAR load runs with indexes dropped, so the semaphore would only throttle it.
+        let _permit = if bulk_load || !*LIVE_LIKE_SERIALIZE {
+            None
+        } else {
+            Some(LIKE_INSERT_SEMAPHORE.acquire().await)
+        };
 
         let client = match pool.get().await {
             Ok(c) => c,
             Err(e) => return (0, count, Some(WintermuteError::Pool(e))),
         };
-        let err = Self::copy_batch_insert_likes(&client, jobs).await.err();
+        let err = Self::copy_batch_insert_likes(pool, &client, jobs, !bulk_load)
+            .await
+            .err();
         (start.elapsed().as_millis(), count, err)
     }
 
     async fn parallel_copy_follows(
         pool: &Pool,
         jobs: &[&ParsedJob<'_>],
+        bulk_load: bool,
     ) -> (u128, usize, Option<WintermuteError>) {
         let count = jobs.len();
         if count == 0 {
@@ -2346,13 +3192,16 @@ impl IndexerManager {
             Ok(c) => c,
             Err(e) => return (0, count, Some(WintermuteError::Pool(e))),
         };
-        let err = Self::copy_batch_insert_follows(&client, jobs).await.err();
+        let err = Self::copy_batch_insert_follows(pool, &client, jobs, !bulk_load)
+            .await
+            .err();
         (start.elapsed().as_millis(), count, err)
     }
 
     async fn parallel_copy_reposts(
         pool: &Pool,
         jobs: &[&ParsedJob<'_>],
+        bulk_load: bool,
     ) -> (u128, usize, Option<WintermuteError>) {
         let count = jobs.len();
         if count == 0 {
@@ -2363,7 +3212,9 @@ impl IndexerManager {
             Ok(c) => c,
             Err(e) => return (0, count, Some(WintermuteError::Pool(e))),
         };
-        let err = Self::copy_batch_insert_reposts(&client, jobs).await.err();
+        let err = Self::copy_batch_insert_reposts(pool, &client, jobs, !bulk_load)
+            .await
+            .err();
         (start.elapsed().as_millis(), count, err)
     }
 
@@ -2404,8 +3255,10 @@ impl IndexerManager {
     // COPY-based batch insert wrappers that extract data and call bulk functions
 
     async fn copy_batch_insert_posts(
+        pool: &Pool,
         client: &deadpool_postgres::Client,
         jobs: &[&ParsedJob<'_>],
+        compute_agg: bool,
     ) -> Result<(), WintermuteError> {
         use crate::metrics;
 
@@ -2413,12 +3266,15 @@ impl IndexerManager {
             return Ok(());
         }
 
-        let mut post_data: Vec<(String, String, String, String, String, String)> =
-            Vec::with_capacity(jobs.len());
+        let mut post_data: Vec<bulk::PostCopyRow> = Vec::with_capacity(jobs.len());
         let mut feed_item_data: Vec<(String, String, String, String, String, String)> =
             Vec::with_capacity(jobs.len());
         let mut embed_image_data: Vec<(String, String, String, String)> = Vec::new();
         let mut embed_video_data: Vec<(String, String, Option<String>)> = Vec::new();
+        let mut quote_data: Vec<(String, String, String, String, String, String)> = Vec::new();
+        let mut notif_rows: Vec<bulk::NotificationRow> = Vec::new();
+        // (did, uri, cid, sort_at) for reply posts; ancestor notifications need queries
+        let mut reply_posts: Vec<(String, String, String, String)> = Vec::new();
 
         for pj in jobs {
             if let Some(record) = &pj.job.record {
@@ -2435,14 +3291,52 @@ impl IndexerManager {
                     created_at.clone()
                 };
 
-                post_data.push((
-                    uri.clone(),
-                    pj.job.cid.clone(),
-                    pj.did.clone(),
+                // Reply linkage and langs/tags (omitted by the bulk path before; index_post has reply).
+                let reply = record.get("reply");
+                let reply_root = reply
+                    .and_then(|r| r.get("root"))
+                    .and_then(|r| r.get("uri"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned);
+                let reply_root_cid = reply
+                    .and_then(|r| r.get("root"))
+                    .and_then(|r| r.get("cid"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned);
+                let reply_parent = reply
+                    .and_then(|r| r.get("parent"))
+                    .and_then(|r| r.get("uri"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned);
+                let reply_parent_cid = reply
+                    .and_then(|r| r.get("parent"))
+                    .and_then(|r| r.get("cid"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned);
+                let langs = record
+                    .get("langs")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|items| bulk::pg_text_array_literal(items));
+                let tags = record
+                    .get("tags")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|items| bulk::pg_text_array_literal(items));
+
+                let is_reply = reply_parent.is_some();
+                post_data.push(bulk::PostCopyRow {
+                    uri: uri.clone(),
+                    cid: pj.job.cid.clone(),
+                    creator: pj.did.clone(),
                     text,
-                    created_at,
-                    pj.job.indexed_at.clone(),
-                ));
+                    reply_root,
+                    reply_root_cid,
+                    reply_parent,
+                    reply_parent_cid,
+                    created_at: created_at.clone(),
+                    indexed_at: pj.job.indexed_at.clone(),
+                    langs,
+                    tags,
+                });
 
                 feed_item_data.push((
                     "post".to_owned(),
@@ -2450,8 +3344,44 @@ impl IndexerManager {
                     pj.job.cid.clone(),
                     uri.clone(),
                     pj.did.clone(),
-                    sort_at,
+                    sort_at.clone(),
                 ));
+
+                // Mention notifications from facets
+                if let Some(facets) = record.get("facets").and_then(|f| f.as_array()) {
+                    for facet in facets {
+                        let features = facet.get("features").and_then(|f| f.as_array());
+                        for feature in features.into_iter().flatten() {
+                            let feature_type =
+                                feature.get("$type").and_then(|t| t.as_str()).unwrap_or("");
+                            if feature_type != "app.bsky.richtext.facet#mention" {
+                                continue;
+                            }
+                            if let Some(mention_did) = feature.get("did").and_then(|d| d.as_str()) {
+                                if mention_did != pj.did {
+                                    notif_rows.push(bulk::NotificationRow {
+                                        did: mention_did.to_owned(),
+                                        author: pj.did.clone(),
+                                        record_uri: uri.clone(),
+                                        record_cid: pj.job.cid.clone(),
+                                        reason: "mention",
+                                        reason_subject: None,
+                                        sort_at: sort_at.clone(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if is_reply {
+                    reply_posts.push((
+                        pj.did.clone(),
+                        uri.clone(),
+                        pj.job.cid.clone(),
+                        sort_at.clone(),
+                    ));
+                }
 
                 // Extract embed data for images and videos
                 if let Some(embed) = record.get("embed") {
@@ -2461,18 +3391,98 @@ impl IndexerManager {
                         &mut embed_image_data,
                         &mut embed_video_data,
                     );
+                    let quotes_before = quote_data.len();
+                    Self::extract_quote(
+                        embed,
+                        &uri,
+                        &pj.job.cid,
+                        &created_at,
+                        &pj.job.indexed_at,
+                        &mut quote_data,
+                    );
+                    // Quote notifications for freshly extracted quote subjects
+                    for (_, _, subject, _, _, _) in &quote_data[quotes_before..] {
+                        if let Ok(subject_uri) = AtUri::new(subject.clone(), None) {
+                            let quoted_author = subject_uri.get_hostname();
+                            if quoted_author != pj.did.as_str() {
+                                notif_rows.push(bulk::NotificationRow {
+                                    did: quoted_author.to_owned(),
+                                    author: pj.did.clone(),
+                                    record_uri: uri.clone(),
+                                    record_cid: pj.job.cid.clone(),
+                                    reason: "quote",
+                                    reason_subject: Some(subject.clone()),
+                                    sort_at: sort_at.clone(),
+                                });
+                            }
+                        }
+                    }
                 }
 
                 metrics::INDEXER_POST_EVENTS_TOTAL.inc();
             }
         }
 
-        bulk::copy_insert_posts(client, &post_data).await?;
+        bulk::copy_insert_posts(client, &post_data, compute_agg).await?;
         bulk::copy_insert_feed_items(client, &feed_item_data).await?;
-        bulk::copy_insert_post_embed_images(client, &embed_image_data).await?;
-        bulk::copy_insert_post_embed_videos(client, &embed_video_data).await?;
 
-        Ok(())
+        // Notifications are deliberately not limited to newly applied rows:
+        // gap-heal replays must generate them for rows indexed by older code,
+        // and the (did, recordUri, reason) dedupe keeps replays exact. The
+        // notification work runs on its own connection concurrently with the
+        // embed/quote inserts.
+        let (embed_result, notif_result) = futures::join!(
+            async {
+                bulk::copy_insert_post_embed_images(client, &embed_image_data).await?;
+                bulk::copy_insert_post_embed_videos(client, &embed_video_data).await?;
+                bulk::copy_insert_quotes(client, &quote_data, compute_agg).await
+            },
+            async {
+                if !compute_agg || (notif_rows.is_empty() && reply_posts.is_empty()) {
+                    return Ok(());
+                }
+                let conn = pool.get().await.map_err(WintermuteError::Pool)?;
+                bulk::copy_insert_notifications(&conn, &notif_rows).await?;
+                bulk::write_reply_notifications_bulk(&conn, &reply_posts).await
+            }
+        );
+        embed_result?;
+        notif_result
+    }
+
+    /// Extract a quote subject (uri, cid) from a post's embed, mirroring the live path.
+    fn extract_quote(
+        embed: &serde_json::Value,
+        post_uri: &str,
+        post_cid: &str,
+        created_at: &str,
+        indexed_at: &str,
+        quote_data: &mut Vec<(String, String, String, String, String, String)>,
+    ) {
+        let embed_type = embed.get("$type").and_then(|t| t.as_str()).unwrap_or("");
+        let quoted = if embed_type == "app.bsky.embed.record" {
+            embed.get("record")
+        } else if embed_type == "app.bsky.embed.recordWithMedia" {
+            embed.get("record").and_then(|r| r.get("record"))
+        } else {
+            None
+        };
+        if let Some(quoted) = quoted {
+            let subject = quoted.get("uri").and_then(|v| v.as_str());
+            let subject_cid = quoted.get("cid").and_then(|v| v.as_str());
+            if let (Some(subject), Some(subject_cid)) = (subject, subject_cid) {
+                if subject.contains("/app.bsky.feed.post/") {
+                    quote_data.push((
+                        post_uri.to_owned(),
+                        post_cid.to_owned(),
+                        subject.to_owned(),
+                        subject_cid.to_owned(),
+                        created_at.to_owned(),
+                        indexed_at.to_owned(),
+                    ));
+                }
+            }
+        }
     }
 
     /// Extract embed data (images and videos) from a post's embed field
@@ -2558,8 +3568,10 @@ impl IndexerManager {
     }
 
     async fn copy_batch_insert_likes(
+        pool: &Pool,
         client: &deadpool_postgres::Client,
         jobs: &[&ParsedJob<'_>],
+        compute_agg: bool,
     ) -> Result<(), WintermuteError> {
         use crate::metrics;
 
@@ -2567,8 +3579,8 @@ impl IndexerManager {
             return Ok(());
         }
 
-        let mut like_data: Vec<(String, String, String, String, String, String, String)> =
-            Vec::with_capacity(jobs.len());
+        let mut like_data: Vec<bulk::SubjectRecordRow> = Vec::with_capacity(jobs.len());
+        let mut notif_rows: Vec<bulk::NotificationRow> = Vec::new();
 
         for pj in jobs {
             if let Some(record) = &pj.job.record {
@@ -2586,27 +3598,131 @@ impl IndexerManager {
                     .get("createdAt")
                     .and_then(|v| v.as_str())
                     .unwrap_or(&pj.job.indexed_at);
+                let (via, via_cid) = Self::extract_via(record);
 
-                like_data.push((
+                Self::collect_subject_notifications(
+                    &mut notif_rows,
+                    record,
+                    &pj.did,
+                    &uri,
+                    &pj.job.cid,
+                    subject_uri,
+                    &pj.job.indexed_at,
+                    "like",
+                    "like-via-repost",
+                );
+
+                like_data.push(bulk::SubjectRecordRow {
                     uri,
-                    pj.job.cid.clone(),
-                    pj.did.clone(),
-                    subject_uri.to_owned(),
-                    subject_cid.to_owned(),
-                    created_at.to_owned(),
-                    pj.job.indexed_at.clone(),
-                ));
+                    cid: pj.job.cid.clone(),
+                    creator: pj.did.clone(),
+                    subject: subject_uri.to_owned(),
+                    subject_cid: subject_cid.to_owned(),
+                    created_at: created_at.to_owned(),
+                    indexed_at: pj.job.indexed_at.clone(),
+                    via,
+                    via_cid,
+                });
 
                 metrics::INDEXER_LIKE_EVENTS_TOTAL.inc();
             }
         }
 
-        bulk::copy_insert_likes(client, &like_data).await
+        // The notification insert is independent of the like rows (ungated,
+        // deduped), so it runs on its own connection concurrently with the
+        // bulk insert instead of serially extending the worker's cycle.
+        let (insert_result, notif_result) = futures::join!(
+            bulk::copy_insert_likes(client, &like_data, compute_agg),
+            Self::insert_notifications_pooled(pool, &notif_rows, compute_agg)
+        );
+        insert_result?;
+        notif_result
+    }
+
+    async fn insert_notifications_pooled(
+        pool: &Pool,
+        notif_rows: &[bulk::NotificationRow],
+        compute_agg: bool,
+    ) -> Result<(), WintermuteError> {
+        if !compute_agg || notif_rows.is_empty() {
+            return Ok(());
+        }
+        let conn = pool.get().await.map_err(WintermuteError::Pool)?;
+        bulk::copy_insert_notifications(&conn, notif_rows).await
+    }
+
+    /// Extract via attribution `{uri, cid}` from a like/repost/follow record.
+    fn extract_via(record: &serde_json::Value) -> (Option<String>, Option<String>) {
+        let via = record.get("via");
+        (
+            via.and_then(|v| v.get("uri"))
+                .and_then(|v| v.as_str())
+                .map(str::to_owned),
+            via.and_then(|v| v.get("cid"))
+                .and_then(|v| v.as_str())
+                .map(str::to_owned),
+        )
+    }
+
+    /// Collect subject + via notifications for a like or repost record,
+    /// mirroring the per-record path's recipients and self-skips.
+    #[allow(clippy::too_many_arguments)]
+    fn collect_subject_notifications(
+        notif_rows: &mut Vec<bulk::NotificationRow>,
+        record: &serde_json::Value,
+        did: &str,
+        uri: &str,
+        cid: &str,
+        subject_uri: &str,
+        indexed_at: &str,
+        reason: &'static str,
+        via_reason: &'static str,
+    ) {
+        if subject_uri.is_empty() {
+            return;
+        }
+        let Ok(subject) = AtUri::new(subject_uri.to_owned(), None) else {
+            return;
+        };
+        let subject_author = subject.get_hostname();
+        if subject_author != did {
+            notif_rows.push(bulk::NotificationRow {
+                did: subject_author.to_owned(),
+                author: did.to_owned(),
+                record_uri: uri.to_owned(),
+                record_cid: cid.to_owned(),
+                reason,
+                reason_subject: Some(subject_uri.to_owned()),
+                sort_at: indexed_at.to_owned(),
+            });
+        }
+        let via_uri_str = record
+            .get("via")
+            .and_then(|v| v.get("uri"))
+            .and_then(|v| v.as_str());
+        if let Some(via_uri_str) = via_uri_str {
+            if let Ok(via_uri) = AtUri::new(via_uri_str.to_owned(), None) {
+                let reposter = via_uri.get_hostname();
+                if reposter != did {
+                    notif_rows.push(bulk::NotificationRow {
+                        did: reposter.to_owned(),
+                        author: did.to_owned(),
+                        record_uri: uri.to_owned(),
+                        record_cid: cid.to_owned(),
+                        reason: via_reason,
+                        reason_subject: Some(via_uri_str.to_owned()),
+                        sort_at: indexed_at.to_owned(),
+                    });
+                }
+            }
+        }
     }
 
     async fn copy_batch_insert_follows(
+        pool: &Pool,
         client: &deadpool_postgres::Client,
         jobs: &[&ParsedJob<'_>],
+        compute_agg: bool,
     ) -> Result<(), WintermuteError> {
         use crate::metrics;
 
@@ -2614,8 +3730,8 @@ impl IndexerManager {
             return Ok(());
         }
 
-        let mut follow_data: Vec<(String, String, String, String, String, String)> =
-            Vec::with_capacity(jobs.len());
+        let mut follow_data: Vec<bulk::FollowCopyRow> = Vec::with_capacity(jobs.len());
+        let mut notif_rows: Vec<bulk::NotificationRow> = Vec::new();
 
         for pj in jobs {
             if let Some(record) = &pj.job.record {
@@ -2625,26 +3741,48 @@ impl IndexerManager {
                     .get("createdAt")
                     .and_then(|v| v.as_str())
                     .unwrap_or(&pj.job.indexed_at);
+                let (via, via_cid) = Self::extract_via(record);
 
-                follow_data.push((
+                if !subject.is_empty() {
+                    notif_rows.push(bulk::NotificationRow {
+                        did: subject.to_owned(),
+                        author: pj.did.clone(),
+                        record_uri: uri.clone(),
+                        record_cid: pj.job.cid.clone(),
+                        reason: "follow",
+                        reason_subject: None,
+                        sort_at: pj.job.indexed_at.clone(),
+                    });
+                }
+
+                follow_data.push(bulk::FollowCopyRow {
                     uri,
-                    pj.job.cid.clone(),
-                    pj.did.clone(),
-                    subject.to_owned(),
-                    created_at.to_owned(),
-                    pj.job.indexed_at.clone(),
-                ));
+                    cid: pj.job.cid.clone(),
+                    creator: pj.did.clone(),
+                    subject_did: subject.to_owned(),
+                    created_at: created_at.to_owned(),
+                    indexed_at: pj.job.indexed_at.clone(),
+                    via,
+                    via_cid,
+                });
 
                 metrics::INDEXER_FOLLOW_EVENTS_TOTAL.inc();
             }
         }
 
-        bulk::copy_insert_follows(client, &follow_data).await
+        let (insert_result, notif_result) = futures::join!(
+            bulk::copy_insert_follows(client, &follow_data, compute_agg),
+            Self::insert_notifications_pooled(pool, &notif_rows, compute_agg)
+        );
+        insert_result?;
+        notif_result
     }
 
     async fn copy_batch_insert_reposts(
+        pool: &Pool,
         client: &deadpool_postgres::Client,
         jobs: &[&ParsedJob<'_>],
+        compute_agg: bool,
     ) -> Result<(), WintermuteError> {
         use crate::metrics;
 
@@ -2652,10 +3790,10 @@ impl IndexerManager {
             return Ok(());
         }
 
-        let mut repost_data: Vec<(String, String, String, String, String, String, String)> =
-            Vec::with_capacity(jobs.len());
+        let mut repost_data: Vec<bulk::SubjectRecordRow> = Vec::with_capacity(jobs.len());
         let mut feed_item_data: Vec<(String, String, String, String, String, String)> =
             Vec::with_capacity(jobs.len());
+        let mut notif_rows: Vec<bulk::NotificationRow> = Vec::new();
 
         for pj in jobs {
             if let Some(record) = &pj.job.record {
@@ -2679,16 +3817,31 @@ impl IndexerManager {
                 } else {
                     created_at.clone()
                 };
+                let (via, via_cid) = Self::extract_via(record);
 
-                repost_data.push((
-                    uri.clone(),
-                    pj.job.cid.clone(),
-                    pj.did.clone(),
-                    subject_uri.to_owned(),
-                    subject_cid.to_owned(),
+                Self::collect_subject_notifications(
+                    &mut notif_rows,
+                    record,
+                    &pj.did,
+                    &uri,
+                    &pj.job.cid,
+                    subject_uri,
+                    &pj.job.indexed_at,
+                    "repost",
+                    "repost-via-repost",
+                );
+
+                repost_data.push(bulk::SubjectRecordRow {
+                    uri: uri.clone(),
+                    cid: pj.job.cid.clone(),
+                    creator: pj.did.clone(),
+                    subject: subject_uri.to_owned(),
+                    subject_cid: subject_cid.to_owned(),
                     created_at,
-                    pj.job.indexed_at.clone(),
-                ));
+                    indexed_at: pj.job.indexed_at.clone(),
+                    via,
+                    via_cid,
+                });
 
                 feed_item_data.push((
                     "repost".to_owned(),
@@ -2703,10 +3856,15 @@ impl IndexerManager {
             }
         }
 
-        bulk::copy_insert_reposts(client, &repost_data).await?;
-        bulk::copy_insert_feed_items(client, &feed_item_data).await?;
-
-        Ok(())
+        let (insert_result, notif_result) = futures::join!(
+            async {
+                bulk::copy_insert_reposts(client, &repost_data, compute_agg).await?;
+                bulk::copy_insert_feed_items(client, &feed_item_data).await
+            },
+            Self::insert_notifications_pooled(pool, &notif_rows, compute_agg)
+        );
+        insert_result?;
+        notif_result
     }
 
     async fn copy_batch_insert_blocks(
@@ -2972,6 +4130,39 @@ impl IndexerManager {
         // Reply notifications: walk ancestor chain up to REPLY_NOTIF_DEPTH
         // Matches official Bluesky behavior from post.ts notifsForInsert
         if let Some(parent_uri_str) = reply_parent {
+            Self::write_reply_notifications(client, did, &uri, cid, sort_at).await?;
+
+            // Update replyCount for parent post
+            client
+                .execute(
+                    "INSERT INTO post_agg (uri, \"replyCount\")
+                     SELECT $1::varchar, COUNT(*) FROM post
+                     WHERE \"replyParent\" = $1
+                       AND (\"violatesThreadGate\" IS NULL OR \"violatesThreadGate\" = false)
+                     ON CONFLICT (uri) DO UPDATE SET \"replyCount\" = EXCLUDED.\"replyCount\"",
+                    &[&parent_uri_str],
+                )
+                .await?;
+        }
+
+        // Handle embed.record (quote posts)
+        if let Some(embed) = record.get("embed") {
+            Self::handle_post_embeds(client, embed, &uri, cid, did, created_at, indexed_at).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Notify ancestor authors of a new reply, including descendant repair for
+    /// out-of-order indexing. Shared by the per-record and batch paths.
+    async fn write_reply_notifications(
+        client: &deadpool_postgres::Client,
+        did: &str,
+        uri: &str,
+        cid: &str,
+        sort_at: &str,
+    ) -> Result<(), WintermuteError> {
+        {
             const REPLY_NOTIF_DEPTH: i32 = 5;
 
             // Query ancestors using recursive CTE
@@ -3086,23 +4277,6 @@ impl IndexerManager {
                     }
                 }
             }
-
-            // Update replyCount for parent post
-            client
-                .execute(
-                    "INSERT INTO post_agg (uri, \"replyCount\")
-                     SELECT $1::varchar, COUNT(*) FROM post
-                     WHERE \"replyParent\" = $1
-                       AND (\"violatesThreadGate\" IS NULL OR \"violatesThreadGate\" = false)
-                     ON CONFLICT (uri) DO UPDATE SET \"replyCount\" = EXCLUDED.\"replyCount\"",
-                    &[&parent_uri_str],
-                )
-                .await?;
-        }
-
-        // Handle embed.record (quote posts)
-        if let Some(embed) = record.get("embed") {
-            Self::handle_post_embeds(client, embed, &uri, cid, did, created_at, indexed_at).await?;
         }
 
         Ok(())
@@ -3237,19 +4411,13 @@ impl IndexerManager {
         if let (Some(embed_uri), Some(embed_cid)) = (embed_uri, embed_cid) {
             // Only process if it's a post being quoted
             if embed_uri.contains("/app.bsky.feed.post/") {
-                // Calculate sortAt (earlier of indexed_at and created_at)
-                let sort_at_quote = if indexed_at < created_at {
-                    indexed_at
-                } else {
-                    created_at
-                };
-                // Insert into quote table
+                // sortAt is GENERATED ALWAYS; creator is unread by rsky/atproto appview (verified) so neither is written.
                 client
                     .execute(
-                        "INSERT INTO quote (uri, cid, creator, subject, \"subjectCid\", \"createdAt\", \"indexedAt\", \"sortAt\")
-                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                        "INSERT INTO quote (uri, cid, subject, \"subjectCid\", \"createdAt\", \"indexedAt\")
+                         VALUES ($1, $2, $3, $4, $5, $6)
                          ON CONFLICT DO NOTHING",
-                        &[&post_uri, &post_cid, &creator, &embed_uri, &embed_cid, &created_at, &indexed_at, &sort_at_quote],
+                        &[&post_uri, &post_cid, &embed_uri, &embed_cid, &created_at, &indexed_at],
                     )
                     .await?;
 
@@ -3300,25 +4468,34 @@ impl IndexerManager {
             .map_err(|e| WintermuteError::Other(format!("invalid uri: {e}")))?;
         let uri = uri_obj.to_string();
 
-        // Fetch creator before deleting so we can decrement postsCount
-        let row = client
-            .query_opt("SELECT creator FROM post WHERE uri = $1", &[&uri])
-            .await?;
-
-        client
-            .execute("DELETE FROM post WHERE uri = $1", &[&uri])
+        let deleted = client
+            .query(
+                "DELETE FROM post WHERE uri = $1 RETURNING creator, \"replyParent\"",
+                &[&uri],
+            )
             .await?;
         client
             .execute("DELETE FROM feed_item WHERE uri = $1", &[&uri])
             .await?;
 
-        if let Some(row) = row {
-            let creator: Option<String> = row.get("creator");
-            if let Some(creator) = creator {
+        if let Some(row) = deleted.first() {
+            if let Some(creator) = row.get::<_, Option<String>>(0) {
                 client
                     .execute(
                         "UPDATE profile_agg SET \"postsCount\" = GREATEST(\"postsCount\" - 1, 0) WHERE did = $1",
                         &[&creator],
+                    )
+                    .await?;
+            }
+            if let Some(parent) = row.get::<_, Option<String>>(1) {
+                client
+                    .execute(
+                        "INSERT INTO post_agg (uri, \"replyCount\")
+                         SELECT $1::varchar, COUNT(*) FROM post
+                         WHERE \"replyParent\" = $1
+                           AND (\"violatesThreadGate\" IS NULL OR \"violatesThreadGate\" = false)
+                         ON CONFLICT (uri) DO UPDATE SET \"replyCount\" = EXCLUDED.\"replyCount\"",
+                        &[&parent],
                     )
                     .await?;
             }
@@ -3397,12 +4574,21 @@ impl IndexerManager {
             .and_then(|v| v.as_str())
             .unwrap_or(indexed_at);
 
+        let via = record
+            .get("via")
+            .and_then(|v| v.get("uri"))
+            .and_then(|v| v.as_str());
+        let via_cid = record
+            .get("via")
+            .and_then(|v| v.get("cid"))
+            .and_then(|v| v.as_str());
+
         let row_count = client
             .execute(
-                "INSERT INTO \"like\" (uri, cid, creator, subject, \"subjectCid\", \"createdAt\", \"indexedAt\")
-                 VALUES ($1, $2, $3, $4, $5, $6, $7)
+                "INSERT INTO \"like\" (uri, cid, creator, subject, \"subjectCid\", via, \"viaCid\", \"createdAt\", \"indexedAt\")
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                  ON CONFLICT DO NOTHING",
-                &[&uri, &cid, &did, &subject, &subject_cid, &created_at, &indexed_at],
+                &[&uri, &cid, &did, &subject, &subject_cid, &via, &via_cid, &created_at, &indexed_at],
             )
             .await?;
 
@@ -3420,6 +4606,25 @@ impl IndexerManager {
                         .await
                     {
                         tracing::warn!("failed to insert like notification for {uri}: {e}");
+                    }
+                }
+
+                // like-via-repost: notify the reposter whose repost was liked through
+                if let Some(via_uri_str) = via {
+                    if let Ok(via_uri) = AtUri::new(via_uri_str.to_owned(), None) {
+                        let reposter = via_uri.get_hostname();
+                        if reposter != did {
+                            drop(
+                                client
+                                    .execute(
+                                        "INSERT INTO notification (did, author, \"recordUri\", \"recordCid\", reason, \"reasonSubject\", \"sortAt\")
+                                         VALUES ($1, $2, $3, $4, $5, $6, $7)
+                                         ON CONFLICT (did, \"recordUri\", reason) DO NOTHING",
+                                        &[&reposter, &did, &uri, &cid, &"like-via-repost", &Some(via_uri_str), &indexed_at],
+                                    )
+                                    .await,
+                            );
+                        }
                     }
                 }
             }
@@ -3448,9 +4653,23 @@ impl IndexerManager {
             .map_err(|e| WintermuteError::Other(format!("invalid uri: {e}")))?;
         let uri = uri_obj.to_string();
 
-        client
-            .execute("DELETE FROM \"like\" WHERE uri = $1", &[&uri])
+        let deleted = client
+            .query(
+                "DELETE FROM \"like\" WHERE uri = $1 RETURNING subject",
+                &[&uri],
+            )
             .await?;
+
+        if let Some(subject) = deleted.first().and_then(|r| r.get::<_, Option<String>>(0)) {
+            client
+                .execute(
+                    "INSERT INTO post_agg (uri, \"likeCount\")
+                     SELECT $1::varchar, COUNT(*) FROM \"like\" WHERE subject = $1
+                     ON CONFLICT (uri) DO UPDATE SET \"likeCount\" = EXCLUDED.\"likeCount\"",
+                    &[&subject],
+                )
+                .await?;
+        }
 
         Ok(())
     }
@@ -3471,6 +4690,7 @@ impl IndexerManager {
             .get("createdAt")
             .and_then(|v| v.as_str())
             .unwrap_or(indexed_at);
+        let (via, via_cid) = Self::extract_via(record);
 
         // Ensure the follow subject also has an actor row (cached)
         if !subject.is_empty() && !ACTOR_CACHE.contains_key(subject) {
@@ -3482,10 +4702,10 @@ impl IndexerManager {
 
         let row_count = client
             .execute(
-                "INSERT INTO follow (uri, cid, creator, \"subjectDid\", \"createdAt\", \"indexedAt\")
-                 VALUES ($1, $2, $3, $4, $5, $6)
+                "INSERT INTO follow (uri, cid, creator, \"subjectDid\", \"createdAt\", \"indexedAt\", via, \"viaCid\")
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                  ON CONFLICT DO NOTHING",
-                &[&uri, &cid, &did, &subject, &created_at, &indexed_at],
+                &[&uri, &cid, &did, &subject, &created_at, &indexed_at, &via, &via_cid],
             )
             .await?;
 
@@ -3593,12 +4813,21 @@ impl IndexerManager {
             .and_then(|v| v.as_str())
             .unwrap_or(indexed_at);
 
+        let via = record
+            .get("via")
+            .and_then(|v| v.get("uri"))
+            .and_then(|v| v.as_str());
+        let via_cid = record
+            .get("via")
+            .and_then(|v| v.get("cid"))
+            .and_then(|v| v.as_str());
+
         let row_count = client
             .execute(
-                "INSERT INTO repost (uri, cid, creator, subject, \"subjectCid\", \"createdAt\", \"indexedAt\")
-                 VALUES ($1, $2, $3, $4, $5, $6, $7)
+                "INSERT INTO repost (uri, cid, creator, subject, \"subjectCid\", via, \"viaCid\", \"createdAt\", \"indexedAt\")
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                  ON CONFLICT DO NOTHING",
-                &[&uri, &cid, &did, &subject, &subject_cid, &created_at, &indexed_at],
+                &[&uri, &cid, &did, &subject, &subject_cid, &via, &via_cid, &created_at, &indexed_at],
             )
             .await?;
 
@@ -3635,6 +4864,25 @@ impl IndexerManager {
                         tracing::warn!("failed to insert repost notification for {uri}: {e}");
                     }
                 }
+
+                // repost-via-repost: notify the reposter whose repost was re-reposted through
+                if let Some(via_uri_str) = via {
+                    if let Ok(via_uri) = AtUri::new(via_uri_str.to_owned(), None) {
+                        let original_reposter = via_uri.get_hostname();
+                        if original_reposter != did {
+                            drop(
+                                client
+                                    .execute(
+                                        "INSERT INTO notification (did, author, \"recordUri\", \"recordCid\", reason, \"reasonSubject\", \"sortAt\")
+                                         VALUES ($1, $2, $3, $4, $5, $6, $7)
+                                         ON CONFLICT (did, \"recordUri\", reason) DO NOTHING",
+                                        &[&original_reposter, &did, &uri, &cid, &"repost-via-repost", &Some(via_uri_str), &indexed_at],
+                                    )
+                                    .await,
+                            );
+                        }
+                    }
+                }
             }
         }
 
@@ -3661,12 +4909,26 @@ impl IndexerManager {
             .map_err(|e| WintermuteError::Other(format!("invalid uri: {e}")))?;
         let uri = uri_obj.to_string();
 
-        client
-            .execute("DELETE FROM repost WHERE uri = $1", &[&uri])
+        let deleted = client
+            .query(
+                "DELETE FROM repost WHERE uri = $1 RETURNING subject",
+                &[&uri],
+            )
             .await?;
         client
             .execute("DELETE FROM feed_item WHERE uri = $1", &[&uri])
             .await?;
+
+        if let Some(subject) = deleted.first().and_then(|r| r.get::<_, Option<String>>(0)) {
+            client
+                .execute(
+                    "INSERT INTO post_agg (uri, \"repostCount\")
+                     SELECT $1::varchar, COUNT(*) FROM repost WHERE subject = $1
+                     ON CONFLICT (uri) DO UPDATE SET \"repostCount\" = EXCLUDED.\"repostCount\"",
+                    &[&subject],
+                )
+                .await?;
+        }
 
         Ok(())
     }

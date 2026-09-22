@@ -1,14 +1,16 @@
 use crate::account_manager::helpers::account::AvailabilityFlags;
 use crate::account_manager::AccountManager;
-use crate::actor_store::aws::s3::S3BlobStore;
+use crate::actor_store::blobstore::BlobstoreFactory;
 use crate::actor_store::ActorStore;
 use crate::apis::ApiError;
+use crate::auth_verifier::scope::{RepoTarget, RepoWrite, Scoped};
 use crate::auth_verifier::AccessStandardIncludeChecks;
-use crate::db::DbConn;
+use crate::metrics::record_repo_write;
+use crate::publication;
+use crate::rate_limits::{Caller, RateLimits};
 use crate::repo::prepare::{prepare_delete, PrepareDeleteOpts};
 use crate::SharedSequencer;
 use anyhow::{bail, Result};
-use aws_config::SdkConfig;
 use lexicon_cid::Cid;
 use rocket::serde::json::Json;
 use rocket::State;
@@ -19,10 +21,10 @@ use std::str::FromStr;
 
 async fn inner_delete_record(
     body: Json<DeleteRecordInput>,
-    auth: AccessStandardIncludeChecks,
+    requester: String,
     sequencer: &State<SharedSequencer>,
-    s3_config: &State<SdkConfig>,
-    db: DbConn,
+    blobstore_factory: &State<BlobstoreFactory>,
+    actor_store: &State<ActorStore>,
     account_manager: AccountManager,
 ) -> Result<()> {
     let DeleteRecordInput {
@@ -46,7 +48,7 @@ async fn inner_delete_record(
         Some(account) if account.deactivated_at.is_some() => bail!("Account is deactivated"),
         Some(account) => {
             let did = account.did;
-            if did != auth.access.credentials.unwrap().did.unwrap() {
+            if did != requester {
                 bail!("AuthRequiredError")
             }
 
@@ -65,33 +67,33 @@ async fn inner_delete_record(
                 rkey,
                 swap_cid: swap_record_cid,
             })?;
-            let mut actor_store =
-                ActorStore::new(did.clone(), S3BlobStore::new(did.clone(), s3_config), db);
+            let mut actor_txn = actor_store
+                .transact(did.clone(), blobstore_factory.blobstore(did.clone()))
+                .await?;
             let write_at_uri: AtUri = write.uri.clone().try_into()?;
-            let record = actor_store
+            let record = actor_txn
                 .record
                 .get_record(&write_at_uri, None, Some(true))
                 .await?;
-            let commit = match record {
+            match record {
                 None => return Ok(()), // No-op if record already doesn't exist
                 Some(_) => {
-                    actor_store
+                    actor_txn
                         .process_writes(vec![PreparedWrite::Delete(write.clone())], swap_commit_cid)
                         .await?
                 }
             };
 
-            let mut lock = sequencer.sequencer.write().await;
-            lock.sequence_commit(did.clone(), commit.clone()).await?;
-            account_manager
-                .update_repo_root(did, commit.commit_data.cid, commit.commit_data.rev)
+            publication::publish_pending(actor_store, sequencer, &account_manager, &did, None)
                 .await?;
+            record_repo_write("delete");
 
             Ok(())
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 #[tracing::instrument(skip_all)]
 #[rocket::post(
     "/xrpc/com.atproto.repo.deleteRecord",
@@ -100,17 +102,42 @@ async fn inner_delete_record(
 )]
 pub async fn delete_record(
     body: Json<DeleteRecordInput>,
-    auth: AccessStandardIncludeChecks,
+    auth: Scoped<RepoWrite, AccessStandardIncludeChecks>,
     sequencer: &State<SharedSequencer>,
-    s3_config: &State<SdkConfig>,
-    db: DbConn,
+    blobstore_factory: &State<BlobstoreFactory>,
+    actor_store: &State<ActorStore>,
     account_manager: AccountManager,
+    limits: &State<RateLimits>,
+    caller: Caller,
 ) -> Result<(), ApiError> {
-    match inner_delete_record(body, auth, sequencer, s3_config, db, account_manager).await {
+    let requester = auth
+        .did_for(&vec![RepoTarget::new(
+            body.collection.clone(),
+            crate::oauth_scope::RepoAction::Delete,
+        )])
+        .await?;
+    limits
+        .consume_all(
+            &crate::rate_limits::REPO_WRITES,
+            &requester,
+            crate::rate_limits::DELETE_POINTS,
+            caller.bypass,
+        )
+        .await?;
+    match inner_delete_record(
+        body,
+        requester,
+        sequencer,
+        blobstore_factory,
+        actor_store,
+        account_manager,
+    )
+    .await
+    {
         Ok(()) => Ok(()),
         Err(error) => {
             tracing::error!("@LOG: ERROR: {error}");
-            Err(ApiError::RuntimeError)
+            Err(ApiError::from(error))
         }
     }
 }

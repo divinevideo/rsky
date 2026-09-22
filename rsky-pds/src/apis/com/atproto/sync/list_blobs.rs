@@ -1,26 +1,25 @@
 use crate::account_manager::AccountManager;
-use crate::actor_store::aws::s3::S3BlobStore;
 use crate::actor_store::blob::ListBlobsOpts;
+use crate::actor_store::blobstore::BlobstoreFactory;
 use crate::actor_store::ActorStore;
 use crate::apis::com::atproto::repo::assert_repo_availability;
 use crate::apis::ApiError;
 use crate::auth_verifier;
 use crate::auth_verifier::OptionalAccessOrAdminToken;
-use crate::db::DbConn;
 use anyhow::Result;
-use aws_config::SdkConfig;
 use rocket::serde::json::Json;
 use rocket::State;
 use rsky_lexicon::com::atproto::sync::ListBlobsOutput;
 
+#[allow(clippy::too_many_arguments)]
 async fn inner_list_blobs(
     did: String,
     since: Option<String>, // Optional revision of the repo to list blobs since.
     limit: Option<u16>,
     cursor: Option<String>,
-    s3_config: &State<SdkConfig>,
+    blobstore_factory: &State<BlobstoreFactory>,
     auth: OptionalAccessOrAdminToken,
-    db: DbConn,
+    actor_store: &State<ActorStore>,
     account_manager: AccountManager,
 ) -> Result<ListBlobsOutput> {
     let is_user_or_admin = if let Some(access) = auth.access {
@@ -30,7 +29,9 @@ async fn inner_list_blobs(
     };
     let _ = assert_repo_availability(&did, is_user_or_admin, &account_manager).await?;
 
-    let actor_store = ActorStore::new(did.clone(), S3BlobStore::new(did.clone(), s3_config), db);
+    let actor_store = actor_store
+        .read(did.clone(), blobstore_factory.blobstore(did.clone()))
+        .await?;
     let blob_cids = actor_store
         .blob
         .list_blobs(ListBlobsOpts {
@@ -40,10 +41,7 @@ async fn inner_list_blobs(
         })
         .await?;
 
-    let last_blob: Option<String> = match blob_cids.last() {
-        None => None,
-        Some(last) => Some(last.clone()),
-    };
+    let last_blob: Option<String> = blob_cids.last().cloned();
     Ok(ListBlobsOutput {
         cursor: last_blob,
         cids: blob_cids,
@@ -52,6 +50,7 @@ async fn inner_list_blobs(
 
 /// List blob CIDs for an account, since some repo revision. Does not require auth;
 /// implemented by PDS
+#[allow(clippy::too_many_arguments)]
 #[tracing::instrument(skip_all)]
 #[rocket::get("/xrpc/com.atproto.sync.listBlobs?<did>&<since>&<limit>&<cursor>")]
 pub async fn list_blobs(
@@ -59,9 +58,9 @@ pub async fn list_blobs(
     since: Option<String>, // Optional revision of the repo to list blobs since.
     limit: Option<u16>,
     cursor: Option<String>,
-    s3_config: &State<SdkConfig>,
+    blobstore_factory: &State<BlobstoreFactory>,
     auth: OptionalAccessOrAdminToken,
-    db: DbConn,
+    actor_store: &State<ActorStore>,
     account_manager: AccountManager,
 ) -> Result<Json<ListBlobsOutput>, ApiError> {
     match inner_list_blobs(
@@ -69,9 +68,9 @@ pub async fn list_blobs(
         since,
         limit,
         cursor,
-        s3_config,
+        blobstore_factory,
         auth,
-        db,
+        actor_store,
         account_manager,
     )
     .await
@@ -79,7 +78,7 @@ pub async fn list_blobs(
         Ok(res) => Ok(Json(res)),
         Err(error) => {
             tracing::error!("@LOG: ERROR: {error}");
-            Err(ApiError::RuntimeError)
+            Err(ApiError::from(error))
         }
     }
 }

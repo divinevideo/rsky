@@ -1,41 +1,43 @@
 use crate::account_manager::helpers::account::AccountStatus;
 use crate::account_manager::{AccountManager, CreateAccountOpts};
-use crate::actor_store::aws::s3::S3BlobStore;
+use crate::actor_store::blobstore::BlobstoreFactory;
 use crate::actor_store::ActorStore;
 use crate::apis::com::atproto::server::safe_resolve_did_doc;
+use crate::apis::com::atproto::server::PDS_PLC_ROTATION_KEYPAIR;
 use crate::apis::ApiError;
-use crate::auth_verifier::OptionalAccessOrAdminToken;
+use crate::auth_verifier::UserDidAuthOptional;
 use crate::config::ServerConfig;
-use crate::db::DbConn;
 use crate::handle::{normalize_and_validate_handle, HandleValidationContext, HandleValidationOpts};
+use crate::metrics::record_account_created;
 use crate::plc::operations::{create_op, CreateAtprotoOpInput};
 use crate::plc::types::{OpOrTombstone, Operation};
-use crate::sequencer::events::sync_evt_data_from_commit;
+use crate::rate_limits::{Caller, RateLimits};
 use crate::SharedSequencer;
 use crate::{plc, SharedIdResolver};
-use aws_config::SdkConfig;
 use email_address::*;
 use rocket::serde::json::Json;
 use rocket::State;
 use rsky_common::env::env_str;
 use rsky_crypto::utils::encode_did_key;
 use rsky_lexicon::com::atproto::server::{CreateAccountInput, CreateAccountOutput};
-use secp256k1::{Keypair, Secp256k1, SecretKey};
+use secp256k1::{Keypair, Secp256k1};
 use std::env;
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Clone)]
 pub struct TransformedCreateAccountInput {
     pub email: String,
     pub handle: String,
     pub did: String,
     pub invite_code: Option<String>,
     pub password: String,
-    pub signing_key: Keypair,
     pub plc_op: Option<Operation>,
     pub deactivated: bool,
+    /// Generated per account, and already named by `plc_op` when there is one.
+    pub signing_key: Keypair,
 }
 
 //TODO: Potential for taking advantage of async better
+#[allow(clippy::too_many_arguments)]
 #[tracing::instrument(skip_all)]
 #[rocket::post(
     "/xrpc/com.atproto.server.createAccount",
@@ -44,25 +46,64 @@ pub struct TransformedCreateAccountInput {
 )]
 pub async fn server_create_account(
     body: Json<CreateAccountInput>,
-    auth: OptionalAccessOrAdminToken,
+    auth: UserDidAuthOptional,
+    admin: Option<crate::auth_verifier::AdminToken>,
     sequencer: &State<SharedSequencer>,
-    s3_config: &State<SdkConfig>,
+    blobstore_factory: &State<BlobstoreFactory>,
     cfg: &State<ServerConfig>,
     id_resolver: &State<SharedIdResolver>,
     account_manager: AccountManager,
-    db: DbConn,
+    actor_store: &State<ActorStore>,
+    lifecycle_store: &State<crate::lifecycle::LifecycleStore>,
+    limits: &State<RateLimits>,
+    caller: Caller,
 ) -> Result<Json<CreateAccountOutput>, ApiError> {
-    tracing::info!("Creating new user account");
-    let is_admin = auth
-        .access
-        .as_ref()
-        .and_then(|a| a.credentials.as_ref())
-        .map(|c| c.r#type == "admin_token")
-        .unwrap_or(false);
+    limits
+        .consume_all(
+            &crate::rate_limits::CREATE_ACCOUNT,
+            &caller.ip,
+            1,
+            caller.bypass,
+        )
+        .await?;
     let requester = match auth.access {
         Some(access) if access.credentials.is_some() => access.credentials.unwrap().iss,
         _ => None,
     };
+    let is_admin = admin.is_some();
+    create_account_for(
+        body.into_inner(),
+        requester,
+        is_admin,
+        sequencer,
+        blobstore_factory,
+        cfg,
+        id_resolver,
+        &account_manager,
+        actor_store,
+        lifecycle_store,
+    )
+    .await
+    .map(Json)
+}
+
+/// Creates the account `input` describes, for the XRPC method and the
+/// sign-up page alike: the actor store and repository, the PLC identity
+/// when this server makes one, the account rows, and the firehose events.
+#[allow(clippy::too_many_arguments)]
+pub async fn create_account_for(
+    input: CreateAccountInput,
+    requester: Option<String>,
+    is_admin: bool,
+    sequencer: &State<SharedSequencer>,
+    blobstore_factory: &State<BlobstoreFactory>,
+    cfg: &State<ServerConfig>,
+    id_resolver: &State<SharedIdResolver>,
+    account_manager: &AccountManager,
+    actor_store: &State<ActorStore>,
+    lifecycle_store: &State<crate::lifecycle::LifecycleStore>,
+) -> Result<CreateAccountOutput, ApiError> {
+    tracing::info!("Creating new user account");
     // @TODO: Evaluate if we need to validate for entryway PDS
     let TransformedCreateAccountInput {
         email,
@@ -76,22 +117,35 @@ pub async fn server_create_account(
     } = validate_inputs_for_local_pds(
         cfg,
         id_resolver,
-        body.into_inner(),
+        input,
         requester,
         is_admin,
-        &account_manager,
+        account_manager,
     )
     .await?;
 
     // Create new actor repo TODO: Proper rollback
-    let mut actor_store =
-        ActorStore::new(did.clone(), S3BlobStore::new(did.clone(), s3_config), db);
-    let commit = match actor_store.create_repo(signing_key, Vec::new()).await {
-        Ok(commit) => commit,
-        Err(error) => {
-            tracing::error!("Failed to create repo\n{:?}", error);
-            actor_store.destroy().await?;
-            return Err(ApiError::RuntimeError);
+    let blobstore = blobstore_factory.blobstore(did.clone());
+    if let Err(error) = actor_store.create(&did, &signing_key).await {
+        tracing::error!("Failed to create actor store\n{:?}", error);
+        return Err(ApiError::from(error));
+    }
+    let commit = {
+        let actor_txn = match actor_store.transact(did.clone(), blobstore.clone()).await {
+            Ok(actor_txn) => actor_txn,
+            Err(error) => {
+                tracing::error!("Failed to open actor store\n{:?}", error);
+                actor_store.destroy(&did, blobstore.clone()).await?;
+                return Err(ApiError::RuntimeError);
+            }
+        };
+        match actor_txn.create_repo(Vec::new(), !deactivated).await {
+            Ok(commit) => commit,
+            Err(error) => {
+                tracing::error!("Failed to create repo\n{:?}", error);
+                actor_store.destroy(&did, blobstore.clone()).await?;
+                return Err(ApiError::RuntimeError);
+            }
         }
     };
 
@@ -110,7 +164,7 @@ pub async fn server_create_account(
                 }
                 Err(_) => {
                     tracing::error!("Failed to create did:plc");
-                    actor_store.destroy().await?;
+                    actor_store.destroy(&did, blobstore.clone()).await?;
                     return Err(ApiError::RuntimeError);
                 }
             }
@@ -125,13 +179,14 @@ pub async fn server_create_account(
                 None
             } else {
                 tracing::error!("Error resolving DID Doc\n{error}");
-                actor_store.destroy().await?;
+                actor_store.destroy(&did, blobstore.clone()).await?;
                 return Err(ApiError::RuntimeError);
             }
         }
     };
 
     // Create Account
+    let invited = invite_code.is_some();
     let (access_jwt, refresh_jwt);
     match account_manager
         .create_account(CreateAccountOpts {
@@ -148,10 +203,15 @@ pub async fn server_create_account(
     {
         Ok(res) => {
             (access_jwt, refresh_jwt) = res;
+            record_account_created(
+                if is_admin { "admin" } else { "self_service" },
+                invited,
+                deactivated,
+            );
         }
         Err(error) => {
             tracing::error!("Error creating account\n{error}");
-            actor_store.destroy().await?;
+            actor_store.destroy(&did, blobstore.clone()).await?;
             return Err(ApiError::RuntimeError);
         }
     }
@@ -182,29 +242,20 @@ pub async fn server_create_account(
                 return Err(ApiError::RuntimeError);
             }
         }
-        match lock.sequence_commit(did.clone(), commit.clone()).await {
-            Ok(_) => {
-                tracing::debug!("Sequence commit succeeded");
-            }
-            Err(error) => {
-                tracing::error!("Sequence Commit failed\n{error}");
-                return Err(ApiError::RuntimeError);
-            }
-        }
-        match lock
-            .sequence_sync_evt(
-                did.clone(),
-                sync_evt_data_from_commit(commit.clone()).await?,
-            )
-            .await
-        {
-            Ok(_) => {
-                tracing::debug!("Sequence sync event data from commit succeeded");
-            }
-            Err(error) => {
-                tracing::error!("Sequence sync event data from commit failed\n{error}");
-                return Err(ApiError::RuntimeError);
-            }
+        drop(lock);
+        // the repository's first commit and its sync event were committed
+        // as intents with the store; deliver them after the account events
+        let published = crate::publication::publish_pending(
+            actor_store,
+            sequencer,
+            account_manager,
+            &did,
+            None,
+        )
+        .await;
+        if let Err(error) = published {
+            tracing::error!("Sequence commit failed\n{error}");
+            return Err(ApiError::RuntimeError);
         }
     }
     match account_manager
@@ -232,21 +283,23 @@ pub async fn server_create_account(
         },
     }
 
-    Ok(Json(CreateAccountOutput {
+    // a DID deleted here earlier may be created again; its purge
+    // obligation, if any, stays until the objects are gone
+    lifecycle_store.clear_tombstone(&did).await?;
+    Ok(CreateAccountOutput {
         access_jwt,
         refresh_jwt,
         handle,
         did,
         did_doc: converted_did_doc,
-    }))
+    })
 }
 
 /// Validates Create Account Parameters and builds PLC Operation if needed.
 ///
 /// When `is_admin` is true and a pre-existing DID is supplied, the invite
-/// code, email, and password requirements are relaxed.  This is the path
-/// used by divine-atbridge to provision accounts on behalf of authenticated
-/// users coming through keycast.
+/// code, email, and password requirements are relaxed.
+#[allow(clippy::too_many_arguments)]
 pub async fn validate_inputs_for_local_pds(
     cfg: &State<ServerConfig>,
     id_resolver: &State<SharedIdResolver>,
@@ -260,9 +313,8 @@ pub async fn validate_inputs_for_local_pds(
     let deactivated: bool;
     let email;
 
-    // Admin-authenticated requests that supply a pre-existing DID (the
-    // divine-atbridge provisioning flow) skip invite, email, and password
-    // checks.  All other callers must satisfy every requirement.
+    // An admin provisioning a pre-existing DID can omit invite, email, and
+    // password. All other callers must satisfy every requirement.
     let is_admin_import = is_admin && input.did.is_some();
 
     //PLC Op Validation
@@ -272,11 +324,15 @@ pub async fn validate_inputs_for_local_pds(
         ));
     }
 
-    //Invite Code Validation
-    let invite_code = if !is_admin_import && cfg.invites.required && input.invite_code.is_none() {
-        return Err(ApiError::InvalidInviteCode);
+    let invite_code = if is_admin_import {
+        input
+            .invite_code
+            .as_deref()
+            .map(str::trim)
+            .filter(|code| !code.is_empty())
+            .map(str::to_owned)
     } else {
-        input.invite_code.clone()
+        resolve_invite_code(cfg.invites.required, input.invite_code.as_deref())?
     };
 
     //Email Validation — admin imports use a placeholder
@@ -313,7 +369,7 @@ pub async fn validate_inputs_for_local_pds(
         id_resolver,
     };
     let handle = normalize_and_validate_handle(opts, validation_ctx).await?;
-    if !super::validate_handle(&handle) {
+    if !super::validate_handle(&handle, &cfg.identity.service_handle_domains) {
         return Err(ApiError::InvalidHandle);
     };
 
@@ -343,15 +399,13 @@ pub async fn validate_inputs_for_local_pds(
         }
     };
 
-    // Get Signing Key
-    let secp = Secp256k1::new();
-    let private_key = env::var("PDS_REPO_SIGNING_KEY_K256_PRIVATE_KEY_HEX").unwrap();
-    let secret_key = SecretKey::from_slice(&hex::decode(private_key.as_bytes()).unwrap()).unwrap();
-    let signing_key = Keypair::from_secret_key(&secp, &secret_key);
+    // One key per account, generated before the PLC create op so the op and
+    // the actor store's key file name the same key.
+    let signing_key = Keypair::new(&Secp256k1::new(), &mut rand::thread_rng());
 
     match input.did {
         Some(input_did) => {
-            if input_did == requester.unwrap_or("n/a".to_string()) {
+            if !is_admin && Some(&input_did) != requester.as_ref() {
                 return Err(ApiError::AuthRequiredError(format!(
                     "Missing auth to create account with did: {input_did}"
                 )));
@@ -361,7 +415,7 @@ pub async fn validate_inputs_for_local_pds(
             deactivated = true;
         }
         None => {
-            let res = format_did_and_plc_op(input, signing_key).await?;
+            let res = format_did_and_plc_op(input, &signing_key).await?;
             did = res.0;
             plc_op = Some(res.1);
             deactivated = false;
@@ -374,16 +428,16 @@ pub async fn validate_inputs_for_local_pds(
         did,
         invite_code,
         password,
-        signing_key,
         plc_op,
         deactivated,
+        signing_key,
     })
 }
 
 #[tracing::instrument(skip_all)]
 async fn format_did_and_plc_op(
     input: CreateAccountInput,
-    signing_key: Keypair,
+    signing_key: &Keypair,
 ) -> Result<(String, Operation), ApiError> {
     let mut rotation_keys: Vec<String> = Vec::new();
 
@@ -393,12 +447,7 @@ async fn format_did_and_plc_op(
     }
 
     //Add PDS rotation key
-    let secp = Secp256k1::new();
-    let private_rotation_key = env::var("PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX").unwrap();
-    let private_secret_key =
-        SecretKey::from_slice(&hex::decode(private_rotation_key.as_bytes()).unwrap()).unwrap();
-    let rotation_keypair = Keypair::from_secret_key(&secp, &private_secret_key);
-    rotation_keys.push(encode_did_key(&rotation_keypair.public_key()));
+    rotation_keys.push(encode_did_key(&PDS_PLC_ROTATION_KEYPAIR.public_key()));
 
     //Build PLC Create Operation
 
@@ -411,7 +460,7 @@ async fn format_did_and_plc_op(
         ),
         rotation_keys,
     };
-    let response = match create_op(create_op_input, rotation_keypair.secret_key()).await {
+    let response = match create_op(create_op_input, PDS_PLC_ROTATION_KEYPAIR.secret_key()).await {
         Ok(res) => res,
         Err(error) => {
             tracing::error!("{error}");
@@ -420,4 +469,44 @@ async fn format_did_and_plc_op(
     };
 
     Ok(response)
+}
+
+// Clients send an empty inviteCode when the server advertises no invite
+// requirement, and an unrequired code must not be validated or consumed.
+fn resolve_invite_code(required: bool, provided: Option<&str>) -> Result<Option<String>, ApiError> {
+    let code = provided.map(str::trim).filter(|code| !code.is_empty());
+    match (required, code) {
+        (true, None) => Err(ApiError::InvalidInviteCode),
+        (true, Some(code)) => Ok(Some(code.to_string())),
+        (false, _) => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_invite_code;
+    use crate::apis::ApiError;
+
+    #[test]
+    fn unrequired_invite_codes_are_dropped() {
+        assert_eq!(resolve_invite_code(false, None).unwrap(), None);
+        assert_eq!(resolve_invite_code(false, Some("")).unwrap(), None);
+        assert_eq!(resolve_invite_code(false, Some("abc-def")).unwrap(), None);
+    }
+
+    #[test]
+    fn required_invite_codes_must_be_present() {
+        assert!(matches!(
+            resolve_invite_code(true, None),
+            Err(ApiError::InvalidInviteCode)
+        ));
+        assert!(matches!(
+            resolve_invite_code(true, Some("  ")),
+            Err(ApiError::InvalidInviteCode)
+        ));
+        assert_eq!(
+            resolve_invite_code(true, Some(" abc-def ")).unwrap(),
+            Some("abc-def".to_string())
+        );
+    }
 }

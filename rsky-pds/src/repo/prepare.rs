@@ -10,7 +10,7 @@ use rsky_repo::types::{
     BlobConstraint, Ids, Lex, PreparedBlobRef, PreparedCreateOrUpdate, PreparedDelete, RepoRecord,
     WriteOpAction,
 };
-use rsky_repo::util::{cbor_to_lex, lex_to_ipld};
+use rsky_repo::util::{cbor_to_lex, lex_to_ipld, normalize_record_blob_refs};
 use rsky_syntax::aturi::AtUri;
 use serde_json::{json, Value as JsonValue};
 
@@ -51,22 +51,32 @@ pub fn blobs_for_write(record: RepoRecord, validate: bool) -> anyhow::Result<Vec
         Some(Lex::Ipld(Ipld::String(t))) => Some(t),
         _ => None,
     };
-    for r#ref in refs.clone() {
-        if matches!(r#ref.r#ref.original, JsonBlobRef::Untyped(_)) {
-            bail!("Legacy blob ref at `{}`", r#ref.path.join("/"))
+    if validate {
+        for r#ref in refs.clone() {
+            if matches!(r#ref.r#ref.original, JsonBlobRef::Untyped(_)) {
+                bail!("Legacy blob ref at `{}`", r#ref.path.join("/"))
+            }
         }
     }
     refs.into_iter()
         .map(|FoundBlobRef { r#ref, path }| {
             let constraints: BlobConstraint = match (validate, record_type) {
                 (true, Some(record_type)) => {
-                    let properties: crate::lexicon::lexicons::Image2 = serde_json::from_value(
+                    // Collections without a known constraint table (custom
+                    // lexicons) carry unconstrained blobs rather than failing
+                    // the write.
+                    match serde_json::from_value::<crate::lexicon::lexicons::Image2>(
                         crate::repo::prepare::CONSTRAINTS[record_type.as_str()][path.join("/")]
                             .clone(),
-                    )?;
-                    BlobConstraint {
-                        max_size: Some(properties.max_size as usize),
-                        accept: Some(properties.accept),
+                    ) {
+                        Ok(properties) => BlobConstraint {
+                            max_size: Some(properties.max_size as usize),
+                            accept: Some(properties.accept),
+                        },
+                        Err(_) => BlobConstraint {
+                            max_size: None,
+                            accept: None,
+                        },
                     }
                 }
                 (_, _) => BlobConstraint {
@@ -86,7 +96,7 @@ pub fn blobs_for_write(record: RepoRecord, validate: bool) -> anyhow::Result<Vec
 
 pub fn find_blob_refs(val: Lex, path: Option<Vec<String>>, layer: Option<u8>) -> Vec<FoundBlobRef> {
     let layer = layer.unwrap_or(0);
-    let path = path.unwrap_or_else(std::vec::Vec::new);
+    let path = path.unwrap_or_default();
     if layer > 32 {
         return vec![];
     }
@@ -97,29 +107,6 @@ pub fn find_blob_refs(val: Lex, path: Option<Vec<String>>, layer: Option<u8>) ->
             .flat_map(|item| find_blob_refs(item, Some(path.clone()), Some(layer + 1)))
             .collect::<Vec<FoundBlobRef>>(),
         Lex::Blob(blob) => vec![FoundBlobRef { r#ref: blob, path }],
-        Lex::Ipld(Ipld::List(list)) => list
-            .into_iter()
-            .flat_map(|item| find_blob_refs(Lex::Ipld(item), Some(path.clone()), Some(layer + 1)))
-            .collect::<Vec<FoundBlobRef>>(),
-        Lex::Ipld(Ipld::Map(map)) => match serde_json::to_value(&map)
-            .ok()
-            .and_then(|json| serde_json::from_value::<JsonBlobRef>(json).ok())
-        {
-            Some(blob) => vec![FoundBlobRef {
-                r#ref: BlobRef { original: blob },
-                path,
-            }],
-            None => map
-                .into_iter()
-                .flat_map(|(key, item)| {
-                    find_blob_refs(
-                        Lex::Ipld(item),
-                        Some([path.as_slice(), [key].as_slice()].concat()),
-                        Some(layer + 1),
-                    )
-                })
-                .collect::<Vec<FoundBlobRef>>(),
-        },
         Lex::Ipld(Ipld::Json(JsonValue::Array(list))) => list
             .into_iter()
             .flat_map(|item| match serde_json::from_value::<RepoRecord>(item) {
@@ -146,6 +133,29 @@ pub fn find_blob_refs(val: Lex, path: Option<Vec<String>>, layer: Option<u8>) ->
                 Err(_) => vec![],
             },
         },
+        Lex::Ipld(Ipld::Map(map)) => match serde_json::to_value(Ipld::Map(map.clone()))
+            .ok()
+            .and_then(|json| serde_json::from_value::<JsonBlobRef>(json).ok())
+        {
+            Some(blob) => vec![FoundBlobRef {
+                r#ref: BlobRef { original: blob },
+                path,
+            }],
+            None => map
+                .into_iter()
+                .flat_map(|(key, item)| {
+                    find_blob_refs(
+                        Lex::Ipld(item),
+                        Some([path.as_slice(), [key].as_slice()].concat()),
+                        Some(layer + 1),
+                    )
+                })
+                .collect::<Vec<FoundBlobRef>>(),
+        },
+        Lex::Ipld(Ipld::List(list)) => list
+            .into_iter()
+            .flat_map(|item| find_blob_refs(Lex::Ipld(item), Some(path.clone()), Some(layer + 1)))
+            .collect::<Vec<FoundBlobRef>>(),
         Lex::Ipld(_) => vec![],
         Lex::Map(map) => map
             .into_iter()
@@ -157,84 +167,6 @@ pub fn find_blob_refs(val: Lex, path: Option<Vec<String>>, layer: Option<u8>) ->
                 )
             })
             .collect::<Vec<FoundBlobRef>>(),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::blobs_for_write;
-    use anyhow::Result;
-    use rsky_repo::types::RepoRecord;
-    use serde_json::json;
-
-    #[test]
-    fn finds_blob_refs_in_video_embed_records_deserialized_from_json() -> Result<()> {
-        let record: RepoRecord = serde_json::from_value(json!({
-            "$type": "app.bsky.feed.post",
-            "text": "staging ACL smoke 2026-03-21T04:00:00Z",
-            "createdAt": "2026-03-21T04:00:00Z",
-            "langs": ["en"],
-            "embed": {
-                "$type": "app.bsky.embed.video",
-                "video": {
-                    "$type": "blob",
-                    "ref": { "$link": "bafkreigh2akiscaildc4v5lskm6ty6q6ks5xifh4rtfj24rl6vb7aq6nzu" },
-                    "mimeType": "video/mp4",
-                    "size": 1027159
-                },
-                "alt": "staging ACL smoke",
-                "aspectRatio": {
-                    "width": 1,
-                    "height": 1
-                }
-            }
-        }))?;
-
-        let blobs = blobs_for_write(record, false)?;
-
-        assert_eq!(blobs.len(), 1);
-        assert_eq!(blobs[0].mime_type, "video/mp4");
-        Ok(())
-    }
-
-    #[test]
-    fn validates_video_embed_blob_constraints() -> Result<()> {
-        std::thread::Builder::new()
-            .name("video-constraint-validate".to_string())
-            .stack_size(32 * 1024 * 1024)
-            .spawn(|| -> Result<()> {
-                let record: RepoRecord = serde_json::from_value(json!({
-                    "$type": "app.bsky.feed.post",
-                    "text": "staging ACL smoke 2026-03-21T04:00:00Z",
-                    "createdAt": "2026-03-21T04:00:00Z",
-                    "langs": ["en"],
-                    "embed": {
-                        "$type": "app.bsky.embed.video",
-                        "video": {
-                            "$type": "blob",
-                            "ref": { "$link": "bafkreigh2akiscaildc4v5lskm6ty6q6ks5xifh4rtfj24rl6vb7aq6nzu" },
-                            "mimeType": "video/mp4",
-                            "size": 1027159
-                        },
-                        "alt": "staging ACL smoke",
-                        "aspectRatio": {
-                            "width": 1,
-                            "height": 1
-                        }
-                    }
-                }))?;
-
-                let blobs = blobs_for_write(record, true)?;
-
-                assert_eq!(blobs.len(), 1);
-                assert_eq!(blobs[0].constraints.max_size, Some(100_000_000));
-                assert_eq!(blobs[0].constraints.accept, Some(vec!["video/mp4".to_string()]));
-                Ok(())
-            })
-            .expect("failed to spawn constraint validation thread")
-            .join()
-            .expect("constraint validation thread panicked")?;
-        Ok(())
     }
 }
 
@@ -257,7 +189,7 @@ pub fn set_collection_name(
         );
     }
     if let Some(Lex::Ipld(Ipld::Json(JsonValue::String(record_type)))) = record.get("$type") {
-        if validate && record_type.to_string() != *collection {
+        if validate && record_type != collection {
             bail!("Invalid $type: expected {collection}, got {record_type}")
         }
     }
@@ -283,7 +215,8 @@ pub async fn prepare_create(opts: PrepareCreateOpts) -> anyhow::Result<PreparedC
     } = opts;
     let validate = validate.unwrap_or(true);
 
-    let record = set_collection_name(&collection, opts.record, validate)?;
+    let record =
+        normalize_record_blob_refs(set_collection_name(&collection, opts.record, validate)?);
     if validate {
         assert_valid_record(&record)?;
     }
@@ -313,7 +246,8 @@ pub async fn prepare_update(opts: PrepareUpdateOpts) -> anyhow::Result<PreparedC
     } = opts;
     let validate = validate.unwrap_or(true);
 
-    let record = set_collection_name(&collection, opts.record, validate)?;
+    let record =
+        normalize_record_blob_refs(set_collection_name(&collection, opts.record, validate)?);
     if validate {
         assert_valid_record(&record)?;
     }
@@ -360,29 +294,101 @@ lazy_static! {
             Ids::AppBskyFeedPost.as_str(): {
                 "embed/images/image": LEXICONS.app_bsky_embed_images.defs.image.properties.image,
                 "embed/external/thumb": LEXICONS.app_bsky_embed_external.defs.external.properties.thumb,
-                "embed/video": {
-                    "type": "blob",
-                    "accept": ["video/mp4"],
-                    "maxSize": 100000000
-                },
-                "embed/captions/file": {
-                    "type": "blob",
-                    "accept": ["text/vtt"],
-                    "maxSize": 20000
-                },
+                "embed/video": LEXICONS.app_bsky_embed_video.defs.main.properties.video,
+                "embed/captions/file": LEXICONS.app_bsky_embed_video.defs.caption.properties.file,
                 "embed/media/images/image": LEXICONS.app_bsky_embed_images.defs.image.properties.image,
                 "embed/media/external/thumb": LEXICONS.app_bsky_embed_external.defs.external.properties.thumb,
-                "embed/media/video": {
-                    "type": "blob",
-                    "accept": ["video/mp4"],
-                    "maxSize": 100000000
-                },
-                "embed/media/captions/file": {
-                    "type": "blob",
-                    "accept": ["text/vtt"],
-                    "maxSize": 20000
-                }
+                "embed/media/video": LEXICONS.app_bsky_embed_video.defs.main.properties.video,
+                "embed/media/captions/file": LEXICONS.app_bsky_embed_video.defs.caption.properties.file
             }
         })
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const VIDEO_CID: &str = "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku";
+    const VTT_CID: &str = "bafkreibjfgx2gprinfvicegelk5kosd6y2frmqpqzwqkg7usac74l3t2v4";
+
+    fn blob_json(cid: &str, mime_type: &str, size: i64) -> JsonValue {
+        json!({
+            "$type": "blob",
+            "ref": { "$link": cid },
+            "mimeType": mime_type,
+            "size": size,
+        })
+    }
+
+    fn video_post_record() -> RepoRecord {
+        serde_json::from_value(json!({
+            "$type": "app.bsky.feed.post",
+            "text": "video post",
+            "createdAt": "2026-01-01T00:00:00.000Z",
+            "embed": {
+                "$type": "app.bsky.embed.video",
+                "video": blob_json(VIDEO_CID, "video/mp4", 1_048_576),
+                "captions": [
+                    { "lang": "en", "file": blob_json(VTT_CID, "text/vtt", 1024) }
+                ],
+            },
+        }))
+        .expect("record deserializes")
+    }
+
+    #[test]
+    fn finds_blob_refs_in_video_embed() {
+        let refs = find_blob_refs(Lex::Map(video_post_record()), None, None);
+        let mut paths = refs
+            .iter()
+            .map(|r| r.path.join("/"))
+            .collect::<Vec<String>>();
+        paths.sort();
+        assert_eq!(paths, vec!["embed/captions/file", "embed/video"]);
+    }
+
+    #[test]
+    fn blobs_for_write_applies_video_constraints() {
+        let prepared = blobs_for_write(video_post_record(), true).expect("blobs prepared");
+        let video = prepared
+            .iter()
+            .find(|blob| blob.mime_type == "video/mp4")
+            .expect("video blob present");
+        assert_eq!(video.cid.to_string(), VIDEO_CID);
+        assert_eq!(
+            video.constraints.accept,
+            Some(vec!["video/mp4".to_string()])
+        );
+        assert_eq!(video.constraints.max_size, Some(100_000_000));
+        let captions = prepared
+            .iter()
+            .find(|blob| blob.mime_type == "text/vtt")
+            .expect("captions blob present");
+        assert_eq!(captions.cid.to_string(), VTT_CID);
+        assert_eq!(
+            captions.constraints.accept,
+            Some(vec!["text/vtt".to_string()])
+        );
+        assert_eq!(captions.constraints.max_size, Some(20_000));
+    }
+
+    #[test]
+    fn finds_blob_refs_in_image_embed() {
+        let record: RepoRecord = serde_json::from_value(json!({
+            "$type": "app.bsky.feed.post",
+            "text": "image post",
+            "createdAt": "2026-01-01T00:00:00.000Z",
+            "embed": {
+                "$type": "app.bsky.embed.images",
+                "images": [
+                    { "image": blob_json(VIDEO_CID, "image/png", 512), "alt": "" }
+                ],
+            },
+        }))
+        .expect("record deserializes");
+        let refs = find_blob_refs(Lex::Map(record), None, None);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].path.join("/"), "embed/images/image");
+    }
 }

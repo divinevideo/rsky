@@ -23,7 +23,7 @@ pub fn extract_prefixed_bytes(multikey: String) -> Result<Vec<u8>> {
 }
 
 pub fn has_prefix(bytes: &Vec<u8>, prefix: &Vec<u8>) -> bool {
-    *prefix == bytes[0..prefix.len()]
+    bytes.len() >= prefix.len() && *prefix == bytes[0..prefix.len()]
 }
 
 pub fn random_bytes(len: usize) -> Vec<u8> {
@@ -53,4 +53,39 @@ pub fn encode_did_key(pubkey: &PublicKey) -> String {
     let pk_wrapped = multicodec_wrap(pk_compact.to_vec());
     let pk_multibase = multibase::encode(Base58Btc, pk_wrapped.as_slice());
     format!("{DID_KEY_PREFIX}{pk_multibase}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_multikey_requires_did_key_prefix() {
+        assert!(extract_multikey(&"did:plc:notakey".to_string()).is_err());
+        assert_eq!(
+            extract_multikey(&"did:key:zAbc".to_string()).unwrap(),
+            "zAbc"
+        );
+    }
+
+    #[test]
+    fn extract_prefixed_bytes_requires_base58btc() {
+        assert!(extract_prefixed_bytes("bAbc".to_string()).is_err());
+    }
+
+    #[test]
+    fn has_prefix_rejects_input_shorter_than_prefix() {
+        let prefix = vec![0xe7u8, 0x01];
+        assert!(!has_prefix(&vec![], &prefix));
+        assert!(!has_prefix(&vec![0xe7], &prefix));
+        assert!(has_prefix(&vec![0xe7, 0x01], &prefix));
+        assert!(has_prefix(&vec![0xe7, 0x01, 0x99], &prefix));
+        assert!(!has_prefix(&vec![0x80, 0x24], &prefix));
+    }
+
+    #[test]
+    fn random_bytes_has_requested_length() {
+        assert_eq!(random_bytes(32).len(), 32);
+        assert_eq!(random_bytes(0).len(), 0);
+    }
 }

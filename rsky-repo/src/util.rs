@@ -9,6 +9,7 @@ use futures::{stream, Stream, StreamExt, TryStreamExt};
 use lexicon_cid::Cid;
 use rsky_common::sign::sign_without_indexmap;
 use rsky_common::tid::Ticker;
+use rsky_lexicon::blob_refs::{BlobRef, JsonBlobRef};
 use secp256k1::Keypair;
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
@@ -17,7 +18,7 @@ use std::fmt::Display;
 use std::str::FromStr;
 use tokio::try_join;
 
-pub fn sign_commit(unsigned: UnsignedCommit, keypair: Keypair) -> Result<Commit> {
+pub fn sign_commit(unsigned: UnsignedCommit, keypair: &Keypair) -> Result<Commit> {
     let commit_sig = sign_without_indexmap(&unsigned, &keypair.secret_key())?;
     Ok(Commit {
         did: unsigned.did,
@@ -40,7 +41,7 @@ pub fn verify_commit_sig(commit: Commit, did_key: &String) -> Result<bool> {
     };
     let encoded = serde_ipld_dagcbor::to_vec(&rest)?;
     let hash = Sha256::digest(&*encoded);
-    rsky_crypto::verify::verify_signature(did_key, hash.as_ref(), sig.as_slice(), None)
+    rsky_crypto::verify::verify_signature_digest(did_key, hash.as_ref(), sig.as_slice(), None)
 }
 
 pub fn format_data_key<T: FromStr + Display>(collection: T, rkey: T) -> String {
@@ -49,11 +50,7 @@ pub fn format_data_key<T: FromStr + Display>(collection: T, rkey: T) -> String {
 
 pub fn lex_to_ipld(val: Lex) -> Ipld {
     match val {
-        Lex::List(list) => Ipld::List(
-            list.into_iter()
-                .map(|item| lex_to_ipld(item))
-                .collect::<Vec<Ipld>>(),
-        ),
+        Lex::List(list) => Ipld::List(list.into_iter().map(lex_to_ipld).collect::<Vec<Ipld>>()),
         Lex::Map(map) => {
             let mut to_return: BTreeMap<String, Ipld> = BTreeMap::new();
             for key in map.keys() {
@@ -61,9 +58,30 @@ pub fn lex_to_ipld(val: Lex) -> Ipld {
             }
             Ipld::Map(to_return)
         }
-        Lex::Blob(blob) => {
-            Ipld::Json(serde_json::to_value(blob.original).expect("Issue serializing blob"))
-        }
+        // A blob ref's `ref` must round-trip as a real IPLD link so DAG-CBOR
+        // writes CBOR tag 42; a JSON-shaped `$link` map produces a different
+        // block and a different CID than every other implementation.
+        Lex::Blob(blob) => match blob.original {
+            JsonBlobRef::Typed(typed) => match typed.r#ref.link.parse::<Cid>() {
+                Ok(cid) => Ipld::Map(BTreeMap::from([
+                    ("$type".to_string(), Ipld::String("blob".to_string())),
+                    ("ref".to_string(), Ipld::Link(cid)),
+                    ("mimeType".to_string(), Ipld::String(typed.mime_type)),
+                    (
+                        "size".to_string(),
+                        Ipld::Json(serde_json::Value::from(typed.size)),
+                    ),
+                ])),
+                Err(_) => Ipld::Json(
+                    serde_json::to_value(JsonBlobRef::Typed(typed))
+                        .expect("Issue serializing blob"),
+                ),
+            },
+            JsonBlobRef::Untyped(legacy) => Ipld::Map(BTreeMap::from([
+                ("cid".to_string(), Ipld::String(legacy.cid)),
+                ("mimeType".to_string(), Ipld::String(legacy.mime_type)),
+            ])),
+        },
         Lex::Ipld(ipld) => match ipld {
             Ipld::Json(json_val) => match serde_json::from_value::<Cid>(json_val.clone()) {
                 Ok(cid) => Ipld::Link(cid),
@@ -74,14 +92,43 @@ pub fn lex_to_ipld(val: Lex) -> Ipld {
     }
 }
 
+/// A DAG-CBOR blob reference decodes as an `Ipld::Map` whose `ref` is an
+/// `Ipld::Link`; recognize that shape here or every blob ref parsed from a
+/// CAR dissolves into a plain map and record-blob associations are lost.
+fn ipld_map_as_blob(map: &BTreeMap<String, Ipld>) -> Option<BlobRef> {
+    let typed = matches!(map.get("$type"), Some(Ipld::String(t)) if t == "blob");
+    let legacy = matches!(map.get("cid"), Some(Ipld::String(_)))
+        && matches!(map.get("mimeType"), Some(Ipld::String(_)));
+    if !typed && !legacy {
+        return None;
+    }
+    let mut obj = serde_json::Map::new();
+    for (key, value) in map {
+        let json = match value {
+            Ipld::Link(cid) => serde_json::json!({ "$link": cid.to_string() }),
+            Ipld::String(s) => JsonValue::String(s.clone()),
+            Ipld::Json(value) => value.clone(),
+            // A JSON-born ref arrives as a one-key map, not a link.
+            Ipld::Map(inner) if inner.len() == 1 => match inner.get("$link") {
+                Some(Ipld::String(link)) => serde_json::json!({ "$link": link }),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        obj.insert(key.clone(), json);
+    }
+    serde_json::from_value::<JsonBlobRef>(JsonValue::Object(obj))
+        .ok()
+        .map(|original| BlobRef { original })
+}
+
 pub fn ipld_to_lex(val: Ipld) -> Lex {
     match val {
-        Ipld::List(list) => Lex::List(
-            list.into_iter()
-                .map(|item| ipld_to_lex(item))
-                .collect::<Vec<Lex>>(),
-        ),
+        Ipld::List(list) => Lex::List(list.into_iter().map(ipld_to_lex).collect::<Vec<Lex>>()),
         Ipld::Map(map) => {
+            if let Some(blob) = ipld_map_as_blob(&map) {
+                return Lex::Blob(blob);
+            }
             let mut to_return: BTreeMap<String, Lex> = BTreeMap::new();
             for key in map.keys() {
                 to_return.insert(key.to_owned(), ipld_to_lex(map.get(key).unwrap().clone()));
@@ -96,6 +143,30 @@ pub fn ipld_to_lex(val: Ipld) -> Lex {
             Lex::Blob(serde_json::from_value(blob).expect("Issue deserializing blob"))
         }
         _ => Lex::Ipld(val),
+    }
+}
+
+/// Re-anchor blob refs in a record that was deserialized from JSON: untagged
+/// serde lands every JSON object on the generic Ipld map, so without this a
+/// blob ref never becomes `Lex::Blob` and its block encodes a `$link` map
+/// instead of a tag-42 link.
+pub fn normalize_record_blob_refs(record: RepoRecord) -> RepoRecord {
+    record
+        .into_iter()
+        .map(|(key, value)| (key, normalize_lex_blob_refs(value)))
+        .collect()
+}
+
+fn normalize_lex_blob_refs(val: Lex) -> Lex {
+    match val {
+        Lex::Ipld(ipld) => ipld_to_lex(ipld),
+        Lex::Map(map) => Lex::Map(
+            map.into_iter()
+                .map(|(key, value)| (key, normalize_lex_blob_refs(value)))
+                .collect(),
+        ),
+        Lex::List(list) => Lex::List(list.into_iter().map(normalize_lex_blob_refs).collect()),
+        blob => blob,
     }
 }
 
@@ -226,4 +297,198 @@ where
         buffer.extend_from_slice(&chunk?);
     }
     Ok(buffer)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The encode direction: a `Lex::Blob` written to DAG-CBOR must emit a
+    /// real tag-42 CID link and re-encode byte-for-byte to what a compliant
+    /// implementation produced, or native writes diverge from every other
+    /// PDS and imported records index under the wrong CID.
+    #[test]
+    fn blob_ref_encodes_as_tag42_and_round_trips() {
+        let cid: Cid = "bafkreiey6e2xp4ncufvsyfmubucbsz5xujbc7lguospuziohtgfdik3pr4"
+            .parse()
+            .unwrap();
+        let original = Ipld::Map(BTreeMap::from([
+            (
+                "$type".to_string(),
+                Ipld::String("app.bsky.actor.profile".to_string()),
+            ),
+            (
+                "avatar".to_string(),
+                Ipld::Map(BTreeMap::from([
+                    ("$type".to_string(), Ipld::String("blob".to_string())),
+                    ("ref".to_string(), Ipld::Link(cid)),
+                    (
+                        "mimeType".to_string(),
+                        Ipld::String("image/jpeg".to_string()),
+                    ),
+                    ("size".to_string(), Ipld::Json(JsonValue::from(924586))),
+                ])),
+            ),
+        ]));
+        let original_bytes = serde_ipld_dagcbor::to_vec(&original).unwrap();
+        // tag 42 present in the source encoding
+        assert!(original_bytes
+            .windows(2)
+            .any(|window| window == [0xd8, 0x2a]));
+        // decode -> Lex (Lex::Blob) -> re-encode must reproduce the bytes
+        let record = cbor_to_lex_record(original_bytes.clone()).unwrap();
+        assert!(matches!(record.get("avatar"), Some(Lex::Blob(_))));
+        let reencoded = serde_ipld_dagcbor::to_vec(&lex_to_ipld(Lex::Map(record))).unwrap();
+        assert_eq!(reencoded, original_bytes);
+    }
+
+    /// The JSON write path: a record parsed from an API body must normalize
+    /// its blob refs to `Lex::Blob` so its block encodes the same tag-42
+    /// bytes a CAR-imported copy carries.
+    #[test]
+    fn json_born_blob_ref_normalizes_and_encodes_tag42() {
+        let record: RepoRecord = serde_json::from_value(serde_json::json!({
+            "$type": "app.bsky.actor.profile",
+            "avatar": {
+                "$type": "blob",
+                "ref": { "$link": "bafkreiey6e2xp4ncufvsyfmubucbsz5xujbc7lguospuziohtgfdik3pr4" },
+                "mimeType": "image/jpeg",
+                "size": 924586
+            }
+        }))
+        .unwrap();
+        let normalized = normalize_record_blob_refs(record);
+        assert!(matches!(normalized.get("avatar"), Some(Lex::Blob(_))));
+        let bytes = serde_ipld_dagcbor::to_vec(&lex_to_ipld(Lex::Map(normalized))).unwrap();
+        assert!(bytes.windows(2).any(|window| window == [0xd8, 0x2a]));
+        // and it must equal the CBOR-native encoding of the same record
+        let reparsed = cbor_to_lex_record(bytes.clone()).unwrap();
+        let reencoded = serde_ipld_dagcbor::to_vec(&lex_to_ipld(Lex::Map(reparsed))).unwrap();
+        assert_eq!(reencoded, bytes);
+    }
+
+    /// A blob ref decoded from real DAG-CBOR (map with a tag-42 link) must
+    /// come out as `Lex::Blob`, or record-blob associations are silently
+    /// lost on every CAR import.
+    #[test]
+    fn cbor_blob_ref_parses_as_lex_blob() {
+        let cid: Cid = "bafkreiey6e2xp4ncufvsyfmubucbsz5xujbc7lguospuziohtgfdik3pr4"
+            .parse()
+            .unwrap();
+        let record = Ipld::Map(BTreeMap::from([
+            (
+                "$type".to_string(),
+                Ipld::String("app.bsky.actor.profile".to_string()),
+            ),
+            (
+                "avatar".to_string(),
+                Ipld::Map(BTreeMap::from([
+                    ("$type".to_string(), Ipld::String("blob".to_string())),
+                    ("ref".to_string(), Ipld::Link(cid)),
+                    (
+                        "mimeType".to_string(),
+                        Ipld::String("image/jpeg".to_string()),
+                    ),
+                    ("size".to_string(), Ipld::Json(JsonValue::from(924586))),
+                ])),
+            ),
+        ]));
+        let bytes = serde_ipld_dagcbor::to_vec(&record).unwrap();
+        let parsed = cbor_to_lex_record(bytes).unwrap();
+        match parsed.get("avatar") {
+            Some(Lex::Blob(blob)) => {
+                assert_eq!(blob.get_cid().unwrap(), cid);
+            }
+            other => panic!("avatar should parse as Lex::Blob, got {other:?}"),
+        }
+    }
+
+    fn unsigned_commit() -> UnsignedCommit {
+        UnsignedCommit {
+            did: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            rev: "3lbqxyzabcd2z".to_string(),
+            data: "bafkreiey6e2xp4ncufvsyfmubucbsz5xujbc7lguospuziohtgfdik3pr4"
+                .parse()
+                .unwrap(),
+            prev: None,
+            version: 3,
+        }
+    }
+
+    fn commit_digest(unsigned: &UnsignedCommit) -> Vec<u8> {
+        Sha256::digest(&*serde_ipld_dagcbor::to_vec(unsigned).unwrap()).to_vec()
+    }
+
+    fn to_commit(unsigned: UnsignedCommit, sig: Vec<u8>) -> Commit {
+        Commit {
+            did: unsigned.did,
+            rev: unsigned.rev,
+            data: unsigned.data,
+            prev: unsigned.prev,
+            version: unsigned.version,
+            sig,
+        }
+    }
+
+    /// A P-256 signing key signs the commit digest; verification must hash the
+    /// commit exactly once, or every P-256-keyed repo fails to verify.
+    #[test]
+    fn verifies_p256_signed_commit() {
+        use p256::ecdsa::signature::hazmat::PrehashSigner;
+        use p256::ecdsa::{Signature, SigningKey};
+
+        let signing_key = SigningKey::from_slice(&[0x2au8; 32]).unwrap();
+        let did_key = rsky_crypto::did::format_did_key(
+            rsky_crypto::constants::P256_JWT_ALG.to_string(),
+            signing_key
+                .verifying_key()
+                .to_encoded_point(true)
+                .as_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+
+        let unsigned = unsigned_commit();
+        let digest = commit_digest(&unsigned);
+        let sig: Signature = signing_key.sign_prehash(&digest).unwrap();
+        let sig = sig.normalize_s().unwrap_or(sig);
+        let commit = to_commit(unsigned, sig.to_vec());
+
+        assert!(verify_commit_sig(commit.clone(), &did_key).unwrap());
+
+        let mut tampered = commit;
+        tampered.rev = "3lbqxyzabce2z".to_string();
+        assert!(!verify_commit_sig(tampered, &did_key).unwrap());
+    }
+
+    #[test]
+    fn verifies_secp256k1_signed_commit() {
+        use rsky_crypto::utils::encode_did_key;
+        use secp256k1::{PublicKey, Secp256k1, SecretKey};
+
+        let secret = SecretKey::from_slice(&[0x2au8; 32]).unwrap();
+        let did_key = encode_did_key(&PublicKey::from_secret_key(&Secp256k1::new(), &secret));
+
+        let unsigned = unsigned_commit();
+        let sig = sign_without_indexmap(&unsigned, &secret).unwrap();
+        let commit = to_commit(unsigned, sig.to_vec());
+
+        assert!(verify_commit_sig(commit.clone(), &did_key).unwrap());
+
+        let mut tampered = commit;
+        tampered.rev = "3lbqxyzabce2z".to_string();
+        assert!(!verify_commit_sig(tampered, &did_key).unwrap());
+    }
+
+    #[test]
+    fn sign_commit_round_trips() {
+        use rsky_crypto::utils::encode_did_key;
+        use secp256k1::{Keypair, Secp256k1};
+
+        let secp = Secp256k1::new();
+        let keypair = Keypair::from_seckey_slice(&secp, &[0x2au8; 32]).unwrap();
+        let did_key = encode_did_key(&keypair.public_key());
+        let commit = sign_commit(unsigned_commit(), &keypair).unwrap();
+        assert!(verify_commit_sig(commit, &did_key).unwrap());
+    }
 }

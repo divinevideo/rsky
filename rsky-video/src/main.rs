@@ -24,8 +24,10 @@ mod bunny;
 mod config;
 mod db;
 mod error;
+mod media_signing;
 mod pds;
 mod signing;
+mod transcode;
 mod xrpc;
 
 pub use config::AppConfig;
@@ -64,6 +66,13 @@ async fn main() -> color_eyre::Result<()> {
         config.host, config.port
     );
 
+    // Every upload shells out to ffmpeg/ffprobe (resolved via PATH at spawn
+    // time), so a host missing either would boot clean and then fail 100% of
+    // uploads. Fail the boot instead.
+    transcode::preflight()
+        .await
+        .map_err(|e| color_eyre::eyre::eyre!("transcode preflight failed: {e}"))?;
+
     // Initialize database pool
     let mut pg_config = PgConfig::new();
     pg_config.url = Some(config.database_url.clone());
@@ -77,6 +86,10 @@ async fn main() -> color_eyre::Result<()> {
         config.bunny_library_id.clone(),
         config.bunny_api_key.clone(),
         config.bunny_pull_zone.clone(),
+        config.bunny_token_key.clone(),
+        config
+            .playlist_redirect_max_age_secs
+            .max(config.thumbnail_redirect_max_age_secs),
     );
 
     // Initialize HTTP client for PDS uploads
