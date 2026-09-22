@@ -1,0 +1,112 @@
+use crate::actor_store::blobstore::BlobstoreFactory;
+use crate::actor_store::ActorStore;
+use crate::apis::com::atproto::space::host::local_space_def;
+use crate::apis::com::atproto::space::{deliver_notifications, parse_space_uri, space_error};
+use crate::apis::ApiError;
+use crate::auth_verifier::bearer_token_from_req;
+use crate::space_auth::{verify_space_service_token, NOTIFY_WRITE_LXM};
+use crate::SharedIdResolver;
+use rocket::request::{FromRequest, Outcome, Request};
+use rocket::serde::json::Json;
+use rocket::State;
+use rsky_lexicon::com::atproto::space::NotifyWriteInput;
+
+pub struct BearerToken(pub String);
+
+#[rocket::async_trait]
+impl<'r> FromRequest<'r> for BearerToken {
+    type Error = ApiError;
+
+    async fn from_request(req: &'r Request<'_>) -> Outcome<Self, Self::Error> {
+        match bearer_token_from_req(req) {
+            Ok(Some(token)) => Outcome::Success(BearerToken(token)),
+            _ => {
+                let error = ApiError::AuthRequiredError("service auth required".to_string());
+                req.local_cache(|| Some(error.clone()));
+                Outcome::Error((rocket::http::Status::Unauthorized, error))
+            }
+        }
+    }
+}
+
+/// Inbound write notification (space-host role): a member's repo host reports
+/// that a repo advanced. The authority updates its writer set and forwards the
+/// notification to registered syncers (spec §Write notifications).
+#[tracing::instrument(skip_all)]
+#[rocket::post(
+    "/xrpc/com.atproto.space.notifyWrite",
+    format = "json",
+    data = "<body>"
+)]
+pub async fn space_notify_write(
+    body: Json<NotifyWriteInput>,
+    token: BearerToken,
+    actor_store: &State<ActorStore>,
+    blobstore_factory: &State<BlobstoreFactory>,
+    id_resolver: &State<SharedIdResolver>,
+) -> Result<(), ApiError> {
+    let NotifyWriteInput { space, repo, rev } = body.into_inner();
+    let space_id = parse_space_uri(&space)?;
+    let claims = verify_space_service_token(
+        actor_store,
+        id_resolver,
+        &token.0,
+        NOTIFY_WRITE_LXM,
+        &space_id.authority,
+    )
+    .await
+    .map_err(|error| {
+        tracing::debug!(%error, "notifyWrite auth rejected");
+        ApiError::InvalidToken("Token is invalid".to_string())
+    })?;
+    // Two legs carry this method. Leg 1 is a repo host telling the space host
+    // that one of its members advanced, signed by that member. Leg 2 is the
+    // space host forwarding that to a registered subscriber, signed by the
+    // authority -- accepted here so an rsky PDS can be a subscriber, and not
+    // forwarded again, which is what would make a loop.
+    if claims.iss == space_id.authority && claims.iss != repo {
+        tracing::debug!(space = %space, %repo, %rev, "forwarded write notice");
+        return Ok(());
+    }
+    if claims.iss != repo {
+        return Err(ApiError::InvalidToken("Token is invalid".to_string()));
+    }
+    let (_, space_store, keypair) =
+        local_space_def(actor_store, blobstore_factory, &space_id).await?;
+    let fresh = space_store
+        .consume_jti(
+            &claims.jti,
+            claims.exp as i64,
+            crate::space_auth::now_secs() as i64,
+        )
+        .await
+        .map_err(space_error)?;
+    if !fresh {
+        return Err(ApiError::InvalidToken("Token is invalid".to_string()));
+    }
+    space_store
+        .upsert_writer(&space_id.uri(), &repo, &rev, None)
+        .await
+        .map_err(space_error)?;
+    let endpoints = space_store
+        .host_notify_endpoints(&space_id.uri(), &rsky_common::now())
+        .await
+        .map_err(space_error)?;
+    if !endpoints.is_empty() {
+        let authority = space_id.authority.clone();
+        let body = serde_json::json!({ "space": space_id.uri(), "repo": repo, "rev": rev });
+        actor_store.background_queue.add(async move {
+            deliver_notifications(
+                &keypair,
+                &authority,
+                &authority,
+                NOTIFY_WRITE_LXM,
+                &endpoints,
+                &body,
+            )
+            .await;
+            Ok(())
+        });
+    }
+    Ok(())
+}

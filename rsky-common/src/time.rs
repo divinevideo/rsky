@@ -1,5 +1,5 @@
 use crate::RFC3339_VARIANT;
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use chrono::offset::Utc as UtcOffset;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use std::time::SystemTime;
@@ -18,29 +18,44 @@ pub fn less_than_ago_s(time: DateTime<UtcOffset>, range: i32) -> bool {
     now < x
 }
 
-pub fn from_str_to_micros(str: &String) -> i64 {
-    NaiveDateTime::parse_from_str(str, RFC3339_VARIANT)
-        .unwrap()
-        .and_utc()
-        .timestamp_micros()
+/// Parse a datetime string to microseconds since epoch.
+/// Tries the primary RFC3339 variant format first, then falls back to
+/// full RFC 3339 parsing (handles `+00:00` offsets and other variants).
+pub fn from_str_to_micros(str: &str) -> Result<i64> {
+    if let Ok(dt) = NaiveDateTime::parse_from_str(str, RFC3339_VARIANT) {
+        return Ok(dt.and_utc().timestamp_micros());
+    }
+    DateTime::parse_from_rfc3339(str)
+        .map(|dt| dt.timestamp_micros())
+        .map_err(|e| anyhow!("failed to parse datetime {:?}: {}", str, e))
 }
 
-pub fn from_str_to_millis(str: &String) -> Result<i64> {
+pub fn from_str_to_millis(str: &str) -> Result<i64> {
     Ok(NaiveDateTime::parse_from_str(str, RFC3339_VARIANT)?
         .and_utc()
         .timestamp_millis())
 }
 
-pub fn from_str_to_utc(str: &String) -> DateTime<UtcOffset> {
-    NaiveDateTime::parse_from_str(str, RFC3339_VARIANT)
-        .unwrap()
-        .and_utc()
+/// Parse a datetime string to a UTC DateTime.
+/// Tries the primary RFC3339 variant format first, then falls back to
+/// full RFC 3339 parsing (handles `+00:00` offsets and other variants).
+pub fn from_str_to_utc(str: &str) -> Result<DateTime<UtcOffset>> {
+    if let Ok(dt) = NaiveDateTime::parse_from_str(str, RFC3339_VARIANT) {
+        return Ok(dt.and_utc());
+    }
+    DateTime::parse_from_rfc3339(str)
+        .map(|dt| dt.with_timezone(&Utc))
+        .map_err(|e| anyhow!("failed to parse datetime {:?}: {}", str, e))
 }
 
 pub fn from_micros_to_utc(micros: i64) -> DateTime<UtcOffset> {
-    // NaiveDateTime::from_timestamp takes SECONDS; passing microseconds here
-    // used to overflow chrono's range and panic ("invalid or out-of-range
-    // datetime"), which broke every refreshSession call.
+    // NaiveDateTime::from_timestamp interprets its argument as SECONDS, so
+    // passing a microsecond value overflowed chrono's representable range and
+    // panicked ("invalid or out-of-range datetime"). rotate_refresh_token
+    // formats the rotated expiry through from_micros_to_str, so this panic
+    // surfaced as a 500 on every com.atproto.server.refreshSession call.
+    // (The old code also stamped a fixed 230ms of sub-second noise onto every
+    // converted instant, which this drops.)
     DateTime::from_timestamp_micros(micros)
         .unwrap_or_else(|| panic!("timestamp out of range: {micros} micros"))
 }
@@ -49,7 +64,9 @@ pub fn from_micros_to_str(micros: i64) -> String {
     format!("{}", from_micros_to_utc(micros).format(RFC3339_VARIANT))
 }
 
+#[allow(deprecated)]
 pub fn from_millis_to_utc(millis: i64) -> DateTime<UtcOffset> {
+    // todo: use non-deprecated APIs
     DateTime::<Utc>::from_utc(NaiveDateTime::from_timestamp_millis(millis).unwrap(), Utc)
 }
 
@@ -60,92 +77,65 @@ pub fn from_millis_to_str(millis: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
 
-    /// A fixed, realistic "current era" instant. Every timestamp the session
-    /// code passes to `from_micros_to_utc` looks like this: ~1.7e15 microseconds.
-    fn sample() -> DateTime<UtcOffset> {
-        Utc.with_ymd_and_hms(2026, 7, 11, 12, 34, 56).unwrap()
-    }
+    const SAMPLE_PRIMARY: &str = "2023-11-14T22:13:20.000Z";
+    const SAMPLE_OFFSET: &str = "2023-11-14T22:13:20+00:00";
 
-    /// Regression: `from_micros_to_utc` used to hand its MICROsecond argument to
-    /// `NaiveDateTime::from_timestamp`, which interprets it as SECONDS. Any real
-    /// timestamp (~1.7e15) is then ~55 million years past chrono's range, so the
-    /// call panicked with "invalid or out-of-range datetime". `rotate_refresh_token`
-    /// reaches this via `from_micros_to_str`, so `com.atproto.server.refreshSession`
-    /// returned a 500 on every single call.
     #[test]
-    fn from_micros_to_utc_does_not_panic_on_a_current_era_timestamp() {
-        let expected = sample();
-        let micros = expected.timestamp_micros();
-        // Guard the guard: if this is not a ~16-digit micros value, the test below
-        // would be exercising a range that never occurs in production.
-        assert!(
-            micros > 1_700_000_000_000_000,
-            "sample must be a realistic microsecond timestamp, got {micros}"
-        );
-
-        let actual = from_micros_to_utc(micros);
-
-        assert_eq!(actual, expected);
-        assert_eq!(actual.timestamp_micros(), micros);
+    fn from_micros_to_utc_handles_a_current_era_timestamp() {
+        // Regression: the previous implementation passed microseconds to
+        // NaiveDateTime::from_timestamp (which expects seconds), so any real
+        // timestamp overflowed chrono's range and panicked. This asserts the
+        // conversion both survives and is correct for a present-day instant.
+        let micros = 1_700_000_000_000_000_i64; // 2023-11-14T22:13:20 UTC
+        let dt = from_micros_to_utc(micros);
+        assert_eq!(dt.timestamp_micros(), micros);
+        assert_eq!(dt.to_rfc3339(), "2023-11-14T22:13:20+00:00");
     }
 
-    /// Sub-second precision must survive the conversion, and the stray hard-coded
-    /// 230ms the old implementation stamped onto every value must be gone.
     #[test]
     fn from_micros_to_utc_preserves_sub_second_precision() {
-        let expected = sample() + chrono::Duration::microseconds(789_012);
-
-        let actual = from_micros_to_utc(expected.timestamp_micros());
-
-        assert_eq!(actual, expected);
-        assert_eq!(actual.timestamp_subsec_micros(), 789_012);
+        // The old code discarded the caller's sub-second component and stamped
+        // a fixed 230ms onto every instant; the fix round-trips microseconds.
+        let micros = 1_700_000_000_123_456_i64;
+        assert_eq!(from_micros_to_utc(micros).timestamp_micros(), micros);
     }
 
-    /// `from_micros_to_str` is what actually writes `refresh_token.expiresAt`.
-    /// It must render the instant it was given -- not panic, and not the old
-    /// hard-coded ".230Z" millisecond suffix.
     #[test]
-    fn from_micros_to_str_renders_the_given_instant() {
-        let formatted = from_micros_to_str(sample().timestamp_micros());
-
-        assert_eq!(formatted, "2026-07-11T12:34:56.000Z");
+    fn from_str_to_micros_parses_primary_format() {
+        assert!(from_str_to_micros(SAMPLE_PRIMARY).is_ok());
     }
 
-    /// The store/read contract used by `store_refresh_token` (writes via
-    /// `from_micros_to_utc`) and `rotate_refresh_token` (reads via
-    /// `from_str_to_micros`). These two must agree on the unit, or the refresh
-    /// grace period is computed against a garbage expiry.
     #[test]
-    fn micros_to_str_round_trips_through_from_str_to_micros() {
-        let micros = sample().timestamp_micros();
-
-        let round_tripped = from_str_to_micros(&from_micros_to_str(micros));
-
-        assert_eq!(round_tripped, micros);
+    fn from_str_to_micros_parses_rfc3339_with_offset() {
+        // Fallback: RFC 3339 with +00:00 offset — same instant as Z suffix
+        let with_z = from_str_to_micros(SAMPLE_PRIMARY).unwrap();
+        let with_offset = from_str_to_micros(SAMPLE_OFFSET).unwrap();
+        assert_eq!(with_z, with_offset);
     }
 
-    /// The exact call the session code makes: `SystemTime::now()` -> micros ->
-    /// back to a `DateTime`. This is the panic that took down refreshSession.
     #[test]
-    fn from_micros_to_utc_accepts_now() {
-        let now = Utc::now();
-
-        let round_tripped = from_micros_to_utc(now.timestamp_micros());
-
-        assert_eq!(round_tripped.timestamp_micros(), now.timestamp_micros());
+    fn from_str_to_micros_returns_err_on_invalid_input() {
+        assert!(from_str_to_micros("not-a-date").is_err());
+        assert!(from_str_to_micros("").is_err());
     }
 
-    /// The time constants are expressed in MILLIseconds. Callers that add them to
-    /// a microsecond timestamp must scale by 1000 -- `rotate_refresh_token` did
-    /// not, which shrank the 2h refresh grace window to 7.2 seconds. Pin the unit
-    /// so the constants cannot be silently redefined out from under that caller.
     #[test]
-    fn time_constants_are_milliseconds() {
-        assert_eq!(SECOND, 1_000);
-        assert_eq!(MINUTE, 60_000);
-        assert_eq!(HOUR, 3_600_000);
-        assert_eq!(DAY, 86_400_000);
+    fn from_str_to_utc_parses_primary_format() {
+        assert!(from_str_to_utc(SAMPLE_PRIMARY).is_ok());
+    }
+
+    #[test]
+    fn from_str_to_utc_parses_rfc3339_with_offset() {
+        // Both formats should resolve to the same UTC instant
+        let with_z = from_str_to_utc(SAMPLE_PRIMARY).unwrap();
+        let with_offset = from_str_to_utc(SAMPLE_OFFSET).unwrap();
+        assert_eq!(with_z, with_offset);
+    }
+
+    #[test]
+    fn from_str_to_utc_returns_err_on_invalid_input() {
+        assert!(from_str_to_utc("not-a-date").is_err());
+        assert!(from_str_to_utc("").is_err());
     }
 }

@@ -5,8 +5,8 @@ use crate::error::DataStoreError;
 use crate::mst::MST;
 use crate::storage::types::RepoStorage;
 use crate::types::{
-    CollectionContents, Commit, CommitData, RecordCreateOrUpdateOp, RecordWriteEnum, RecordWriteOp,
-    RepoContents, RepoRecord, UnsignedCommit,
+    CollectionContents, Commit, CommitData, Lex, RecordCreateOrUpdateOp, RecordWriteEnum,
+    RecordWriteOp, RepoContents, RepoRecord, UnsignedCommit,
 };
 use crate::util;
 use anyhow::{bail, Result};
@@ -20,6 +20,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+// todo: determine which of these fields are necessary to keep around
+#[allow(dead_code)]
 pub struct CommitRecord {
     collection: String,
     rkey: String,
@@ -128,7 +130,7 @@ impl Repo {
             .collect::<Vec<Cid>>();
         let storage_guard = self.storage.read().await;
         let found = storage_guard.get_blocks(cids).await?;
-        if found.missing.len() > 0 {
+        if !found.missing.is_empty() {
             return Err(anyhow::Error::new(DataStoreError::MissingBlocks(
                 "getContents record".to_owned(),
                 found.missing,
@@ -137,7 +139,7 @@ impl Repo {
         let mut contents: RepoContents = BTreeMap::new();
         for entry in entries {
             let path = util::parse_data_key(&entry.key)?;
-            if contents.get(&path.collection).is_none() {
+            if !contents.contains_key(&path.collection) {
                 contents.insert(path.collection.clone(), CollectionContents::new());
             }
             let parsed = crate::parse::get_and_parse_record(&found.blocks, entry.value)?;
@@ -152,13 +154,13 @@ impl Repo {
     pub async fn format_init_commit(
         storage: Arc<RwLock<dyn RepoStorage>>,
         did: String,
-        keypair: Keypair,
+        keypair: &Keypair,
         initial_writes: Option<Vec<RecordCreateOrUpdateOp>>,
     ) -> Result<CommitData> {
         let mut new_blocks = BlockMap::new();
         let mut data = MST::create(storage, None, None).await?;
-        for record in initial_writes.unwrap_or(Vec::new()) {
-            let cid = new_blocks.add(record.record)?;
+        for record in initial_writes.unwrap_or_default() {
+            let cid = new_blocks.add(util::lex_to_ipld(Lex::Map(record.record)))?;
             let data_key = util::format_data_key(record.collection, record.rkey);
             data = data.add(&data_key, cid, None).await?;
         }
@@ -204,7 +206,7 @@ impl Repo {
     pub async fn create(
         storage: Arc<RwLock<dyn RepoStorage>>,
         did: String,
-        keypair: Keypair,
+        keypair: &Keypair,
         initial_writes: Option<Vec<RecordCreateOrUpdateOp>>,
     ) -> Result<Self> {
         let commit =
@@ -215,7 +217,20 @@ impl Repo {
     pub async fn format_commit(
         &mut self,
         to_write: RecordWriteEnum,
-        keypair: Keypair,
+        keypair: &Keypair,
+    ) -> Result<CommitData> {
+        self.format_commit_above(to_write, keypair, None).await
+    }
+
+    /// Formats a commit whose revision exceeds both the current revision
+    /// and `floor`, so a repository restored below a revision consumers
+    /// have already seen can move past it. `since` stays the current
+    /// revision.
+    pub async fn format_commit_above(
+        &mut self,
+        to_write: RecordWriteEnum,
+        keypair: &Keypair,
+        floor: Option<&str>,
     ) -> Result<CommitData> {
         let writes = match to_write {
             RecordWriteEnum::List(to_write) => to_write,
@@ -227,12 +242,12 @@ impl Repo {
         for write in writes.clone() {
             match write {
                 RecordWriteOp::Create(write) => {
-                    let cid = leaves.add(write.record)?;
+                    let cid = leaves.add(util::lex_to_ipld(Lex::Map(write.record)))?;
                     let data_key = util::format_data_key(write.collection, write.rkey);
                     data = data.add(&data_key, cid, None).await?;
                 }
                 RecordWriteOp::Update(write) => {
-                    let cid = leaves.add(write.record)?;
+                    let cid = leaves.add(util::lex_to_ipld(Lex::Map(write.record)))?;
                     let data_key = util::format_data_key(write.collection, write.rkey);
                     data = data.update(&data_key, cid).await?;
                 }
@@ -251,21 +266,24 @@ impl Repo {
 
         let mut relevant_blocks = BlockMap::new();
         for op in writes {
-            data.add_blocks_for_path(
-                util::format_data_key(op.collection(), op.rkey()),
-                &mut relevant_blocks,
-            )
-            .await?;
+            let proof = data
+                .get_covering_proof(&util::format_data_key(op.collection(), op.rkey()))
+                .await?;
+            relevant_blocks.add_map(proof)?;
         }
 
         let added_leaves = leaves.get_many(diff.new_leaf_cids.to_list())?;
-        if added_leaves.missing.len() > 0 {
+        if !added_leaves.missing.is_empty() {
             bail!("Missing leaf blocks: {:?}", added_leaves.missing);
         }
         new_blocks.add_map(added_leaves.blocks.clone())?;
         relevant_blocks.add_map(added_leaves.blocks)?;
 
-        let rev = Ticker::new().next(Some(TID(self.commit.rev.clone())));
+        let after = match floor {
+            Some(floor) if floor > self.commit.rev.as_str() => floor.to_owned(),
+            _ => self.commit.rev.clone(),
+        };
+        let rev = Ticker::new().next(Some(TID(after)));
 
         let commit = util::sign_commit(
             UnsignedCommit {
@@ -298,7 +316,7 @@ impl Repo {
     }
 
     pub async fn apply_commit(&self, commit_data: CommitData) -> Result<Self> {
-        let commit_data_cid = commit_data.cid.clone();
+        let commit_data_cid = commit_data.cid;
         {
             let storage_guard = self.storage.read().await;
             storage_guard.apply_commit(commit_data, None).await?;
@@ -309,13 +327,13 @@ impl Repo {
     pub async fn apply_writes(
         &mut self,
         to_write: RecordWriteEnum,
-        keypair: Keypair,
+        keypair: &Keypair,
     ) -> Result<Self> {
         let commit = self.format_commit(to_write, keypair).await?;
         self.apply_commit(commit).await
     }
 
-    pub fn format_resign_commit(&self, rev: String, keypair: Keypair) -> Result<CommitData> {
+    pub fn format_resign_commit(&self, rev: String, keypair: &Keypair) -> Result<CommitData> {
         let commit = util::sign_commit(
             UnsignedCommit {
                 did: self.did(),
@@ -339,7 +357,7 @@ impl Repo {
         })
     }
 
-    pub async fn resign_commit(&mut self, rev: String, keypair: Keypair) -> Result<Self> {
+    pub async fn resign_commit(&mut self, rev: String, keypair: &Keypair) -> Result<Self> {
         let formatted = self.format_resign_commit(rev, keypair)?;
         self.apply_commit(formatted).await
     }
@@ -365,7 +383,7 @@ mod tests {
     use secp256k1::Secp256k1;
     use serde_json::json;
 
-    const TEST_COLLECTIONS: [&'static str; 2] = ["com.example.posts", "com.example.likes"];
+    const TEST_COLLECTIONS: [&str; 2] = ["com.example.posts", "com.example.likes"];
     const COLL_NAME: &str = "com.example.posts";
 
     pub struct FillRepoOutput {
@@ -401,7 +419,7 @@ mod tests {
             repo_data.insert(coll_name.to_string(), coll_data);
         }
         let writes = RecordWriteEnum::List(writes);
-        let updated = repo.apply_writes(writes, keypair).await?;
+        let updated = repo.apply_writes(writes, &keypair).await?;
         Ok(FillRepoOutput {
             repo: updated,
             data: repo_data,
@@ -462,7 +480,9 @@ mod tests {
                     claims.push(RecordCidClaim {
                         collection: coll.to_string(),
                         rkey: rkey.to_string(),
-                        cid: Some(cid_for_cbor(coll_content.get(rkey).unwrap())?),
+                        cid: Some(cid_for_cbor(&util::lex_to_ipld(Lex::Map(
+                            coll_content.get(rkey).unwrap().clone(),
+                        )))?),
                     });
                 }
             }
@@ -547,7 +567,7 @@ mod tests {
             repo_data.insert(coll_name.to_string(), coll_data);
         }
         let commit = repo
-            .format_commit(RecordWriteEnum::List(writes), keypair)
+            .format_commit(RecordWriteEnum::List(writes), &keypair)
             .await?;
         Ok(FormatEditOutput {
             commit,
@@ -561,7 +581,35 @@ mod tests {
         let secp = Secp256k1::new();
         let keypair = Keypair::new(&secp, &mut thread_rng());
         let did_key = encode_did_key(&keypair.public_key());
-        let _ = Repo::create(Arc::new(RwLock::new(storage)), did_key, keypair, None).await?;
+        let _ = Repo::create(Arc::new(RwLock::new(storage)), did_key, &keypair, None).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn formats_commits_above_a_revision_floor() -> Result<()> {
+        let storage = MemoryBlockstore::default();
+        let secp = Secp256k1::new();
+        let keypair = Keypair::new(&secp, &mut thread_rng());
+        let did_key = encode_did_key(&keypair.public_key());
+        let mut repo = Repo::create(
+            Arc::new(RwLock::new(storage)),
+            did_key.clone(),
+            &keypair,
+            None,
+        )
+        .await?;
+        let current = repo.commit.rev.clone();
+        let floor = Ticker::new().next(Some(TID(current.clone()))).to_string();
+        let above = repo
+            .format_commit_above(RecordWriteEnum::List(vec![]), &keypair, Some(&floor))
+            .await?;
+        assert!(above.rev > floor);
+        assert_eq!(above.since, Some(current.clone()));
+        // a floor below the current revision changes nothing
+        let ordinary = repo
+            .format_commit_above(RecordWriteEnum::List(vec![]), &keypair, Some("2"))
+            .await?;
+        assert!(ordinary.rev > current);
         Ok(())
     }
 
@@ -574,7 +622,7 @@ mod tests {
         let repo = Repo::create(
             Arc::new(RwLock::new(storage)),
             did_key.clone(),
-            keypair,
+            &keypair,
             None,
         )
         .await?;
@@ -592,7 +640,7 @@ mod tests {
         let mut repo = Repo::create(
             Arc::new(RwLock::new(storage)),
             did_key.clone(),
-            keypair,
+            &keypair,
             None,
         )
         .await?;
@@ -606,7 +654,7 @@ mod tests {
                     rkey: rkey.clone(),
                     record: record.clone(),
                 })),
-                keypair,
+                &keypair,
             )
             .await?;
 
@@ -624,7 +672,7 @@ mod tests {
                     rkey: rkey.clone(),
                     record: updated_record.clone(),
                 })),
-                keypair,
+                &keypair,
             )
             .await?;
         let got = repo.get_record(COLL_NAME.to_string(), rkey.clone()).await?;
@@ -639,7 +687,7 @@ mod tests {
                     collection: COLL_NAME.to_string(),
                     rkey: rkey.clone(),
                 })),
-                keypair,
+                &keypair,
             )
             .await?;
         let got = repo.get_record(COLL_NAME.to_string(), rkey.clone()).await?;
@@ -656,7 +704,7 @@ mod tests {
         let mut repo = Repo::create(
             Arc::new(RwLock::new(storage)),
             did_key.clone(),
-            keypair,
+            &keypair,
             None,
         )
         .await?;
@@ -677,7 +725,7 @@ mod tests {
         let mut repo = Repo::create(
             Arc::new(RwLock::new(storage)),
             did_key.clone(),
-            keypair,
+            &keypair,
             None,
         )
         .await?;
@@ -711,7 +759,7 @@ mod tests {
         let mut repo = Repo::create(
             Arc::new(RwLock::new(storage)),
             did_key.clone(),
-            keypair,
+            &keypair,
             None,
         )
         .await?;
@@ -745,7 +793,7 @@ mod tests {
         let mut repo = Repo::create(
             Arc::new(RwLock::new(storage)),
             did_key.clone(),
-            keypair,
+            &keypair,
             None,
         )
         .await?;
@@ -779,7 +827,7 @@ mod tests {
         let mut repo = Repo::create(
             Arc::new(RwLock::new(storage)),
             did_key.clone(),
-            keypair,
+            &keypair,
             None,
         )
         .await?;
@@ -822,7 +870,7 @@ mod tests {
         let mut repo = Repo::create(
             Arc::new(RwLock::new(blockstore)),
             did.to_string(),
-            keypair,
+            &keypair,
             None,
         )
         .await?;
@@ -839,7 +887,7 @@ mod tests {
                         rkey,
                         record: serde_json::from_value(record.clone())?,
                     })),
-                    keypair,
+                    &keypair,
                 )
                 .await?;
         }
@@ -855,7 +903,7 @@ mod tests {
                         collection: collection.to_string(),
                         rkey: keys[0].clone(),
                     })),
-                    keypair,
+                    &keypair,
                 )
                 .await?;
             let car = blocks_to_car_file(Some(&commit.cid), commit.new_blocks).await?;
@@ -881,6 +929,13 @@ mod tests {
         }
 
         for rkey in keys {
+            let data_key = util::format_data_key(collection.to_string(), rkey.clone());
+            let prev_data = repo.data.get_pointer().await?;
+            let deleted_cid = repo
+                .data
+                .get(&data_key)
+                .await?
+                .expect("record to delete is present");
             let commit = repo
                 .format_commit(
                     RecordWriteEnum::Single(RecordWriteOp::Delete(RecordDeleteOp {
@@ -888,9 +943,10 @@ mod tests {
                         collection: collection.to_string(),
                         rkey: rkey.clone(),
                     })),
-                    keypair,
+                    &keypair,
                 )
                 .await?;
+            let relevant_blocks = commit.relevant_blocks.clone();
             let car = blocks_to_car_file(Some(&commit.cid), commit.relevant_blocks.clone()).await?;
             let did_key = encode_did_key(&keypair.public_key());
             let proof_res = verify_proofs(
@@ -906,6 +962,15 @@ mod tests {
             .await?;
             assert_eq!(proof_res.unverified.len(), 0);
             repo = repo.apply_commit(commit).await?;
+
+            // The covering proof must let a consumer invert the delete holding no other blocks.
+            let new_data = repo.data.get_pointer().await?;
+            let proof_store = Arc::new(RwLock::new(
+                MemoryBlockstore::new(Some(relevant_blocks)).await?,
+            ));
+            let mut inverted = MST::load(proof_store, new_data, None)?;
+            inverted = inverted.add(&data_key, deleted_cid, None).await?;
+            assert_eq!(inverted.get_pointer().await?, prev_data);
         }
         Ok(())
     }
@@ -919,7 +984,7 @@ mod tests {
         let mut repo = Repo::create(
             Arc::new(RwLock::new(storage)),
             repo_did.to_string(),
-            keypair,
+            &keypair,
             None,
         )
         .await?;
@@ -954,7 +1019,7 @@ mod tests {
         let mut repo = Repo::create(
             Arc::new(RwLock::new(storage)),
             repo_did.to_string(),
-            keypair,
+            &keypair,
             None,
         )
         .await?;
@@ -993,7 +1058,7 @@ mod tests {
         let mut repo = Repo::create(
             Arc::new(RwLock::new(storage)),
             repo_did.to_string(),
-            keypair,
+            &keypair,
             None,
         )
         .await?;
@@ -1033,7 +1098,7 @@ mod tests {
         let mut repo = Repo::create(
             Arc::new(RwLock::new(storage)),
             repo_did.to_string(),
-            keypair,
+            &keypair,
             None,
         )
         .await?;
@@ -1074,7 +1139,7 @@ mod tests {
         let mut repo = Repo::create(
             Arc::new(RwLock::new(storage)),
             repo_did.to_string(),
-            keypair,
+            &keypair,
             None,
         )
         .await?;
@@ -1114,7 +1179,7 @@ mod tests {
         let mut repo = Repo::create(
             Arc::new(RwLock::new(storage)),
             repo_did.to_string(),
-            keypair,
+            &keypair,
             None,
         )
         .await?;
@@ -1148,13 +1213,14 @@ mod tests {
                 None => bail!("Could not find record for claim"),
                 Some(found_claim) => assert_eq!(
                     found_claim.cid,
-                    Some(cid_for_cbor(
+                    Some(cid_for_cbor(&util::lex_to_ipld(Lex::Map(
                         repo_data
                             .get(&record.collection)
                             .unwrap()
                             .get(&record.rkey)
                             .unwrap()
-                    )?)
+                            .clone()
+                    )))?)
                 ),
             }
         }
@@ -1170,7 +1236,7 @@ mod tests {
         let mut repo = Repo::create(
             Arc::new(RwLock::new(storage)),
             repo_did.to_string(),
-            keypair,
+            &keypair,
             None,
         )
         .await?;
@@ -1211,7 +1277,7 @@ mod tests {
         let mut repo = Repo::create(
             Arc::new(RwLock::new(storage)),
             repo_did.to_string(),
-            keypair,
+            &keypair,
             None,
         )
         .await?;
@@ -1244,7 +1310,6 @@ mod tests {
                 None => {
                     contents_from_ops
                         .insert(write.collection.clone(), CollectionContents::default());
-                    ()
                 }
             }
             let parsed = get_and_parse_record(&car.blocks, write.cid)?;

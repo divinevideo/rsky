@@ -163,10 +163,10 @@ impl PreparedWrite {
 
 impl From<&PreparedWrite> for CommitAction {
     fn from(value: &PreparedWrite) -> Self {
-        match value {
-            &PreparedWrite::Create(_) => CommitAction::Create,
-            &PreparedWrite::Update(_) => CommitAction::Update,
-            &PreparedWrite::Delete(_) => CommitAction::Delete,
+        match *value {
+            PreparedWrite::Create(_) => CommitAction::Create,
+            PreparedWrite::Update(_) => CommitAction::Update,
+            PreparedWrite::Delete(_) => CommitAction::Delete,
         }
     }
 }
@@ -202,10 +202,10 @@ impl From<WriteOpAction> for CommitAction {
 
 impl From<&WriteOpAction> for CommitAction {
     fn from(value: &WriteOpAction) -> Self {
-        match value {
-            &WriteOpAction::Create => CommitAction::Create,
-            &WriteOpAction::Update => CommitAction::Update,
-            &WriteOpAction::Delete => CommitAction::Delete,
+        match *value {
+            WriteOpAction::Create => CommitAction::Create,
+            WriteOpAction::Update => CommitAction::Update,
+            WriteOpAction::Delete => CommitAction::Delete,
         }
     }
 }
@@ -252,37 +252,31 @@ impl RecordWriteOp {
 
 pub fn create_write_to_op(write: PreparedCreateOrUpdate) -> Result<RecordWriteOp> {
     let write_at_uri: AtUri = write.uri.try_into()?;
-    Ok(RecordWriteOp::Create {
-        0: RecordCreateOrUpdateOp {
-            action: WriteOpAction::Create,
-            collection: write_at_uri.get_collection(),
-            rkey: write_at_uri.get_rkey(),
-            record: write.record,
-        },
-    })
+    Ok(RecordWriteOp::Create(RecordCreateOrUpdateOp {
+        action: WriteOpAction::Create,
+        collection: write_at_uri.get_collection(),
+        rkey: write_at_uri.get_rkey(),
+        record: write.record,
+    }))
 }
 
 pub fn update_write_to_op(write: PreparedCreateOrUpdate) -> Result<RecordWriteOp> {
     let write_at_uri: AtUri = write.uri.try_into()?;
-    Ok(RecordWriteOp::Update {
-        0: RecordCreateOrUpdateOp {
-            action: WriteOpAction::Update,
-            collection: write_at_uri.get_collection(),
-            rkey: write_at_uri.get_rkey(),
-            record: write.record,
-        },
-    })
+    Ok(RecordWriteOp::Update(RecordCreateOrUpdateOp {
+        action: WriteOpAction::Update,
+        collection: write_at_uri.get_collection(),
+        rkey: write_at_uri.get_rkey(),
+        record: write.record,
+    }))
 }
 
 pub fn delete_write_to_op(write: PreparedDelete) -> Result<RecordWriteOp> {
     let write_at_uri: AtUri = write.uri.try_into()?;
-    Ok(RecordWriteOp::Delete {
-        0: RecordDeleteOp {
-            action: WriteOpAction::Delete,
-            collection: write_at_uri.get_collection(),
-            rkey: write_at_uri.get_rkey(),
-        },
-    })
+    Ok(RecordWriteOp::Delete(RecordDeleteOp {
+        action: WriteOpAction::Delete,
+        collection: write_at_uri.get_collection(),
+        rkey: write_at_uri.get_rkey(),
+    }))
 }
 
 pub fn write_to_op(write: PreparedWrite) -> Result<RecordWriteOp> {
@@ -578,6 +572,7 @@ pub enum Ids {
     AppBskyNotificationGetUnreadCount,
     AppBskyNotificationListNotifications,
     AppBskyNotificationRegisterPush,
+    AppBskyNotificationUnregisterPush,
     AppBskyNotificationUpdateSeen,
     AppBskyRichtextFacet,
     AppBskyUnspeccedDefs,
@@ -773,6 +768,7 @@ impl Ids {
             Ids::AppBskyNotificationGetUnreadCount => "app.bsky.notification.getUnreadCount",
             Ids::AppBskyNotificationListNotifications => "app.bsky.notification.listNotifications",
             Ids::AppBskyNotificationRegisterPush => "app.bsky.notification.registerPush",
+            Ids::AppBskyNotificationUnregisterPush => "app.bsky.notification.unregisterPush",
             Ids::AppBskyNotificationUpdateSeen => "app.bsky.notification.updateSeen",
             Ids::AppBskyRichtextFacet => "app.bsky.richtext.facet",
             Ids::AppBskyUnspeccedDefs => "app.bsky.unspecced.defs",
@@ -824,6 +820,7 @@ impl Ids {
         }
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Result<Self> {
         match s {
             "com.atproto.admin.defs" => Ok(Ids::ComAtprotoAdminDefs),
@@ -990,6 +987,7 @@ impl Ids {
                 Ok(Ids::AppBskyNotificationListNotifications)
             }
             "app.bsky.notification.registerPush" => Ok(Ids::AppBskyNotificationRegisterPush),
+            "app.bsky.notification.unregisterPush" => Ok(Ids::AppBskyNotificationUnregisterPush),
             "app.bsky.notification.updateSeen" => Ok(Ids::AppBskyNotificationUpdateSeen),
             "app.bsky.richtext.facet" => Ok(Ids::AppBskyRichtextFacet),
             "app.bsky.unspecced.defs" => Ok(Ids::AppBskyUnspeccedDefs),

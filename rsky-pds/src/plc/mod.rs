@@ -1,10 +1,11 @@
-use crate::plc::operations::update_handle_op;
+use crate::plc::operations::{update_atproto_key_op, update_handle_op};
 use crate::plc::types::{CompatibleOp, OpOrTombstone};
 use crate::APP_USER_AGENT;
 use anyhow::{bail, Result};
+use rsky_common::encode_uri_component;
 use secp256k1::SecretKey;
 use serde::de::DeserializeOwned;
-use types::{CompatibleOpOrTombstone, DocumentData};
+use types::{AuditLogEntry, CompatibleOpOrTombstone, DocumentData};
 
 pub struct Client {
     pub url: String,
@@ -16,7 +17,7 @@ impl Client {
     }
 
     pub fn post_op_url(&self, did: &String) -> String {
-        format!("{0}/{1}", self.url, did)
+        format!("{0}/{1}", self.url, encode_uri_component(did))
     }
 
     // @TODO: Add better failure mode here
@@ -59,7 +60,25 @@ impl Client {
 
     pub async fn get_document_data(&self, did: &String) -> Result<DocumentData> {
         match self
-            .make_get_req(format!("{0}/{1}/data", self.url, did), None)
+            .make_get_req(
+                format!("{0}/{1}/data", self.url, encode_uri_component(did)),
+                None,
+            )
+            .await
+        {
+            Ok(res) => Ok(res),
+            Err(error) => bail!(error.to_string()),
+        }
+    }
+
+    /// The directory's full operation history for a DID, nullified
+    /// operations included.
+    pub async fn get_audit_log(&self, did: &String) -> Result<Vec<AuditLogEntry>> {
+        match self
+            .make_get_req(
+                format!("{0}/{1}/log/audit", self.url, encode_uri_component(did)),
+                None,
+            )
             .await
         {
             Ok(res) => Ok(res),
@@ -69,7 +88,10 @@ impl Client {
 
     pub async fn get_last_op(&self, did: &String) -> Result<CompatibleOpOrTombstone> {
         match self
-            .make_get_req(format!("{0}/{1}/log/last", self.url, did), None)
+            .make_get_req(
+                format!("{0}/{1}/log/last", self.url, encode_uri_component(did)),
+                None,
+            )
             .await
         {
             Ok(res) => Ok(res),
@@ -77,11 +99,12 @@ impl Client {
         }
     }
 
-    pub async fn ensure_last_op(&self, did: &String) -> Result<CompatibleOpOrTombstone> {
+    pub async fn ensure_last_op(&self, did: &String) -> Result<CompatibleOp> {
         let last_op: CompatibleOpOrTombstone = self.get_last_op(did).await?;
         match last_op {
             CompatibleOpOrTombstone::Tombstone(_) => bail!("Cannot apply op to tombstone"),
-            _ => Ok(last_op),
+            CompatibleOpOrTombstone::CreateOpV1(op) => Ok(CompatibleOp::CreateOpV1(op)),
+            CompatibleOpOrTombstone::Operation(op) => Ok(CompatibleOp::Operation(op)),
         }
     }
 
@@ -91,18 +114,31 @@ impl Client {
         signer: &SecretKey,
         handle: &str,
     ) -> Result<()> {
-        let last_op: CompatibleOp = match self.ensure_last_op(did).await? {
-            CompatibleOpOrTombstone::CreateOpV1(last_op) => CompatibleOp::CreateOpV1(last_op),
-            CompatibleOpOrTombstone::Operation(last_op) => CompatibleOp::Operation(last_op),
-            CompatibleOpOrTombstone::Tombstone(_) => {
-                panic!("ensure_last_op() didn't prevent tombstone")
-            }
-        };
+        let last_op = self.ensure_last_op(did).await?;
         let op = update_handle_op(last_op, signer, handle.to_owned()).await?;
+        self.send_operation(did, &OpOrTombstone::Operation(op))
+            .await
+    }
+
+    pub async fn update_atproto_key(
+        &self,
+        did: &String,
+        signer: &SecretKey,
+        signing_key: &str,
+    ) -> Result<()> {
+        let last_op = self.ensure_last_op(did).await?;
+        let op = update_atproto_key_op(last_op, signer, signing_key.to_owned()).await?;
         self.send_operation(did, &OpOrTombstone::Operation(op))
             .await
     }
 }
 
 pub mod operations;
+#[cfg(test)]
+#[path = "tests/support.rs"]
+pub(crate) mod test_support;
 pub mod types;
+
+#[cfg(test)]
+#[path = "plc_tests.rs"]
+mod tests;

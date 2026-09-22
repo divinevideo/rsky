@@ -1,24 +1,25 @@
 use crate::account_manager::helpers::account::AvailabilityFlags;
 use crate::account_manager::AccountManager;
+use crate::actor_store::ActorStore;
+use crate::apis::com::atproto::server::PDS_PLC_ROTATION_KEYPAIR;
 use crate::apis::ApiError;
-use crate::auth_verifier::AccessStandard;
+use crate::auth_verifier::scope::{NoScopeRequired, Scoped};
 use crate::config::ServerConfig;
 use rocket::serde::json::Json;
 use rocket::State;
 use rsky_crypto::utils::encode_did_key;
 use rsky_lexicon::com::atproto::identity::GetRecommendedDidCredentialsResponse;
-use secp256k1::{Keypair, Secp256k1, SecretKey};
 use serde_json::json;
-use std::env;
 
 #[tracing::instrument(skip_all)]
 #[rocket::get("/xrpc/com.atproto.identity.getRecommendedDidCredentials")]
 pub async fn get_recommended_did_credentials(
-    auth: AccessStandard,
+    auth: Scoped<NoScopeRequired>,
     cfg: &State<ServerConfig>,
+    actor_store: &State<ActorStore>,
     account_manager: AccountManager,
 ) -> Result<Json<GetRecommendedDidCredentialsResponse>, ApiError> {
-    let requester = auth.access.credentials.unwrap().did.unwrap();
+    let requester = auth.did().await?;
     let availability_flags = AvailabilityFlags {
         include_taken_down: Some(true),
         include_deactivated: Some(true),
@@ -36,12 +37,18 @@ pub async fn get_recommended_did_credentials(
         }
     }
 
-    let signing_key = get_public_signing_key()?;
+    let signing_key = match actor_store.keypair(&requester).await {
+        Ok(keypair) => encode_did_key(&keypair.public_key()),
+        Err(error) => {
+            tracing::error!("Failed to load signing key for {requester}\n{error}");
+            return Err(ApiError::RuntimeError);
+        }
+    };
     let verification_methods = json!({
         "atproto": signing_key
     });
 
-    let rotation_key = get_public_rotation_key()?;
+    let rotation_key = encode_did_key(&PDS_PLC_ROTATION_KEYPAIR.public_key());
     let rotation_keys = vec![rotation_key];
 
     let services = json!({
@@ -57,58 +64,4 @@ pub async fn get_recommended_did_credentials(
         services,
     };
     Ok(Json(response))
-}
-
-fn get_public_rotation_key() -> Result<String, ApiError> {
-    let secp = Secp256k1::new();
-    let private_rotation_key = match env::var("PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX") {
-        Ok(res) => res,
-        Err(error) => {
-            tracing::error!("Error geting rotation private key\n{error}");
-            return Err(ApiError::RuntimeError);
-        }
-    };
-    match hex::decode(private_rotation_key.as_bytes()) {
-        Ok(bytes) => match SecretKey::from_slice(&bytes) {
-            Ok(secret_key) => {
-                let rotation_keypair = Keypair::from_secret_key(&secp, &secret_key);
-                Ok(encode_did_key(&rotation_keypair.public_key()))
-            }
-            Err(error) => {
-                tracing::error!("Error geting rotation secret key from bytes\n{error}");
-                Err(ApiError::RuntimeError)
-            }
-        },
-        Err(error) => {
-            tracing::error!("Unable to hex decode rotation key\n{error}");
-            Err(ApiError::RuntimeError)
-        }
-    }
-}
-
-fn get_public_signing_key() -> Result<String, ApiError> {
-    let secp = Secp256k1::new();
-    let private_signing_key = match env::var("PDS_REPO_SIGNING_KEY_K256_PRIVATE_KEY_HEX") {
-        Ok(res) => res,
-        Err(error) => {
-            tracing::error!("Error geting signing private key\n{error}");
-            return Err(ApiError::RuntimeError);
-        }
-    };
-    match hex::decode(private_signing_key.as_bytes()) {
-        Ok(bytes) => match SecretKey::from_slice(&bytes) {
-            Ok(secret_key) => {
-                let signing_keypair = Keypair::from_secret_key(&secp, &secret_key);
-                Ok(encode_did_key(&signing_keypair.public_key()))
-            }
-            Err(error) => {
-                tracing::error!("Error geting signing secret key from bytes\n{error}");
-                Err(ApiError::RuntimeError)
-            }
-        },
-        Err(error) => {
-            tracing::error!("Unable to hex decode signing key\n{error}");
-            Err(ApiError::RuntimeError)
-        }
-    }
 }

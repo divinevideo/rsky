@@ -1,6 +1,7 @@
 use crate::account_manager::AccountManager;
-use crate::apis::com::atproto::server::get_keys_from_private_key_str;
+use crate::apis::com::atproto::server::PDS_PLC_ROTATION_KEYPAIR;
 use crate::apis::ApiError;
+use crate::auth_verifier::scope::{IdentityFull, Scoped};
 use crate::auth_verifier::AccessFull;
 use crate::models::models::EmailTokenPurpose;
 use crate::plc;
@@ -8,7 +9,7 @@ use crate::plc::operations::create_update_op;
 use crate::plc::types::{CompatibleOp, CompatibleOpOrTombstone, Operation, Service};
 use rocket::serde::json::Json;
 use rsky_common::env::env_str;
-use rsky_lexicon::com::atproto::identity::SignPlcOperationRequest;
+use rsky_lexicon::com::atproto::identity::{SignPlcOperationRequest, SignPlcOperationResponse};
 use std::collections::BTreeMap;
 
 #[rocket::post(
@@ -19,10 +20,11 @@ use std::collections::BTreeMap;
 #[tracing::instrument(skip_all)]
 pub async fn sign_plc_operation(
     body: Json<SignPlcOperationRequest>,
-    auth: AccessFull,
+    // `AccessFull` (its pre-existing tier) via the guard's default `Base`.
+    auth: Scoped<IdentityFull, AccessFull>,
     account_manager: AccountManager,
-) -> Result<Json<Operation>, ApiError> {
-    let did = auth.access.credentials.unwrap().did.unwrap();
+) -> Result<Json<SignPlcOperationResponse>, ApiError> {
+    let did = auth.did().await?;
     let request = body.into_inner();
     let token = request.token.clone();
 
@@ -50,9 +52,6 @@ pub async fn sign_plc_operation(
             return Err(ApiError::RuntimeError);
         }
     };
-
-    let private_key = env_str("PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX").unwrap();
-    let (secret_rotation_key, _) = get_keys_from_private_key_str(private_key)?;
 
     //If request doesn't contain field, check last op for field. In the case of CreateOpV1,
     // we don't set it (which is aligned with BSky Implementation
@@ -92,7 +91,7 @@ pub async fn sign_plc_operation(
     };
     let operation = match create_update_op(
         last_op,
-        &secret_rotation_key,
+        &PDS_PLC_ROTATION_KEYPAIR.secret_key(),
         |normalized: Operation| -> Operation {
             let mut updated = normalized.clone();
             if let Some(also_known_as) = &also_known_as {
@@ -119,5 +118,16 @@ pub async fn sign_plc_operation(
         }
     };
 
-    Ok(Json(operation))
+    Ok(Json(wrap_operation(operation)))
 }
+
+fn wrap_operation(operation: Operation) -> SignPlcOperationResponse {
+    // Operation consists only of strings, lists, and string-keyed maps.
+    SignPlcOperationResponse {
+        operation: serde_json::json!(operation),
+    }
+}
+
+#[cfg(test)]
+#[path = "sign_plc_operation_tests.rs"]
+mod tests;

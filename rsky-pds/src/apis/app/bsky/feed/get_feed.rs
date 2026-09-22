@@ -1,171 +1,11 @@
 use crate::apis::ApiError;
-use crate::auth_verifier::{AccessOutput, AccessStandard};
-use crate::config::ServerConfig;
+use crate::auth_verifier::scope::{RpcProxy, Scoped};
 use crate::pipethrough::{pipethrough, OverrideOpts, ProxyRequest};
 use crate::read_after_write::util::ReadAfterWriteResponse;
-use crate::xrpc_server::types::{HandlerPipeThrough, InvalidRequestError};
-use crate::{SharedATPAgent, SharedIdResolver};
-use anyhow::{anyhow, Result};
-use atrium_api::app::bsky::feed::get_feed_generator::{
-    Output as AppBskyFeedGetFeedGeneratorOutput, Parameters as AppBskyFeedGetFeedGeneratorParams,
-    ParametersData as AppBskyFeedGetFeedGeneratorData,
-};
-use ipld_core::ipld::Ipld as AtriumIpld;
-use rocket::http::Status;
-use rocket::request::{FromRequest, Outcome, Request};
-use rocket::State;
+use anyhow::Result;
 use rsky_lexicon::app::bsky::feed::AuthorFeed;
 use rsky_repo::types::Ids;
-use std::collections::BTreeMap;
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct GetFeedPipeThrough {
-    pub encoding: String,
-    #[serde(with = "serde_bytes")]
-    pub buffer: Vec<u8>,
-    pub headers: Option<BTreeMap<String, String>>,
-}
-
-#[rocket::async_trait]
-impl<'r> FromRequest<'r> for GetFeedPipeThrough {
-    type Error = anyhow::Error;
-
-    async fn from_request(req: &'r Request<'_>) -> Outcome<Self, Self::Error> {
-        match AccessStandard::from_request(req).await {
-            Outcome::Success(output) => {
-                let AccessOutput { credentials, .. } = output.access;
-                let requester: Option<String> = match credentials {
-                    None => None,
-                    Some(credentials) => credentials.did,
-                };
-                if let Some(limit) = req.query_value::<Option<u8>>("limit") {
-                    match limit {
-                        Ok(limit) => match limit {
-                            Some(limit) if limit > 100 => {
-                                req.local_cache(|| {
-                                    Some(ApiError::InvalidRequest("`limit` is invalid".to_string()))
-                                });
-                                return Outcome::Error((
-                                    Status::BadRequest,
-                                    anyhow!("`limit` is invalid"),
-                                ));
-                            }
-                            _ => (),
-                        },
-                        _ => {
-                            req.local_cache(|| {
-                                Some(ApiError::InvalidRequest("`limit` is invalid".to_string()))
-                            });
-                            return Outcome::Error((
-                                Status::BadRequest,
-                                anyhow!("`limit` is invalid"),
-                            ));
-                        }
-                    }
-                }
-                match req.query_value::<String>("feed") {
-                    Some(Ok(feed)) => {
-                        let app_view_agent = req.guard::<&State<SharedATPAgent>>().await.unwrap();
-                        let cfg = req.guard::<&State<ServerConfig>>().await.unwrap();
-                        match (&cfg.bsky_app_view, &app_view_agent.app_view_agent) {
-                            (Some(_), Some(app_view_agent_unwrapped)) => {
-                                let lock = app_view_agent_unwrapped.read().await;
-                                let AppBskyFeedGetFeedGeneratorOutput { data, .. } = match lock
-                                    .service
-                                    .app
-                                    .bsky
-                                    .feed
-                                    .get_feed_generator(AppBskyFeedGetFeedGeneratorParams {
-                                        data: AppBskyFeedGetFeedGeneratorData { feed },
-                                        extra_data: AtriumIpld::Null,
-                                    })
-                                    .await
-                                {
-                                    Ok(res) => res,
-                                    Err(error) => {
-                                        req.local_cache(|| {
-                                            Some(ApiError::InvalidRequest(error.to_string()))
-                                        });
-                                        return Outcome::Error((
-                                            Status::BadRequest,
-                                            anyhow!(error.to_string()),
-                                        ));
-                                    }
-                                };
-                                let headers = req.headers().clone().into_iter().fold(
-                                    BTreeMap::new(),
-                                    |mut acc: BTreeMap<String, String>, cur| {
-                                        let _ = acc.insert(
-                                            cur.name().to_string(),
-                                            cur.value().to_string(),
-                                        );
-                                        acc
-                                    },
-                                );
-                                let proxy_req = ProxyRequest {
-                                    headers,
-                                    query: match req.uri().query() {
-                                        None => None,
-                                        Some(query) => Some(query.to_string()),
-                                    },
-                                    path: req.uri().path().to_string(),
-                                    method: req.method(),
-                                    id_resolver: req
-                                        .guard::<&State<SharedIdResolver>>()
-                                        .await
-                                        .unwrap(),
-                                    cfg: req.guard::<&State<ServerConfig>>().await.unwrap(),
-                                };
-                                match pipethrough(
-                                    &proxy_req,
-                                    requester,
-                                    OverrideOpts {
-                                        aud: Some(data.view.did.to_string()),
-                                        lxm: Some(
-                                            Ids::AppBskyFeedGetFeedSkeleton.as_str().to_string(),
-                                        ),
-                                    },
-                                )
-                                .await
-                                {
-                                    Ok(res) => Outcome::Success(Self {
-                                        encoding: res.encoding,
-                                        buffer: res.buffer,
-                                        headers: res.headers,
-                                    }),
-                                    Err(error) => {
-                                        req.local_cache(|| {
-                                            Some(ApiError::InvalidRequest(error.to_string()))
-                                        });
-                                        Outcome::Error((Status::BadRequest, error))
-                                    }
-                                }
-                            }
-                            _ => Outcome::Error((
-                                Status::InternalServerError,
-                                anyhow!("internal error"),
-                            )),
-                        }
-                    }
-                    _ => {
-                        req.local_cache(|| {
-                            Some(ApiError::InvalidRequest("`feed` is invalid".to_string()))
-                        });
-                        Outcome::Error((Status::BadRequest, anyhow!("`feed` is invalid")))
-                    }
-                }
-            }
-            Outcome::Error(err) => {
-                req.local_cache(|| Some(ApiError::InvalidRequest(err.1.to_string())));
-                Outcome::Error((
-                    Status::BadRequest,
-                    anyhow::Error::new(InvalidRequestError::AuthError(err.1)),
-                ))
-            }
-            _ => panic!("Unexpected outcome during Pipethrough"),
-        }
-    }
-}
+use rsky_syntax::aturi::AtUri;
 
 /// Get a hydrated feed from an actor's selected feed generator. Implemented by App View.
 #[tracing::instrument(skip_all)]
@@ -173,14 +13,63 @@ impl<'r> FromRequest<'r> for GetFeedPipeThrough {
 #[rocket::get("/xrpc/app.bsky.feed.getFeed?<feed>&<limit>&<cursor>")]
 pub async fn get_feed(
     feed: String,
-    limit: Option<u8>,
+    limit: Option<String>,
     cursor: Option<String>,
-    res: GetFeedPipeThrough,
+    auth: Scoped<RpcProxy>,
+    req: ProxyRequest<'_>,
 ) -> Result<ReadAfterWriteResponse<AuthorFeed>, ApiError> {
-    let res = HandlerPipeThrough {
-        encoding: res.encoding,
-        buffer: res.buffer,
-        headers: res.headers,
+    let limit = limit
+        .map(|limit| limit.parse::<u8>())
+        .transpose()
+        .map_err(|_| ApiError::InvalidRequest("`limit` is invalid".to_string()))?;
+    if limit.is_some_and(|limit| limit > 100) {
+        return Err(ApiError::InvalidRequest("`limit` is invalid".to_string()));
+    }
+    let requester = auth.requester_did();
+    let feed_uri = AtUri::new(feed, None)
+        .map_err(|error| ApiError::InvalidRequest(format!("`feed` is invalid: {error}")))?;
+    // Resolve the generator from its record using the requester's service
+    // auth and selected app view. The generator's DID is the audience for
+    // the subsequent feed request, whose token grants getFeedSkeleton.
+    let lookup = ProxyRequest {
+        headers: req.headers.clone(),
+        query: Some(
+            url::form_urlencoded::Serializer::new(String::new())
+                .append_pair("repo", feed_uri.get_hostname())
+                .append_pair("collection", &feed_uri.get_collection())
+                .append_pair("rkey", &feed_uri.get_rkey())
+                .finish(),
+        ),
+        path: format!("/xrpc/{}", Ids::ComAtprotoRepoGetRecord.as_str()),
+        method: req.method,
+        id_resolver: req.id_resolver,
+        cfg: req.cfg,
+        actor_store: req.actor_store,
     };
-    Ok(ReadAfterWriteResponse::HandlerPipeThrough(res))
+    let record_response = pipethrough(
+        &lookup,
+        requester.clone(),
+        OverrideOpts {
+            aud: None,
+            lxm: None,
+        },
+    )
+    .await
+    .map_err(|error| ApiError::InvalidRequest(error.to_string()))?;
+    let record: serde_json::Value = serde_json::from_slice(&record_response.buffer)
+        .map_err(|error| ApiError::InvalidRequest(error.to_string()))?;
+    let generator_did = record["value"]["did"]
+        .as_str()
+        .ok_or_else(|| ApiError::InvalidRequest("could not resolve feed did".to_string()))?;
+    let response = pipethrough(
+        &req,
+        requester,
+        OverrideOpts {
+            aud: Some(generator_did.to_owned()),
+            lxm: Some(Ids::AppBskyFeedGetFeedSkeleton.as_str().to_string()),
+        },
+    )
+    .await
+    .map_err(|error| ApiError::InvalidRequest(error.to_string()))?;
+    Ok(ReadAfterWriteResponse::HandlerPipeThrough(response))
 }

@@ -1,5 +1,6 @@
 use crate::account_manager::AccountManager;
-use crate::config::{entryway_url, ServerConfig};
+use crate::config::{configured_entryway_url, ServerConfig, DEFAULT_ENTRYWAY_URL};
+use crate::oauth::SharedOAuthProvider;
 use anyhow::Result;
 use rocket::http::Status;
 use rocket::request::{FromRequest, Outcome};
@@ -7,14 +8,10 @@ use rocket::response::status;
 use rocket::serde::json::Json;
 use rocket::{Request, State};
 use serde::Serialize;
+use serde_json::Value;
 
 pub struct HostHeader(pub String);
 
-#[derive(Serialize)]
-pub struct OAuthProtectedResourceMetadata {
-    pub resource: String,
-    pub authorization_servers: Vec<String>,
-}
 #[rocket::async_trait]
 impl<'r> FromRequest<'r> for HostHeader {
     type Error = ();
@@ -34,11 +31,7 @@ pub async fn well_known(
     account_manager: AccountManager,
 ) -> Result<String, status::Custom<String>> {
     let handle = host.0;
-    let supported_handle = cfg
-        .identity
-        .service_handle_domains
-        .iter()
-        .any(|host| handle.ends_with(host.as_str()) || handle == host[1..]);
+    let supported_handle = cfg.identity.is_hosted_handle(&handle);
     if !supported_handle {
         return Err(status::Custom(
             Status::NotFound,
@@ -69,11 +62,14 @@ pub async fn well_known(
 #[rocket::get("/.well-known/oauth-protected-resource")]
 pub async fn oauth_protected_resource(
     cfg: &State<ServerConfig>,
-) -> Json<OAuthProtectedResourceMetadata> {
-    Json(OAuthProtectedResourceMetadata {
-        resource: cfg.service.public_url.clone(),
-        authorization_servers: vec![entryway_url()],
-    })
+    shared: &State<SharedOAuthProvider>,
+) -> Json<Value> {
+    let mut metadata = shared.provider.protected_resource_metadata();
+    let server = configured_entryway_url()
+        .or_else(|| cfg.identity.oauth_authorization_server.clone())
+        .unwrap_or_else(|| DEFAULT_ENTRYWAY_URL.to_string());
+    metadata["authorization_servers"] = serde_json::json!([server]);
+    Json(metadata)
 }
 
 /// did:web DID document for service-to-service auth.
@@ -111,8 +107,7 @@ struct DidService {
 pub async fn did_json(
     cfg: &State<ServerConfig>,
 ) -> Result<Json<DidDocument>, status::Custom<String>> {
-    let hostname = &cfg.service.hostname;
-    let did = format!("did:web:{}", hostname);
+    let did = format!("did:web:{}", cfg.service.hostname);
 
     // Derive public key multibase from the PDS signing key
     let signing_key_hex =
@@ -151,7 +146,7 @@ pub async fn did_json(
         service: vec![DidService {
             id: "#atproto_pds".to_string(),
             type_: "AtprotoPersonalDataServer".to_string(),
-            service_endpoint: format!("https://{}", hostname),
+            service_endpoint: cfg.service.public_url.clone(),
         }],
     }))
 }

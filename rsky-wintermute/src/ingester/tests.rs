@@ -57,9 +57,11 @@ mod ingester_tests {
                     action: action.to_owned(),
                     path: path.to_owned(),
                     cid: cid.and_then(|c| Cid::try_from(c).ok()),
+                    prev: None,
                 })
                 .collect(),
             blobs: vec![],
+            prev_data: None,
         };
 
         let mut result = Vec::new();
@@ -262,6 +264,7 @@ mod ingester_tests {
                 rev: "test-rev-123".to_owned(),
                 ops: vec![],
                 blocks: vec![10, 20, 30],
+                cid: None,
             }),
             identity: None,
             account: None,
@@ -385,6 +388,7 @@ mod ingester_tests {
                     rev: "rev1".to_owned(),
                     ops: vec![],
                     blocks: vec![],
+                    cid: None,
                 }),
                 identity: None,
                 account: None,
@@ -398,6 +402,7 @@ mod ingester_tests {
                     rev: "rev2".to_owned(),
                     ops: vec![],
                     blocks: vec![],
+                    cid: None,
                 }),
                 identity: None,
                 account: None,
@@ -411,6 +416,7 @@ mod ingester_tests {
                     rev: "rev3".to_owned(),
                     ops: vec![],
                     blocks: vec![],
+                    cid: None,
                 }),
                 identity: None,
                 account: None,
@@ -828,6 +834,8 @@ mod ingester_tests {
             time: "2024-01-01T00:00:00Z".to_owned(),
             kind: "commit".to_owned(),
             commit: Some(CommitData {
+                cid: None,
+
                 rev: "rev-abc".to_owned(),
                 ops: vec![
                     RepoOp {
@@ -866,8 +874,8 @@ mod ingester_tests {
             .await
             .unwrap();
 
-        // Should have 3 jobs (one for each operation)
-        assert_eq!(storage.firehose_live_len().unwrap(), 3);
+        // one job per operation, then the commit itself
+        assert_eq!(storage.firehose_live_len().unwrap(), 4);
 
         // Dequeue and verify jobs (order not guaranteed)
         let mut jobs = Vec::new();
@@ -876,7 +884,13 @@ mod ingester_tests {
             storage.remove_firehose_live(&key).unwrap();
         }
 
-        assert_eq!(jobs.len(), 3);
+        assert_eq!(jobs.len(), 4);
+        assert_eq!(
+            jobs.iter()
+                .filter(|j| matches!(j.action, crate::types::WriteAction::Commit))
+                .count(),
+            1
+        );
 
         // Verify we have one of each action type
         assert_eq!(
@@ -931,16 +945,22 @@ mod ingester_tests {
                 rev: "rev-abc".to_owned(),
                 ops: vec![], // No operations
                 blocks: vec![],
+                cid: None,
             }),
             identity: None,
             account: None,
         };
 
-        // Should succeed but not enqueue anything
+        // no record job, but the commit itself is queued so that progress
+        // records it
         IngesterManager::enqueue_event_for_indexing(&storage, &event)
             .await
             .unwrap();
-        assert_eq!(storage.firehose_live_len().unwrap(), 0);
+        assert_eq!(storage.firehose_live_len().unwrap(), 1);
+        let (_, job) = storage.dequeue_firehose_live().unwrap().unwrap();
+        assert!(matches!(job.action, crate::types::WriteAction::Commit));
+        assert_eq!(job.uri, format!("at://{}", event.did));
+        assert_eq!(job.rev, "rev-abc");
     }
 
     #[tokio::test]
@@ -964,5 +984,321 @@ mod ingester_tests {
             .await
             .unwrap();
         assert_eq!(storage.firehose_live_len().unwrap(), 0);
+    }
+
+    mod account_event_time_guard {
+        use crate::ingester::IngesterManager;
+        use deadpool_postgres::{Config, ManagerConfig, Pool, RecyclingMethod, Runtime};
+        use tokio_postgres::NoTls;
+
+        fn setup_test_pool() -> Pool {
+            let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+                "postgresql://postgres:postgres@localhost:5432/bsky_test".to_owned()
+            });
+            let mut pg_config = Config::new();
+            pg_config.url = Some(database_url);
+            pg_config.manager = Some(ManagerConfig {
+                recycling_method: RecyclingMethod::Fast,
+            });
+            pg_config.create_pool(Some(Runtime::Tokio1), NoTls).unwrap()
+        }
+
+        async fn seed_actor(pool: &Pool, did: &str) {
+            let client = pool.get().await.unwrap();
+            client
+                .execute("DELETE FROM actor WHERE did = $1", &[&did])
+                .await
+                .unwrap();
+            // actor.handle is unique in the canonical schema; derive one per did
+            let handle = format!("{}.test", did.rsplit(':').next().unwrap());
+            client
+                .execute(
+                    "INSERT INTO actor (did, handle, \"indexedAt\") VALUES ($1, $2, NOW()) \
+                     ON CONFLICT (did) DO UPDATE SET handle = EXCLUDED.handle, \
+                     \"upstreamStatus\" = NULL, \"accountEventAt\" = NULL",
+                    &[&did, &handle],
+                )
+                .await
+                .unwrap();
+        }
+
+        async fn read_actor(
+            pool: &Pool,
+            did: &str,
+        ) -> (Option<String>, Option<chrono::DateTime<chrono::Utc>>) {
+            let client = pool.get().await.unwrap();
+            let row = client
+                .query_one(
+                    "SELECT \"upstreamStatus\", \"accountEventAt\" FROM actor WHERE did = $1",
+                    &[&did],
+                )
+                .await
+                .unwrap();
+            (row.get(0), row.get(1))
+        }
+
+        #[tokio::test]
+        async fn applies_first_event_when_column_is_null() {
+            let pool = setup_test_pool();
+            let did = "did:plc:wintermute-test-first-event";
+            seed_actor(&pool, did).await;
+
+            IngesterManager::process_account_event(
+                &pool,
+                did,
+                "2026-06-10T12:00:00Z",
+                false,
+                Some("deactivated"),
+            )
+            .await
+            .unwrap();
+
+            let (status, at) = read_actor(&pool, did).await;
+            assert_eq!(status.as_deref(), Some("deactivated"));
+            assert_eq!(
+                at,
+                Some(
+                    "2026-06-10T12:00:00Z"
+                        .parse::<chrono::DateTime<chrono::Utc>>()
+                        .unwrap()
+                )
+            );
+        }
+
+        #[tokio::test]
+        async fn newer_time_overwrites_older() {
+            let pool = setup_test_pool();
+            let did = "did:plc:wintermute-test-newer-time";
+            seed_actor(&pool, did).await;
+
+            IngesterManager::process_account_event(
+                &pool,
+                did,
+                "2026-06-10T12:00:00Z",
+                false,
+                Some("deactivated"),
+            )
+            .await
+            .unwrap();
+            IngesterManager::process_account_event(&pool, did, "2026-06-10T12:00:05Z", true, None)
+                .await
+                .unwrap();
+
+            let (status, at) = read_actor(&pool, did).await;
+            assert!(status.is_none(), "expected active row, got {status:?}");
+            assert_eq!(
+                at,
+                Some(
+                    "2026-06-10T12:00:05Z"
+                        .parse::<chrono::DateTime<chrono::Utc>>()
+                        .unwrap()
+                )
+            );
+        }
+
+        #[tokio::test]
+        async fn stale_event_does_not_clobber_newer_state() {
+            let pool = setup_test_pool();
+            let did = "did:plc:wintermute-test-stale-event";
+            seed_actor(&pool, did).await;
+
+            IngesterManager::process_account_event(&pool, did, "2026-06-10T12:00:05Z", true, None)
+                .await
+                .unwrap();
+            IngesterManager::process_account_event(
+                &pool,
+                did,
+                "2026-06-10T12:00:00Z",
+                false,
+                Some("deactivated"),
+            )
+            .await
+            .unwrap();
+
+            let (status, at) = read_actor(&pool, did).await;
+            assert!(status.is_none(), "stale deactivate clobbered active state");
+            assert_eq!(
+                at,
+                Some(
+                    "2026-06-10T12:00:05Z"
+                        .parse::<chrono::DateTime<chrono::Utc>>()
+                        .unwrap()
+                )
+            );
+        }
+
+        #[tokio::test]
+        async fn equal_time_is_idempotent_noop() {
+            let pool = setup_test_pool();
+            let did = "did:plc:wintermute-test-equal-time";
+            seed_actor(&pool, did).await;
+
+            IngesterManager::process_account_event(
+                &pool,
+                did,
+                "2026-06-10T12:00:00Z",
+                false,
+                Some("deactivated"),
+            )
+            .await
+            .unwrap();
+            IngesterManager::process_account_event(&pool, did, "2026-06-10T12:00:00Z", true, None)
+                .await
+                .unwrap();
+
+            let (status, _at) = read_actor(&pool, did).await;
+            assert_eq!(
+                status.as_deref(),
+                Some("deactivated"),
+                "equal-time replay should not overwrite"
+            );
+        }
+
+        #[tokio::test]
+        async fn malformed_time_returns_error() {
+            let pool = setup_test_pool();
+            let did = "did:plc:wintermute-test-malformed-time";
+            seed_actor(&pool, did).await;
+
+            let err =
+                IngesterManager::process_account_event(&pool, did, "not-a-timestamp", true, None)
+                    .await
+                    .unwrap_err();
+            assert!(
+                err.to_string().contains("invalid account event time"),
+                "unexpected error: {err}"
+            );
+
+            let (status, at) = read_actor(&pool, did).await;
+            assert!(status.is_none());
+            assert!(at.is_none());
+        }
+    }
+
+    mod identity_event_upsert {
+        use crate::ingester::IngesterManager;
+        use deadpool_postgres::{Config, ManagerConfig, Pool, RecyclingMethod, Runtime};
+        use tokio_postgres::NoTls;
+
+        fn setup_test_pool() -> Pool {
+            let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+                "postgresql://postgres:postgres@localhost:5432/bsky_test".to_owned()
+            });
+            let mut pg_config = Config::new();
+            pg_config.url = Some(database_url);
+            pg_config.manager = Some(ManagerConfig {
+                recycling_method: RecyclingMethod::Fast,
+            });
+            pg_config.create_pool(Some(Runtime::Tokio1), NoTls).unwrap()
+        }
+
+        async fn delete_actor(pool: &Pool, did: &str) {
+            let client = pool.get().await.unwrap();
+            client
+                .execute("DELETE FROM actor WHERE did = $1", &[&did])
+                .await
+                .unwrap();
+        }
+
+        async fn read_handle(pool: &Pool, did: &str) -> Option<Option<String>> {
+            let client = pool.get().await.unwrap();
+            client
+                .query_opt("SELECT handle FROM actor WHERE did = $1", &[&did])
+                .await
+                .unwrap()
+                .map(|row| row.get(0))
+        }
+
+        #[tokio::test]
+        async fn creates_actor_row_for_unseen_did() {
+            let pool = setup_test_pool();
+            let did = "did:plc:wintermute-test-identity-new";
+            delete_actor(&pool, did).await;
+
+            IngesterManager::process_identity_event(
+                &pool,
+                did,
+                "2026-07-29T12:00:00.000Z",
+                Some("Identity-New.Test"),
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(
+                read_handle(&pool, did).await,
+                Some(Some("identity-new.test".to_owned()))
+            );
+            delete_actor(&pool, did).await;
+        }
+
+        #[tokio::test]
+        async fn updates_handle_for_known_did() {
+            let pool = setup_test_pool();
+            let did = "did:plc:wintermute-test-identity-known";
+            delete_actor(&pool, did).await;
+            let client = pool.get().await.unwrap();
+            let inserted = client
+                .execute(
+                    "INSERT INTO actor (did, handle, \"indexedAt\") \
+                     VALUES ($1, 'identity-old.test', '2026-01-01T00:00:00.000Z')",
+                    &[&did],
+                )
+                .await
+                .unwrap();
+            assert_eq!(inserted, 1);
+
+            IngesterManager::process_identity_event(
+                &pool,
+                did,
+                "2026-07-29T12:00:00.000Z",
+                Some("identity-renamed.test"),
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(
+                read_handle(&pool, did).await,
+                Some(Some("identity-renamed.test".to_owned()))
+            );
+            delete_actor(&pool, did).await;
+        }
+    }
+
+    mod pds_verification {
+        use crate::ingester::parse_active_flag;
+
+        #[test]
+        fn typical_active_true() {
+            let body = r#"{"did":"did:plc:abc","active":true,"rev":"3xx"}"#;
+            assert_eq!(parse_active_flag(body), Some(true));
+        }
+
+        #[test]
+        fn deactivated_with_status() {
+            let body = r#"{"did":"did:plc:abc","active":false,"status":"deactivated"}"#;
+            assert_eq!(parse_active_flag(body), Some(false));
+        }
+
+        #[test]
+        fn missing_active_field() {
+            let body = r#"{"did":"did:plc:abc"}"#;
+            assert_eq!(parse_active_flag(body), None);
+        }
+
+        #[test]
+        fn non_boolean_active() {
+            let body = r#"{"did":"did:plc:abc","active":"yes"}"#;
+            assert_eq!(parse_active_flag(body), None);
+        }
+
+        #[test]
+        fn malformed_json() {
+            assert_eq!(parse_active_flag("not json"), None);
+        }
+
+        #[test]
+        fn empty_body() {
+            assert_eq!(parse_active_flag(""), None);
+        }
     }
 }

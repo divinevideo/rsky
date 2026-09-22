@@ -1,47 +1,47 @@
 use crate::account_manager::AccountManager;
-use crate::actor_store::aws::s3::S3BlobStore;
+use crate::actor_store::blobstore::BlobstoreFactory;
 use crate::actor_store::ActorStore;
 use crate::apis::com::atproto::server::is_valid_did_doc_for_service;
 use crate::apis::ApiError;
+use crate::auth_verifier::scope::{NoScopeRequired, Scoped};
 use crate::auth_verifier::AccessFull;
-use crate::db::DbConn;
 use anyhow::Result;
-use aws_config::SdkConfig;
 use futures::try_join;
 use rocket::serde::json::Json;
 use rocket::State;
 use rsky_lexicon::com::atproto::server::CheckAccountStatusOutput;
 
 async fn inner_check_account_status(
-    auth: AccessFull,
-    s3_config: &State<SdkConfig>,
-    db: DbConn,
+    auth: Scoped<NoScopeRequired, AccessFull>,
+    blobstore_factory: &State<BlobstoreFactory>,
+    actor_store: &State<ActorStore>,
     account_manager: AccountManager,
 ) -> Result<CheckAccountStatusOutput> {
-    let requester = auth.access.credentials.unwrap().did.unwrap();
+    let requester = auth.did().await?;
 
-    let mut actor_store = ActorStore::new(
-        requester.clone(),
-        S3BlobStore::new(requester.clone(), s3_config),
-        db,
-    );
+    let mut reader = actor_store
+        .read(
+            requester.clone(),
+            blobstore_factory.blobstore(requester.clone()),
+        )
+        .await?;
     let repo_root = {
-        let storage_guard = actor_store.storage.read().await;
+        let storage_guard = reader.storage.read().await;
         storage_guard.get_root_detailed().await?
     };
     let repo_blocks = {
-        let storage_guard = actor_store.storage.read().await;
+        let storage_guard = reader.storage.read().await;
         storage_guard.count_blocks().await?
     };
     let (indexed_records, imported_blobs, expected_blobs) = try_join!(
-        actor_store.record.record_count(),
-        actor_store.blob.blob_count(),
-        actor_store.blob.record_blob_count(),
+        reader.record.record_count(),
+        reader.blob.blob_count(),
+        reader.blob.record_blob_count(),
     )?;
 
     let (activated, valid_did) = try_join!(
         account_manager.is_account_activated(&requester),
-        is_valid_did_doc_for_service(requester.clone())
+        is_valid_did_doc_for_service(actor_store, requester.clone())
     )?;
 
     Ok(CheckAccountStatusOutput {
@@ -60,12 +60,12 @@ async fn inner_check_account_status(
 #[tracing::instrument(skip_all)]
 #[rocket::get("/xrpc/com.atproto.server.checkAccountStatus")]
 pub async fn check_account_status(
-    auth: AccessFull,
-    s3_config: &State<SdkConfig>,
-    db: DbConn,
+    auth: Scoped<NoScopeRequired, AccessFull>,
+    blobstore_factory: &State<BlobstoreFactory>,
+    actor_store: &State<ActorStore>,
     account_manager: AccountManager,
 ) -> Result<Json<CheckAccountStatusOutput>, ApiError> {
-    match inner_check_account_status(auth, s3_config, db, account_manager).await {
+    match inner_check_account_status(auth, blobstore_factory, actor_store, account_manager).await {
         Ok(res) => Ok(Json(res)),
         Err(error) => {
             tracing::error!("Internal Error: {error}");

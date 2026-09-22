@@ -28,3 +28,26 @@ pub fn sha256_to_cid(hash: Vec<u8>) -> Cid {
     );
     cid
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sha256_to_cid_uses_raw_codec() {
+        let hash = Sha256::digest(b"").to_vec();
+        let cid = sha256_to_cid(hash);
+        assert_eq!(cid.codec(), 0x55);
+        // CIDv1 raw sha2-256 of empty input
+        assert_eq!(
+            cid.to_string(),
+            "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku"
+        );
+    }
+
+    #[test]
+    fn cid_for_cbor_uses_dag_cbor_codec() {
+        let cid = cid_for_cbor(&serde_json::json!({"a": 1})).unwrap();
+        assert_eq!(cid.codec(), 0x71);
+    }
+}

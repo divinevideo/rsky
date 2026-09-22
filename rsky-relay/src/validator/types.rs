@@ -1,3 +1,10 @@
+// MST implementation tracking indigo/atproto/repo/mst/{node,node_insert,node_remove,encoding}.go.
+// Each `TODO` below is mirrored from the corresponding upstream comment; do NOT fix them in
+// isolation — diverging from indigo creates real correctness drift on cross-implementation
+// MST inversion. Strict-mode improvements should port indigo's interop test fixtures
+// (atproto/repo/mst/testdata/) and run them against this implementation before changing
+// algorithm behavior. Lenient mode (default in production) bypasses this verifier on failure
+// per AT Protocol relay-validator-discretion.
 use std::cmp::Ordering;
 use std::{io, mem};
 
@@ -270,7 +277,7 @@ impl Node {
         // compute this block
         let nd = NodeData::from_node(self)?;
         let cc = cid_for_cbor(&nd)
-            .map_err(|error| serde_ipld_dagcbor::EncodeError::Msg(format!("{}", error)))?;
+            .map_err(|error| serde_ipld_dagcbor::EncodeError::Msg(format!("{error}")))?;
         self.cid = Some(cc);
         self.dirty = false;
         Ok(cc)
@@ -302,7 +309,7 @@ impl Node {
         // look for existing key
         if let Some(idx) = self.find_value(path) {
             let NodeEntry::Value { value, dirty, .. } = &mut self.entries[idx] else {
-                unreachable!()
+                return Err(InvertError::MalformedTreeNode);
             };
             if *value == val {
                 // same value already exists; no-op
@@ -333,7 +340,9 @@ impl Node {
         }
 
         // we need to split
-        let NodeEntry::Child { child, .. } = &mut self.entries[idx] else { unreachable!() };
+        let NodeEntry::Child { child, .. } = &mut self.entries[idx] else {
+            return Err(InvertError::MalformedTreeNode);
+        };
         // remove the existing entry, and replace with three new entries
         let (left, right) = child.take().ok_or(InvertError::PartialTree)?.split(path)?;
         let left_entry = NodeEntry::Child { cid: None, child: Some(left), dirty: true };
@@ -365,7 +374,9 @@ impl Node {
     ) -> Result<Option<Cid>, InvertError> {
         // look for an existing child node which encompasses the key, and use that
         if let Some(idx) = self.find_child(path) {
-            let NodeEntry::Child { child, .. } = &mut self.entries[idx] else { unreachable!() };
+            let NodeEntry::Child { child, .. } = &mut self.entries[idx] else {
+                return Err(InvertError::MalformedTreeNode);
+            };
             let Some(child) = child else {
                 return Err(InvertError::PartialTree);
             };
@@ -410,7 +421,9 @@ impl Node {
 
         // need to split recursively
         let mut right_entries = self.entries.split_off(idx);
-        let NodeEntry::Child { child, .. } = &mut right_entries[0] else { unreachable!() };
+        let NodeEntry::Child { child, .. } = &mut right_entries[0] else {
+            return Err(InvertError::MalformedTreeNode);
+        };
         let (left_node, right_node) = child.take().ok_or(InvertError::PartialTree)?.split(path)?;
         self.entries.push(NodeEntry::Child { cid: None, child: Some(left_node), dirty: true });
         let left =
@@ -468,7 +481,9 @@ impl Node {
 
         // found it! will remove from list
         self.dirty = true;
-        let NodeEntry::Value { value: prev, .. } = self.entries[idx] else { unreachable!() };
+        let NodeEntry::Value { value: prev, .. } = self.entries[idx] else {
+            return Err(InvertError::MalformedTreeNode);
+        };
 
         // check if we need to "merge" adjacent nodes
         if idx > 0
@@ -497,7 +512,7 @@ impl Node {
                     break;
                 }
                 let NodeEntry::Child { cid, child, .. } = self.entries.remove(0) else {
-                    unreachable!()
+                    return Err(InvertError::MalformedTreeNode);
                 };
                 *self = if let Some(child) = child {
                     child
@@ -528,7 +543,9 @@ impl Node {
             return Ok(None);
         };
 
-        let NodeEntry::Child { child, .. } = &mut self.entries[idx] else { unreachable!() };
+        let NodeEntry::Child { child, .. } = &mut self.entries[idx] else {
+            return Err(InvertError::MalformedTreeNode);
+        };
         let Some(child) = child else {
             // partial node, can't recurse
             return Err(InvertError::PartialTree);
@@ -589,7 +606,7 @@ impl Node {
                         }
                     }
                     let NodeEntry::Child { child, .. } = &mut self.entries[idx] else {
-                        unreachable!()
+                        return Err(InvertError::MalformedTreeNode);
                     };
                     let Some(child) = child else {
                         return Err(InvertError::PartialTree);
@@ -655,7 +672,7 @@ impl Node {
                         }
                     }
                     let NodeEntry::Child { child, .. } = &mut self.entries[idx] else {
-                        unreachable!()
+                        return Err(InvertError::MalformedTreeNode);
                     };
                     let Some(child) = child else {
                         return Err(InvertError::PartialTree);
@@ -699,7 +716,7 @@ impl Node {
                         }
                     }
                     let NodeEntry::Child { child, .. } = &mut self.entries[idx] else {
-                        unreachable!()
+                        return Err(InvertError::MalformedTreeNode);
                     };
                     let Some(child) = child else {
                         return Err(InvertError::PartialTreeInsertionOrderError);

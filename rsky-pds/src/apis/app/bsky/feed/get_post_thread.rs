@@ -1,10 +1,9 @@
 use crate::account_manager::AccountManager;
-use crate::actor_store::aws::s3::S3BlobStore;
+use crate::actor_store::blobstore::BlobstoreFactory;
 use crate::actor_store::ActorStore;
 use crate::apis::ApiError;
-use crate::auth_verifier::AccessStandard;
+use crate::auth_verifier::scope::{RpcProxy, Scoped};
 use crate::config::ServerConfig;
-use crate::db::DbConn;
 use crate::models::{ErrorCode, ErrorMessageResponse};
 use crate::read_after_write::types::{LocalRecords, RecordDescript};
 use crate::read_after_write::util::{
@@ -21,7 +20,6 @@ use atrium_api::app::bsky::feed::get_post_thread::{
 use atrium_api::client::AtpServiceClient;
 use atrium_api::types::LimitedU16;
 use atrium_xrpc_client::reqwest::ReqwestClientBuilder;
-use aws_config::SdkConfig;
 use futures::stream::{self, StreamExt};
 use ipld_core::ipld::Ipld as AtriumIpld;
 use reqwest::header::HeaderMap;
@@ -42,24 +40,22 @@ pub struct ReadAfterWriteNotFoundOutput {
     pub lag: Option<usize>,
 }
 
-#[allow(non_snake_case)]
-#[allow(unused_variables)]
+#[allow(unused_variables, non_snake_case, clippy::too_many_arguments)]
 pub async fn inner_get_post_thread(
     uri: String,
     depth: u16,
     parentHeight: u16,
-    auth: AccessStandard,
+    auth: Scoped<RpcProxy>,
     res: Result<HandlerPipeThrough>,
-    s3_config: &State<SdkConfig>,
+    blobstore_factory: &State<BlobstoreFactory>,
     state_local_viewer: &State<SharedLocalViewer>,
     cfg: &State<ServerConfig>,
-    db: DbConn,
+    actor_store: &State<ActorStore>,
     account_manager: AccountManager,
 ) -> Result<ReadAfterWriteResponse<GetPostThreadOutput>> {
-    let requester: String = match auth.access.credentials {
-        None => "".to_string(),
-        Some(credentials) => credentials.did.unwrap_or("".to_string()),
-    };
+    let requester: String = auth
+        .requester_did()
+        .ok_or_else(|| anyhow!("Missing account did on authenticated request"))?;
     match res {
         Ok(res) => {
             let read_afer_write_response = handle_read_after_write(
@@ -67,12 +63,12 @@ pub async fn inner_get_post_thread(
                 requester,
                 res,
                 get_post_thread_munge,
-                s3_config,
+                blobstore_factory,
                 state_local_viewer,
-                db,
+                actor_store,
                 account_manager,
             )
-            .await?;
+            .await;
             Ok(read_afer_write_response)
         }
         Err(err) => match err.downcast_ref() {
@@ -86,11 +82,12 @@ pub async fn inner_get_post_thread(
                 {
                     match error {
                         Some(error) if error == "NotFound" => {
-                            let actor_store = ActorStore::new(
-                                requester.clone(),
-                                S3BlobStore::new(requester.clone(), s3_config),
-                                db,
-                            );
+                            let actor_store = actor_store
+                                .read(
+                                    requester.clone(),
+                                    blobstore_factory.blobstore(requester.clone()),
+                                )
+                                .await?;
                             let local_viewer_lock = state_local_viewer.local_viewer.read().await;
                             let local_viewer = local_viewer_lock(actor_store, account_manager);
                             let local = read_after_write_not_found(
@@ -122,20 +119,19 @@ pub async fn inner_get_post_thread(
 
 /// Get posts in a thread. Does not require auth, but additional metadata and filtering
 /// will be applied for authed requests.
-#[allow(non_snake_case)]
-#[allow(unused_variables)]
+#[allow(unused_variables, non_snake_case, clippy::too_many_arguments)]
 #[tracing::instrument(skip_all)]
 #[rocket::get("/xrpc/app.bsky.feed.getPostThread?<uri>&<depth>&<parentHeight>")]
 pub async fn get_post_thread(
     uri: String,               // Reference (AT-URI) to post record.
     depth: Option<u16>,        // How many levels of reply depth should be included in response.
     parentHeight: Option<u16>, // How many levels of parent (and grandparent, etc.) post to include.
-    auth: AccessStandard,
+    auth: Scoped<RpcProxy>,
     res: Result<HandlerPipeThrough>,
-    s3_config: &State<SdkConfig>,
+    blobstore_factory: &State<BlobstoreFactory>,
     state_local_viewer: &State<SharedLocalViewer>,
     cfg: &State<ServerConfig>,
-    db: DbConn,
+    actor_store: &State<ActorStore>,
     account_manager: AccountManager,
 ) -> Result<ReadAfterWriteResponse<GetPostThreadOutput>, ApiError> {
     let depth = depth.unwrap_or(6);
@@ -153,10 +149,10 @@ pub async fn get_post_thread(
             parentHeight,
             auth,
             res,
-            s3_config,
+            blobstore_factory,
             state_local_viewer,
             cfg,
-            db,
+            actor_store,
             account_manager,
         )
         .await
@@ -173,17 +169,11 @@ pub async fn get_post_thread(
                         } = xrpc
                         {
                             let xrpc_error = ErrorMessageResponse {
-                                code: match error {
-                                    None => None,
-                                    Some(error) => Some(
-                                        ErrorCode::from_str(error)
-                                            .unwrap_or(ErrorCode::InternalServerError),
-                                    ),
-                                },
-                                message: match message {
-                                    None => None,
-                                    Some(message) => Some(message.to_string()),
-                                },
+                                code: error.as_ref().map(|error| {
+                                    ErrorCode::from_str(error)
+                                        .unwrap_or(ErrorCode::InternalServerError)
+                                }),
+                                message: message.as_ref().map(|message| message.to_string()),
                             };
                             Err(ApiError::BadRequest(
                                 "XRPCError".to_string(),
@@ -228,7 +218,7 @@ pub async fn add_posts_to_thread(
     posts: Vec<RecordDescript<Post>>,
 ) -> Result<ThreadViewPost> {
     let in_thread = find_posts_in_thread(&original, posts);
-    if in_thread.len() == 0 {
+    if in_thread.is_empty() {
         return Ok(original);
     }
     let mut thread = original;
@@ -411,8 +401,12 @@ pub async fn read_after_write_not_found(
                                                 let nsid = Ids::AppBskyFeedGetPostThread
                                                     .as_str()
                                                     .to_string();
+                                                let keypair =
+                                                    local_viewer.actor_store.keypair().await?;
                                                 let headers = cfg
-                                                    .appview_auth_headers(&requester, &nsid)
+                                                    .appview_auth_headers(
+                                                        &requester, &nsid, &keypair,
+                                                    )
                                                     .await?;
                                                 let client = ReqwestClientBuilder::new(
                                                     bsky_app_view.url.clone(),

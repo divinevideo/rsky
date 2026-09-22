@@ -1,33 +1,38 @@
 use crate::account_manager::helpers::account::AvailabilityFlags;
 use crate::account_manager::AccountManager;
-use crate::actor_store::aws::s3::S3BlobStore;
+use crate::actor_store::blobstore::BlobstoreFactory;
 use crate::actor_store::ActorStore;
 use crate::apis::ApiError;
+use crate::auth_verifier::scope::{RepoTarget, RepoWrite, Scoped};
 use crate::auth_verifier::AccessStandardIncludeChecks;
-use crate::db::DbConn;
+use crate::metrics::record_repo_write;
+use crate::publication;
+use crate::rate_limits::{Caller, RateLimits};
 use crate::repo::prepare::{
     prepare_create, prepare_delete, prepare_update, PrepareCreateOpts, PrepareDeleteOpts,
     PrepareUpdateOpts,
 };
 use crate::SharedSequencer;
 use anyhow::{bail, Result};
-use aws_config::SdkConfig;
 use futures::stream::{self, StreamExt};
 use lexicon_cid::Cid;
 use rocket::serde::json::Json;
 use rocket::State;
-use rsky_lexicon::com::atproto::repo::{ApplyWritesInput, ApplyWritesInputRefWrite};
+use rsky_lexicon::com::atproto::repo::{
+    ApplyWritesInput, ApplyWritesInputRefWrite, ApplyWritesOutput, ApplyWritesOutputResult,
+    ApplyWritesResultCreate, ApplyWritesResultDelete, ApplyWritesResultUpdate, CommitMeta,
+};
 use rsky_repo::types::PreparedWrite;
 use std::str::FromStr;
 
 async fn inner_apply_writes(
     body: Json<ApplyWritesInput>,
-    auth: AccessStandardIncludeChecks,
+    requester: String,
     sequencer: &State<SharedSequencer>,
-    s3_config: &State<SdkConfig>,
-    db: DbConn,
+    blobstore_factory: &State<BlobstoreFactory>,
+    actor_store: &State<ActorStore>,
     account_manager: AccountManager,
-) -> Result<()> {
+) -> Result<ApplyWritesOutput> {
     let tx: ApplyWritesInput = body.into_inner();
     let ApplyWritesInput {
         repo,
@@ -50,13 +55,10 @@ async fn inner_apply_writes(
             bail!("Account is deactivated")
         }
         let did = account.did;
-        if did != auth.access.credentials.unwrap().did.unwrap() {
+        if did != requester {
             bail!("AuthRequiredError")
         }
         let did: &String = &did;
-        if tx.writes.len() > 200 {
-            bail!("Too many writes. Max: 200")
-        }
 
         let writes: Vec<PreparedWrite> = stream::iter(tx.writes)
             .then(|write| async move {
@@ -103,44 +105,120 @@ async fn inner_apply_writes(
             None => None,
         };
 
-        let mut actor_store =
-            ActorStore::new(did.clone(), S3BlobStore::new(did.clone(), s3_config), db);
+        let mut actor_txn = actor_store
+            .transact(did.clone(), blobstore_factory.blobstore(did.clone()))
+            .await?;
 
-        let commit = actor_store
+        let commit = actor_txn
             .process_writes(writes.clone(), swap_commit_cid)
             .await?;
 
-        let mut lock = sequencer.sequencer.write().await;
-        lock.sequence_commit(did.clone(), commit.clone()).await?;
-        account_manager
-            .update_repo_root(
-                did.to_string(),
-                commit.commit_data.cid,
-                commit.commit_data.rev,
-            )
-            .await?;
-        Ok(())
+        let commit_cid = commit.commit_data.cid.to_string();
+        let commit_rev = commit.commit_data.rev.clone();
+        publication::publish_pending(actor_store, sequencer, &account_manager, did, None).await?;
+        for write in &writes {
+            record_repo_write(match write {
+                PreparedWrite::Create(_) => "create",
+                PreparedWrite::Update(_) => "update",
+                PreparedWrite::Delete(_) => "delete",
+            });
+        }
+        // The lexicon declares a JSON object output; returning an empty body
+        // instead makes a client that requires JSON treat a successful write as
+        // failed and retry it, duplicating records.
+        let results = writes
+            .iter()
+            .map(|write| match write {
+                PreparedWrite::Create(w) => {
+                    ApplyWritesOutputResult::Create(ApplyWritesResultCreate {
+                        uri: w.uri.clone(),
+                        cid: w.cid.to_string(),
+                        validation_status: None,
+                    })
+                }
+                PreparedWrite::Update(w) => {
+                    ApplyWritesOutputResult::Update(ApplyWritesResultUpdate {
+                        uri: w.uri.clone(),
+                        cid: w.cid.to_string(),
+                        validation_status: None,
+                    })
+                }
+                PreparedWrite::Delete(_) => {
+                    ApplyWritesOutputResult::Delete(ApplyWritesResultDelete {})
+                }
+            })
+            .collect();
+        Ok(ApplyWritesOutput {
+            commit: Some(CommitMeta {
+                cid: commit_cid,
+                rev: commit_rev,
+            }),
+            results: Some(results),
+        })
     } else {
         bail!("Could not find repo: `{repo}`")
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 #[tracing::instrument(skip_all)]
 #[rocket::post("/xrpc/com.atproto.repo.applyWrites", format = "json", data = "<body>")]
 pub async fn apply_writes(
     body: Json<ApplyWritesInput>,
-    auth: AccessStandardIncludeChecks,
+    auth: Scoped<RepoWrite, AccessStandardIncludeChecks>,
     sequencer: &State<SharedSequencer>,
-    s3_config: &State<SdkConfig>,
-    db: DbConn,
+    blobstore_factory: &State<BlobstoreFactory>,
+    actor_store: &State<ActorStore>,
     account_manager: AccountManager,
-) -> Result<(), ApiError> {
+    limits: &State<RateLimits>,
+    caller: Caller,
+) -> Result<Json<ApplyWritesOutput>, ApiError> {
     tracing::debug!("@LOG: debug apply_writes {body:#?}");
-    match inner_apply_writes(body, auth, sequencer, s3_config, db, account_manager).await {
-        Ok(()) => Ok(()),
+    let targets: Vec<RepoTarget> = body
+        .writes
+        .iter()
+        .map(|write| match write {
+            ApplyWritesInputRefWrite::Create(w) => {
+                RepoTarget::new(w.collection.clone(), crate::oauth_scope::RepoAction::Create)
+            }
+            ApplyWritesInputRefWrite::Update(w) => {
+                RepoTarget::new(w.collection.clone(), crate::oauth_scope::RepoAction::Update)
+            }
+            ApplyWritesInputRefWrite::Delete(w) => {
+                RepoTarget::new(w.collection.clone(), crate::oauth_scope::RepoAction::Delete)
+            }
+        })
+        .collect();
+    let requester = auth.did_for(&targets).await?;
+    limits
+        .consume_all(
+            &crate::rate_limits::REPO_WRITES,
+            &requester,
+            body.writes
+                .iter()
+                .map(|write| match write {
+                    ApplyWritesInputRefWrite::Create(_) => crate::rate_limits::CREATE_POINTS,
+                    ApplyWritesInputRefWrite::Update(_) => crate::rate_limits::UPDATE_POINTS,
+                    ApplyWritesInputRefWrite::Delete(_) => crate::rate_limits::DELETE_POINTS,
+                })
+                .sum(),
+            caller.bypass,
+        )
+        .await?;
+    match inner_apply_writes(
+        body,
+        requester,
+        sequencer,
+        blobstore_factory,
+        actor_store,
+        account_manager,
+    )
+    .await
+    {
+        Ok(output) => Ok(Json(output)),
         Err(error) => {
             tracing::error!("@LOG: ERROR: {error}");
-            Err(ApiError::RuntimeError)
+            Err(ApiError::from(error))
         }
     }
 }

@@ -1,4 +1,5 @@
 /target/
+rsky-pdsadmin/target/
 **/*.rs.bk
 .openapi-generator-ignore
 .openapi-generator
@@ -11,6 +12,11 @@ NOTE.md
 Rocket.toml
 *.pem
 **/data/
+# the TypeScript compat fixture is test data, not runtime data
+!rsky-pds/tests/fixtures/ts-pds-0.5.27/data/
+!rsky-pds/tests/fixtures/ts-pds-0.5.27/data/**
+rsky-pds/tests/fixtures/ts-pds-0.5.27/data/**/*-wal
+rsky-pds/tests/fixtures/ts-pds-0.5.27/data/**/*-shm
 /db/
 *.db
 *.db-shm

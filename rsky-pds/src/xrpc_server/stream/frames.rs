@@ -115,3 +115,7 @@ impl Frame for ErrorFrame {
         *self.get_op() == FrameType::Error
     }
 }
+
+#[cfg(test)]
+#[path = "frames_tests.rs"]
+mod tests;

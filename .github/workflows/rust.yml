@@ -117,6 +117,8 @@ jobs:
   build-and-test:
     needs: [determine-workspace-members, check]
     runs-on: ubuntu-latest
+    # A test that hangs otherwise burns the 6-hour runner cap before failing.
+    timeout-minutes: 45
     if: ${{ needs.determine-workspace-members.outputs.workspace_members != '[]' }}
     strategy:
       fail-fast: false
@@ -141,8 +143,134 @@ jobs:
           shared-key: ${{ matrix.package }}
       - name: Run cargo build for ${{ matrix.package }}
         run: cargo build --release -p ${{ matrix.package }}
+      # rsky-wintermute's DB-backed tests (indexer::tests, ingester::tests) need
+      # a live Postgres carrying the Bluesky appview dataplane schema; they are
+      # not gated behind a feature or #[ignore], so a stock image alone fails
+      # them with `relation "actor" does not exist`. The schema is applied from
+      # the checked-in dump in the step after this one.
+      - name: Start Postgres for database-backed tests
+        if: matrix.package == 'rsky-wintermute' || matrix.package == 'rsky-feedgen'
+        run: |
+          docker run -d --name test-pg \
+            -e POSTGRES_PASSWORD=postgres \
+            -e POSTGRES_DB=bsky_test \
+            -p 5432:5432 postgres:17
+          for _ in $(seq 1 30); do
+            if docker exec test-pg pg_isready -U postgres -d bsky_test; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Postgres did not become ready" >&2
+          docker logs test-pg >&2
+          exit 1
+      # Appview schema snapshot (public schema, no rows). Regenerate per
+      # rsky-wintermute/README.md when the dataplane migrations change.
+      - name: Apply appview schema for rsky-wintermute
+        if: matrix.package == 'rsky-wintermute'
+        run: |
+          docker exec -i test-pg psql -U postgres -d bsky_test \
+            -v ON_ERROR_STOP=1 -q < rsky-wintermute/tests/schema/appview.sql
+      - name: Apply moderation schema for rsky-feedgen
+        if: matrix.package == 'rsky-feedgen'
+        run: |
+          docker exec -i test-pg psql -U postgres -d bsky_test \
+            -v ON_ERROR_STOP=1 -q < rsky-feedgen/migrations/2024-11-16-235919_020/up.sql
+      - name: Start Redis for PDS replay and rate-limit tests
+        if: matrix.package == 'rsky-pds'
+        run: |
+          docker run -d --name test-redis -p 6379:6379 redis:7-alpine
+          for _ in $(seq 1 30); do
+            if docker exec test-redis redis-cli ping | grep -q PONG; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs test-redis
+          exit 1
       - name: Run cargo test for ${{ matrix.package }}
         run: cargo test --release -p ${{ matrix.package }}
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/bsky_test
+          TEST_REDIS_URL: ${{ matrix.package == 'rsky-pds' && 'redis://127.0.0.1:6379' || '' }}
+      # The transcode e2e tests are #[ignore]d so plain `cargo test` doesn't
+      # require ffmpeg on every dev machine; CI installs it and runs them
+      # explicitly, otherwise the video normalization fix has zero coverage
+      # in the green build.
+      - name: Install ffmpeg for rsky-video e2e tests
+        if: matrix.package == 'rsky-video'
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: Run rsky-video transcode e2e tests
+        if: matrix.package == 'rsky-video'
+        run: cargo test --release -p rsky-video -- --ignored transcode
+
+  # Coverage gate for the sqlite PDS stack. Standalone so a coverage
+  # failure never blocks CI for unrelated crates.
+  # One instrumented test run serves the crate-wide floor and the changed-line
+  # gate. The instrumented target tree is tens of gigabytes with debuginfo,
+  # which is more than the runner's disk; coverage needs none of it.
+  coverage-pds:
+    needs: determine-workspace-members
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 15
+    env:
+      CARGO_BUILD_JOBS: 2
+      RUST_TEST_THREADS: 2
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      TEST_REDIS_URL: redis://127.0.0.1:6379
+    if: |
+      contains(fromJson(needs.determine-workspace-members.outputs.workspace_members), 'rsky-pds') ||
+      contains(fromJson(needs.determine-workspace-members.outputs.workspace_members), 'rsky-oauth') ||
+      contains(fromJson(needs.determine-workspace-members.outputs.workspace_members), 'rsky-space') ||
+      contains(fromJson(needs.determine-workspace-members.outputs.workspace_members), 'rsky-space-host') ||
+      contains(fromJson(needs.determine-workspace-members.outputs.workspace_members), 'rsky-daemon')
+    steps:
+      - name: Clean up large directories
+        run: |
+          sudo rm -rf /usr/local/share/boost \
+                      /usr/share/dotnet \
+                      /usr/local/lib/android \
+                      /opt/ghc
+      # The gate diffs the push against its base, which a shallow clone lacks.
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: coverage-pds
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Run the PDS crates' tests under coverage
+        run: >-
+          cargo llvm-cov --no-report --no-fail-fast
+          -p rsky-pds -p rsky-oauth -p rsky-space -p rsky-space-host -p rsky-daemon
+      - name: Enforce the crate-wide line floor
+        run: >-
+          cargo llvm-cov report --fail-under-lines 90
+          -p rsky-pds -p rsky-oauth -p rsky-space -p rsky-space-host -p rsky-daemon
+      # Every rsky-pds / rsky-oauth line the push added or rewrote must be covered.
+      - name: Gate changed lines at 100% coverage
+        env:
+          COVERAGE_GATE_REUSE_PROFILE: 1
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          if [ -n "$BASE_SHA" ] && [ "$BASE_SHA" != "0000000000000000000000000000000000000000" ] && git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null; then
+            scripts/coverage-gate.sh "$BASE_SHA"
+          else
+            scripts/coverage-gate.sh HEAD^
+          fi
 
   # Run formatting check on the entire workspace
   formatting:
@@ -176,7 +304,7 @@ jobs:
           
       # Create a cache directory for Docker builds
       - name: Set up cache for Docker builds
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           path: /tmp/.buildx-cache
           key: ${{ runner.os }}-buildx-${{ matrix.dockerfile }}-${{ github.sha }}
@@ -192,6 +320,14 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
           
+      # The crate version from its manifest, so a release is pullable by
+      # the version people see in `_health` and in the changelog.
+      - name: Read crate version
+        id: crate
+        run: |
+          version=$(sed -nE 's/^version = "([^"]+)"/\1/p' "${{ matrix.dockerfile }}/Cargo.toml" | head -1)
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
       - name: Extract Docker metadata
         id: meta
         uses: docker/metadata-action@v5.7.0
@@ -202,6 +338,9 @@ jobs:
             type=sha,format=long
             # Add 'main' tag if this is on the main branch
             type=raw,value=main,enable=${{ github.ref == 'refs/heads/main' }}
+            # On main, also tag the crate version and 'latest'
+            type=raw,value=${{ steps.crate.outputs.version }},enable=${{ github.ref == 'refs/heads/main' && steps.crate.outputs.version != '' }}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
       
       # Build the Docker image (no push if from fork)
       - name: Build Docker image
@@ -253,7 +392,7 @@ jobs:
   # Optional: Add a final job that depends on all tests to signal success
   ci-success:
     runs-on: ubuntu-latest
-    needs: [check, build-and-test, formatting, determine-dockerfiles]
+    needs: [check, build-and-test, coverage-pds, formatting, determine-dockerfiles, docker-build]
     if: always()
     steps:
       - name: Check if docker-build should run
@@ -261,9 +400,9 @@ jobs:
         run: |
           DOCKERFILES='${{ needs.determine-dockerfiles.outputs.dockerfiles }}'
           if [[ "$DOCKERFILES" == "[]" ]]; then
-            echo "docker_build_needed=false" >> $GITHUB_OUTPUT
+            echo "docker_build_needed=false" >> "$GITHUB_OUTPUT"
           else
-            echo "docker_build_needed=true" >> $GITHUB_OUTPUT
+            echo "docker_build_needed=true" >> "$GITHUB_OUTPUT"
           fi
 
       - name: CI Success (no docker build needed)
@@ -274,7 +413,9 @@ jobs:
           (!contains(needs.build-and-test.result, 'failure') || needs.build-and-test.result == 'skipped') &&
           (!contains(needs.build-and-test.result, 'cancelled') || needs.build-and-test.result == 'skipped') &&
           !contains(needs.formatting.result, 'failure') &&
-          !contains(needs.formatting.result, 'cancelled')
+          !contains(needs.formatting.result, 'cancelled') &&
+          (!contains(needs.coverage-pds.result, 'failure') || needs.coverage-pds.result == 'skipped') &&
+          (!contains(needs.coverage-pds.result, 'cancelled') || needs.coverage-pds.result == 'skipped')
         run: echo "All CI jobs passed! (Docker build not needed)"
 
       - name: CI Success (with docker build)
@@ -286,6 +427,8 @@ jobs:
           (!contains(needs.build-and-test.result, 'cancelled') || needs.build-and-test.result == 'skipped') &&
           !contains(needs.formatting.result, 'failure') &&
           !contains(needs.formatting.result, 'cancelled') &&
+          (!contains(needs.coverage-pds.result, 'failure') || needs.coverage-pds.result == 'skipped') &&
+          (!contains(needs.coverage-pds.result, 'cancelled') || needs.coverage-pds.result == 'skipped') &&
           (!contains(needs.docker-build.result, 'failure') || needs.docker-build.result == 'skipped') &&
           (!contains(needs.docker-build.result, 'cancelled') || needs.docker-build.result == 'skipped')
         run: echo "All CI jobs passed! (Including Docker build)"
@@ -298,6 +441,8 @@ jobs:
           (contains(needs.build-and-test.result, 'cancelled') && needs.build-and-test.result != 'skipped') ||
           contains(needs.formatting.result, 'failure') ||
           contains(needs.formatting.result, 'cancelled') ||
+          (contains(needs.coverage-pds.result, 'failure') && needs.coverage-pds.result != 'skipped') ||
+          (contains(needs.coverage-pds.result, 'cancelled') && needs.coverage-pds.result != 'skipped') ||
           (steps.should-docker-build.outputs.docker_build_needed == 'true' && 
            ((contains(needs.docker-build.result, 'failure') && needs.docker-build.result != 'skipped') || 
             (contains(needs.docker-build.result, 'cancelled') && needs.docker-build.result != 'skipped')))

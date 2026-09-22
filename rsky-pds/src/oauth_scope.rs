@@ -1,0 +1,529 @@
+//! Modern atproto OAuth scope forms (permission-set proposal §Scopes).
+//!
+//! ```text
+//! atproto | transition:<name> | repo:<nsid>[?action=...] | blob:<mime-pattern>
+//!         | rpc:<nsid>[?aud=...] | identity:<attr> | account:<attr>[?action=...]
+//!         | include:<nsid> | space:<...>
+//! ```
+//!
+//! This module is pure: parsing and classification only. `space:` forms are
+//! delegated to [`crate::space_scope`], which owns that grammar.
+//!
+//! Resolution note: an `include:<nsid>` names a permission set published as a
+//! `com.atproto.lexicon.schema` record, which must be fetched to learn the
+//! collections and actions it confers. That resolution is not performed here,
+//! so an `include:` is recognised as a well-formed permission grant but its
+//! contents are not expanded. Granular enforcement therefore still happens at
+//! the resource (see `crate::space_auth` for the space surface); this module
+//! only answers "what kind of grant is this".
+
+use std::fmt;
+
+pub const SCOPE_ATPROTO: &str = "atproto";
+pub const TRANSITION_PREFIX: &str = "transition:";
+pub const REPO_PREFIX: &str = "repo:";
+pub const BLOB_PREFIX: &str = "blob:";
+pub const RPC_PREFIX: &str = "rpc:";
+pub const IDENTITY_PREFIX: &str = "identity:";
+pub const ACCOUNT_PREFIX: &str = "account:";
+pub const INCLUDE_PREFIX: &str = "include:";
+
+/// The `attr` values an `identity:` scope may name (proposal 0011's
+/// `IdentityPermission` grammar): the account's handle, or a wildcard
+/// covering every identity attribute.
+pub const IDENTITY_ATTRS: [&str; 2] = ["handle", "*"];
+
+/// The `attr` values an `account:` scope may name (proposal 0011's
+/// `AccountPermission` grammar).
+pub const ACCOUNT_ATTRS: [&str; 3] = ["email", "repo", "status"];
+
+/// A single granted scope token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OAuthScope {
+    /// The base scope every atproto session carries.
+    Atproto,
+    /// Legacy `transition:*` grants, which map onto the app-password model.
+    Transition(String),
+    /// `repo:<nsid>` — record access, optionally narrowed by `action`.
+    Repo(String),
+    /// `blob:<mime-pattern>` — blob upload, e.g. `image/*`.
+    Blob(String),
+    /// `rpc:<nsid>` — permission to call a method on another service.
+    Rpc(String),
+    /// `identity:<attr>` — permission to read or change an identity
+    /// attribute (currently just the handle), or `identity:*` for all of
+    /// them.
+    Identity(String),
+    /// `account:<attr>[?action=...]` — permission over an account-level
+    /// attribute (`email`, `repo`, or `status`), narrowed to `read` or
+    /// widened to `manage`.
+    Account(String),
+    /// `include:<nsid>` — a published permission set, resolved elsewhere.
+    Include(String),
+    /// `space:<...>` — permissioned-data grants; see [`crate::space_scope`].
+    Space(String),
+    /// Anything else: a scope string this parser does not recognise.
+    ///
+    /// Retained as a classified variant -- rather than making [`Self::parse`]
+    /// fallible and rejecting the whole scope list -- so a token mixing
+    /// recognised and unrecognised scopes still parses instead of blowing up
+    /// on a form this server doesn't know about yet.
+    ///
+    /// It is inert everywhere a grant is evaluated: [`Self::is_permission_grant`]
+    /// excludes it, and every `allows_*` check on [`GrantedScopes`] matches a
+    /// specific typed variant, never this one. So an unrecognised scope can
+    /// never be the reason a session ends up with *more* access than its
+    /// recognised scopes alone would grant -- at most it does nothing, and a
+    /// session carrying only unrecognised scopes (no `transition:`, no
+    /// recognised permission grant) is refused by
+    /// [`crate::auth_verifier::oauth_scopes_to_auth_scope`] rather than
+    /// silently treated as fully authorised.
+    Unknown(String),
+}
+
+/// A repository write action named in a `repo:` scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepoAction {
+    Create,
+    Update,
+    Delete,
+}
+
+/// An action named in an `account:` scope. `Manage` implies `Read` (proposal
+/// 0011's `AccountPermission.matches`: a `manage` grant also satisfies a
+/// `read` check).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountAction {
+    Read,
+    Manage,
+}
+
+/// Parse a `repo:` scope suffix into its collections and actions, applying
+/// the proposal's defaults (no collection = all, no action = all three).
+///
+/// `pub(crate)` rather than private: the OAuth consent screen (see
+/// `crate::ui::technical`) reuses this to describe a `repo:` grant in
+/// plain language instead of duplicating the parse.
+pub(crate) fn parse_repo_scope(suffix: &str) -> (Vec<String>, Vec<RepoAction>) {
+    let (positional, params) = match suffix.find('?') {
+        Some(pos) => (
+            Some(&suffix[..pos]).filter(|p| !p.is_empty()),
+            Some(&suffix[pos + 1..]),
+        ),
+        None => (Some(suffix).filter(|p| !p.is_empty()), None),
+    };
+    let mut collections: Vec<String> = Vec::new();
+    if let Some(nsid) = positional {
+        collections.push(nsid.to_string());
+    }
+    let mut actions: Vec<RepoAction> = Vec::new();
+    if let Some(params) = params {
+        for pair in params.split('&') {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            match key {
+                "collection" if !value.is_empty() => collections.push(value.to_string()),
+                "action" => match value {
+                    "create" => actions.push(RepoAction::Create),
+                    "update" => actions.push(RepoAction::Update),
+                    "delete" => actions.push(RepoAction::Delete),
+                    "*" => {
+                        actions.extend([RepoAction::Create, RepoAction::Update, RepoAction::Delete])
+                    }
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+    }
+    if collections.is_empty() {
+        collections.push("*".to_string());
+    }
+    if actions.is_empty() {
+        actions.extend([RepoAction::Create, RepoAction::Update, RepoAction::Delete]);
+    }
+    (collections, actions)
+}
+
+/// Split a scope suffix into its positional value and its query string,
+/// matching the same `<positional>` / `?<params>` grammar [`parse_repo_scope`]
+/// uses. Shared by the new resource kinds below; `parse_repo_scope` keeps its
+/// own inline copy so its existing, reference-quality behaviour is untouched.
+fn split_suffix(suffix: &str) -> (Option<&str>, Option<&str>) {
+    match suffix.find('?') {
+        Some(pos) => (
+            Some(&suffix[..pos]).filter(|p| !p.is_empty()),
+            Some(&suffix[pos + 1..]),
+        ),
+        None => (Some(suffix).filter(|p| !p.is_empty()), None),
+    }
+}
+
+/// Parse an `identity:` scope suffix into the attribute it names.
+///
+/// Unlike `repo:`, an empty or unrecognised attribute is not defaulted to a
+/// wildcard: proposal 0011's `IdentityPermission.attr` is required with no
+/// default, so a malformed grant matches nothing rather than matching
+/// everything (see the module docs on why unrecognised input must narrow,
+/// never widen, access).
+///
+/// `pub(crate)`: the OAuth consent screen (see `crate::ui::technical`)
+/// reuses this to describe an `identity:` grant in plain language.
+pub(crate) fn parse_identity_scope(suffix: &str) -> Option<String> {
+    let (positional, params) = split_suffix(suffix);
+    let attr = match (positional, params) {
+        (Some(attr), None) => attr.to_string(),
+        (None, Some(params)) if !params.is_empty() => {
+            let mut attr = None;
+            for pair in params.split('&') {
+                let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+                if key == "attr" && !value.is_empty() {
+                    attr = Some(value.to_string());
+                } else {
+                    // An `identity:` grant takes no parameter but `attr`
+                    // (proposal 0011 has no `action` for this resource); any
+                    // other key makes the grant unrecognisable, so it must
+                    // deny rather than silently ignore the stray key.
+                    return None;
+                }
+            }
+            attr?
+        }
+        _ => return None,
+    };
+    IDENTITY_ATTRS.contains(&attr.as_str()).then_some(attr)
+}
+
+/// Parse an `account:` scope suffix into the attribute and actions it names,
+/// applying proposal 0011's default (`action=read` when unspecified). An
+/// unrecognised attribute or action denies rather than defaulting wide, for
+/// the same reason as [`parse_identity_scope`].
+///
+/// `pub(crate)`: reused by `crate::ui::technical` for consent-screen copy.
+pub(crate) fn parse_account_scope(suffix: &str) -> Option<(String, Vec<AccountAction>)> {
+    let (positional, params) = split_suffix(suffix);
+    let mut attr: Option<String> = positional.map(str::to_string);
+    let mut actions: Vec<AccountAction> = Vec::new();
+    if let Some(params) = params {
+        for pair in params.split('&') {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            match key {
+                "attr" if attr.is_none() && !value.is_empty() => attr = Some(value.to_string()),
+                "action" => match value {
+                    "read" => actions.push(AccountAction::Read),
+                    "manage" => actions.push(AccountAction::Manage),
+                    _ => return None,
+                },
+                _ => return None,
+            }
+        }
+    }
+    let attr = attr?;
+    if !ACCOUNT_ATTRS.contains(&attr.as_str()) {
+        return None;
+    }
+    if actions.is_empty() {
+        actions.push(AccountAction::Read);
+    }
+    Some((attr, actions))
+}
+
+/// Parse a `blob:` scope suffix into the mime-type patterns it accepts.
+/// `blob:<pattern>` is shorthand for a single pattern; `blob?accept=...`
+/// (repeated) names several. An empty suffix accepts nothing -- unlike
+/// `repo:`'s bare form, there is no wildcard default here.
+///
+/// `pub(crate)`: reused by `crate::ui::technical` for consent-screen copy.
+pub(crate) fn parse_blob_scope(suffix: &str) -> Vec<String> {
+    let (positional, params) = split_suffix(suffix);
+    let mut accepts: Vec<String> = Vec::new();
+    if let Some(pattern) = positional {
+        accepts.push(pattern.to_string());
+    }
+    if let Some(params) = params {
+        for pair in params.split('&') {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            if key == "accept" && !value.is_empty() {
+                accepts.push(value.to_string());
+            }
+        }
+    }
+    accepts
+}
+
+/// Whether `mime` matches an accepted pattern from a `blob:` scope, mirroring
+/// [`crate::actor_store::blob::accepted_mime`]'s glob semantics (`*/*`,
+/// `type/*`, or an exact match).
+fn mime_matches(accepted: &[String], mime: &str) -> bool {
+    accepted.iter().any(|pattern| {
+        pattern == "*/*"
+            || pattern == mime
+            || pattern
+                .strip_suffix("/*")
+                .is_some_and(|base| mime.starts_with(&format!("{base}/")))
+    })
+}
+
+/// A query value as the client wrote it: a `did:` or `#fragment` survives
+/// percent-encoding, and a value that does not decode is kept as is.
+pub(crate) fn percent_decoded(value: &str) -> String {
+    urlencoding::decode(value).map_or_else(|_| value.to_string(), |v| v.into_owned())
+}
+
+/// Parse an `rpc:` scope suffix into the methods it names and the audience
+/// it is bound to. `rpc:<nsid>` is shorthand for a single method with no
+/// `aud`; the query form allows several `lxm` values plus one `aud`.
+///
+/// `aud` is required by proposal 0011's `RpcPermission` (no default), so a
+/// grant naming no audience matches nothing. `rpc:*?aud=*` -- every method on
+/// every service -- is rejected outright, matching the reference
+/// implementation's constructor check.
+///
+/// `pub(crate)`: reused by `crate::ui::technical` for consent-screen copy.
+pub(crate) fn parse_rpc_scope(suffix: &str) -> Option<(Vec<String>, String)> {
+    let (positional, params) = split_suffix(suffix);
+    let mut lxms: Vec<String> = Vec::new();
+    if let Some(lxm) = positional {
+        lxms.push(lxm.to_string());
+    }
+    let mut aud: Option<String> = None;
+    if let Some(params) = params {
+        for pair in params.split('&') {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            match key {
+                "lxm" if !value.is_empty() => lxms.push(percent_decoded(value)),
+                "aud" if !value.is_empty() => aud = Some(percent_decoded(value)),
+                _ => {}
+            }
+        }
+    }
+    if lxms.is_empty() {
+        return None;
+    }
+    let aud = aud?;
+    if aud == "*" && lxms.iter().any(|l| l == "*") {
+        return None;
+    }
+    Some((lxms, aud))
+}
+
+impl OAuthScope {
+    #[must_use]
+    pub fn parse(token: &str) -> Self {
+        if token == SCOPE_ATPROTO {
+            return OAuthScope::Atproto;
+        }
+        // `repo` accepts three surface forms: bare `repo`, `repo:<nsid>`
+        // shorthand, and `repo?<params>` query form.
+        if token == "repo" {
+            return OAuthScope::Repo(String::new());
+        }
+        if let Some(rest) = token.strip_prefix("repo?") {
+            return OAuthScope::Repo(format!("?{rest}"));
+        }
+        // `identity` and `account` accept the same named-parameter query
+        // form as `repo?...`, alongside their `identity:`/`account:` colon
+        // shorthand handled by the prefix table below.
+        if let Some(rest) = token.strip_prefix("identity?") {
+            return OAuthScope::Identity(format!("?{rest}"));
+        }
+        if let Some(rest) = token.strip_prefix("account?") {
+            return OAuthScope::Account(format!("?{rest}"));
+        }
+        if let Some(rest) = token.strip_prefix("rpc?") {
+            return OAuthScope::Rpc(format!("?{rest}"));
+        }
+        for (prefix, ctor) in [
+            (
+                TRANSITION_PREFIX,
+                OAuthScope::Transition as fn(String) -> OAuthScope,
+            ),
+            (REPO_PREFIX, OAuthScope::Repo as fn(String) -> OAuthScope),
+            (BLOB_PREFIX, OAuthScope::Blob as fn(String) -> OAuthScope),
+            (RPC_PREFIX, OAuthScope::Rpc as fn(String) -> OAuthScope),
+            (
+                IDENTITY_PREFIX,
+                OAuthScope::Identity as fn(String) -> OAuthScope,
+            ),
+            (
+                ACCOUNT_PREFIX,
+                OAuthScope::Account as fn(String) -> OAuthScope,
+            ),
+            (
+                INCLUDE_PREFIX,
+                OAuthScope::Include as fn(String) -> OAuthScope,
+            ),
+        ] {
+            if let Some(rest) = token.strip_prefix(prefix) {
+                return ctor(rest.to_owned());
+            }
+        }
+        if let Some(rest) = token.strip_prefix(crate::space_scope::SPACE_SCOPE_PREFIX) {
+            return OAuthScope::Space(rest.to_owned());
+        }
+        OAuthScope::Unknown(token.to_owned())
+    }
+
+    /// Whether this token is a permission grant under the modern scope model,
+    /// as opposed to the base scope or a legacy transition grant.
+    #[must_use]
+    pub const fn is_permission_grant(&self) -> bool {
+        matches!(
+            self,
+            OAuthScope::Repo(_)
+                | OAuthScope::Blob(_)
+                | OAuthScope::Rpc(_)
+                | OAuthScope::Identity(_)
+                | OAuthScope::Account(_)
+                | OAuthScope::Include(_)
+                | OAuthScope::Space(_)
+        )
+    }
+}
+
+impl fmt::Display for OAuthScope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            OAuthScope::Atproto => f.write_str(SCOPE_ATPROTO),
+            OAuthScope::Transition(v) => write!(f, "{TRANSITION_PREFIX}{v}"),
+            OAuthScope::Repo(v) => write!(f, "{REPO_PREFIX}{v}"),
+            OAuthScope::Blob(v) => write!(f, "{BLOB_PREFIX}{v}"),
+            OAuthScope::Rpc(v) => write!(f, "{RPC_PREFIX}{v}"),
+            OAuthScope::Identity(v) => write!(f, "{IDENTITY_PREFIX}{v}"),
+            OAuthScope::Account(v) => write!(f, "{ACCOUNT_PREFIX}{v}"),
+            OAuthScope::Include(v) => write!(f, "{INCLUDE_PREFIX}{v}"),
+            OAuthScope::Space(v) => {
+                write!(f, "{}{v}", crate::space_scope::SPACE_SCOPE_PREFIX)
+            }
+            OAuthScope::Unknown(v) => f.write_str(v),
+        }
+    }
+}
+
+/// The granted scopes of a session, classified once.
+#[derive(Debug, Clone, Default)]
+pub struct GrantedScopes {
+    scopes: Vec<OAuthScope>,
+}
+
+impl GrantedScopes {
+    #[must_use]
+    pub fn parse(granted: &[String]) -> Self {
+        Self {
+            scopes: granted.iter().map(|s| OAuthScope::parse(s)).collect(),
+        }
+    }
+
+    #[must_use]
+    pub fn has_atproto(&self) -> bool {
+        self.scopes.iter().any(|s| matches!(s, OAuthScope::Atproto))
+    }
+
+    #[must_use]
+    pub fn has_transition(&self, name: &str) -> bool {
+        self.scopes
+            .iter()
+            .any(|s| matches!(s, OAuthScope::Transition(v) if v == name))
+    }
+
+    /// True when the session carries at least one modern permission grant.
+    #[must_use]
+    pub fn has_permission_grant(&self) -> bool {
+        self.scopes.iter().any(OAuthScope::is_permission_grant)
+    }
+
+    /// Whether some granted `repo:` scope permits `action` on `collection`.
+    ///
+    /// `repo:<nsid>` is shorthand for `repo?collection=<nsid>`; a missing
+    /// collection means all collections, a missing action means all three
+    /// actions, and `*` is the wildcard in either position (proposal 0016
+    /// §Scopes, matching the reference `allows_repo`).
+    #[must_use]
+    pub fn allows_repo(&self, collection: &str, action: RepoAction) -> bool {
+        self.scopes.iter().any(|s| match s {
+            OAuthScope::Repo(suffix) => {
+                let (collections, actions) = parse_repo_scope(suffix);
+                let collection_ok = collections.iter().any(|c| c == "*" || c == collection);
+                let action_ok = actions.iter().any(|a| *a == action);
+                collection_ok && action_ok
+            }
+            _ => false,
+        })
+    }
+
+    /// Whether some granted `blob:` scope accepts `mime`.
+    #[must_use]
+    pub fn allows_blob(&self, mime: &str) -> bool {
+        self.scopes.iter().any(|s| match s {
+            OAuthScope::Blob(suffix) => mime_matches(&parse_blob_scope(suffix), mime),
+            _ => false,
+        })
+    }
+
+    /// Whether some granted `rpc:` scope permits calling `lxm` on `aud`.
+    #[must_use]
+    pub fn allows_rpc(&self, lxm: &str, aud: &str) -> bool {
+        self.scopes.iter().any(|s| match s {
+            OAuthScope::Rpc(suffix) => match parse_rpc_scope(suffix) {
+                Some((lxms, granted_aud)) => {
+                    let lxm_ok = lxms.iter().any(|l| l == "*" || l == lxm);
+                    let aud_ok = granted_aud == "*" || granted_aud == aud;
+                    lxm_ok && aud_ok
+                }
+                None => false,
+            },
+            _ => false,
+        })
+    }
+
+    /// Whether some granted `identity:` scope permits acting on `attr`
+    /// (`"handle"`, currently the only recognised attribute).
+    #[must_use]
+    pub fn allows_identity(&self, attr: &str) -> bool {
+        self.scopes.iter().any(|s| match s {
+            OAuthScope::Identity(suffix) => match parse_identity_scope(suffix) {
+                Some(granted) => granted == "*" || granted == attr,
+                None => false,
+            },
+            _ => false,
+        })
+    }
+
+    /// Whether some granted `account:` scope permits `action` on `attr`
+    /// (`email`, `repo`, or `status`). A `manage` grant also satisfies a
+    /// `read` check (proposal 0011 §AccountPermission).
+    #[must_use]
+    pub fn allows_account(&self, attr: &str, action: AccountAction) -> bool {
+        self.scopes.iter().any(|s| match s {
+            OAuthScope::Account(suffix) => match parse_account_scope(suffix) {
+                Some((granted_attr, actions)) => {
+                    granted_attr == attr
+                        && (actions.contains(&AccountAction::Manage) || actions.contains(&action))
+                }
+                None => false,
+            },
+            _ => false,
+        })
+    }
+
+    /// The `space:` grant strings, for [`crate::space_scope`] to evaluate.
+    #[must_use]
+    pub fn space_grants(&self) -> Vec<String> {
+        self.scopes
+            .iter()
+            .filter_map(|s| match s {
+                OAuthScope::Space(v) => {
+                    Some(format!("{}{v}", crate::space_scope::SPACE_SCOPE_PREFIX))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &OAuthScope> {
+        self.scopes.iter()
+    }
+}
+
+#[cfg(test)]
+#[path = "oauth_scope_tests.rs"]
+mod tests;

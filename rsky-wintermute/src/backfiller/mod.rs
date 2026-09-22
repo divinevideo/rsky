@@ -1,12 +1,13 @@
 mod tests;
 
 use crate::SHUTDOWN;
-use crate::config::{BACKFILLER_BATCH_SIZE, WORKERS_BACKFILLER, backfiller_timeout};
+use crate::config::{WORKERS_BACKFILLER, backfiller_timeout};
 use crate::storage::Storage;
 use crate::types::{BackfillJob, IndexJob, WintermuteError, WriteAction};
 use dashmap::DashMap;
 use iroh_car::CarReader;
 use rsky_identity::IdResolver;
+use rsky_identity::safe_fetch::{Redirects, SafeClient};
 use rsky_identity::types::IdentityResolverOpts;
 use rsky_repo::parse::get_and_parse_record;
 use rsky_repo::readable_repo::ReadableRepo;
@@ -19,21 +20,38 @@ use std::time::Duration;
 pub struct BackfillerManager {
     workers: usize,
     storage: Arc<Storage>,
-    http_client: reqwest::Client,
+    http_client: SafeClient,
     pds_cache: Arc<DashMap<String, String>>,
+    /// Where the actor generations are read before each fetch.
+    generations: Option<deadpool_postgres::Pool>,
+}
+
+/// RAII guard that decrements `BACKFILLER_REPOS_RUNNING` on drop.
+/// Prevents metric leaks when `process_job` returns early via `?`.
+struct RepoRunningGuard;
+
+impl RepoRunningGuard {
+    fn new() -> Self {
+        crate::metrics::BACKFILLER_REPOS_RUNNING.inc();
+        Self
+    }
+}
+
+impl Drop for RepoRunningGuard {
+    fn drop(&mut self) {
+        crate::metrics::BACKFILLER_REPOS_RUNNING.dec();
+    }
 }
 
 impl BackfillerManager {
     pub fn new(storage: Arc<Storage>) -> Result<Self, WintermuteError> {
         let workers = *WORKERS_BACKFILLER;
-        let http_client = reqwest::Client::builder()
-            .timeout(backfiller_timeout())
-            .build()?;
+        let http_client = crate::outbound::client()?;
 
         tracing::info!(
-            "backfiller config: workers={}, batch_size={}, timeout={:?}",
+            "backfiller config: workers={}, channel_cap={}, timeout={:?}",
             workers,
-            *BACKFILLER_BATCH_SIZE,
+            workers * 2,
             backfiller_timeout()
         );
 
@@ -41,11 +59,29 @@ impl BackfillerManager {
             workers,
             storage,
             http_client,
+            generations: None,
             pds_cache: Arc::new(DashMap::new()),
         })
     }
 
+    /// Stamps every job with the actor's generation read from `pool` when
+    /// the fetch starts, so work obtained before a reconciliation is
+    /// refused after it.
+    #[must_use]
+    pub fn with_generations(mut self, pool: deadpool_postgres::Pool) -> Self {
+        self.generations = Some(pool);
+        self
+    }
+
     pub fn run(self) -> Result<(), WintermuteError> {
+        if self.workers == 0 {
+            tracing::info!("backfiller disabled (workers=0), skipping");
+            while !SHUTDOWN.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_secs(5));
+            }
+            return Ok(());
+        }
+
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(self.workers)
             .enable_all()
@@ -64,7 +100,10 @@ impl BackfillerManager {
     /// No batch barriers -- each worker immediately picks up the next job when done.
     async fn process_loop(&self) {
         const MAX_EMPTY_BACKOFF_MS: u64 = 5000;
-        let (tx, rx) = tokio::sync::mpsc::channel::<(Vec<u8>, BackfillJob)>(*BACKFILLER_BATCH_SIZE);
+        // Channel capacity = workers * 2: enough to keep workers fed without buffering
+        // thousands of dequeued items that would be lost on crash.
+        let channel_cap = self.workers * 2;
+        let (tx, rx) = tokio::sync::mpsc::channel::<(Vec<u8>, BackfillJob)>(channel_cap);
         let rx = Arc::new(tokio::sync::Mutex::new(rx));
 
         tracing::info!(
@@ -79,6 +118,7 @@ impl BackfillerManager {
             let storage = Arc::clone(&self.storage);
             let http_client = self.http_client.clone();
             let pds_cache = Arc::clone(&self.pds_cache);
+            let generations = self.generations.clone();
 
             worker_handles.push(tokio::spawn(async move {
                 loop {
@@ -93,7 +133,15 @@ impl BackfillerManager {
                         break;
                     };
 
-                    match Self::process_job(&storage, &http_client, &pds_cache, &job).await {
+                    match Self::process_job_with(
+                        &storage,
+                        &http_client,
+                        &pds_cache,
+                        &job,
+                        generations.as_ref(),
+                    )
+                    .await
+                    {
                         Ok(()) => {}
                         Err(e) => {
                             tracing::error!("worker {worker_id}: failed {}: {e}", job.did);
@@ -126,7 +174,9 @@ impl BackfillerManager {
                     break;
                 }
 
-                let batch_size = *BACKFILLER_BATCH_SIZE;
+                // Dequeue in small batches proportional to channel capacity to avoid
+                // removing thousands of items from Fjall that would be lost on crash.
+                let batch_size = channel_cap;
                 let jobs = match dequeue_storage.dequeue_backfill_batch(batch_size) {
                     Ok(jobs) => jobs,
                     Err(e) => {
@@ -172,15 +222,34 @@ impl BackfillerManager {
 
     pub async fn process_job(
         storage: &Storage,
-        http_client: &reqwest::Client,
+        http_client: &SafeClient,
         pds_cache: &DashMap<String, String>,
         job: &BackfillJob,
     ) -> Result<(), WintermuteError> {
+        Self::process_job_with(storage, http_client, pds_cache, job, None).await
+    }
+
+    pub async fn process_job_with(
+        storage: &Storage,
+        http_client: &SafeClient,
+        pds_cache: &DashMap<String, String>,
+        job: &BackfillJob,
+        generations: Option<&deadpool_postgres::Pool>,
+    ) -> Result<(), WintermuteError> {
         use crate::metrics;
 
-        metrics::BACKFILLER_REPOS_RUNNING.inc();
+        // Guard decrements BACKFILLER_REPOS_RUNNING on drop, even on early ? returns.
+        let _running_guard = RepoRunningGuard::new();
 
         let did = &job.did;
+        // the acquisition identity is fixed before any data is fetched
+        let generation = match generations {
+            Some(pool) => crate::reconcile::current_generation(pool, did).await?,
+            None => None,
+        };
+        let fetched_at = chrono::Utc::now()
+            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+            .to_string();
 
         // Check PDS endpoint cache first to avoid repeated DID resolution
         let pds_endpoint = if let Some(cached) = pds_cache.get(did) {
@@ -192,10 +261,9 @@ impl BackfillerManager {
                 did_cache: None,
                 backup_nameservers: None,
             };
-            let mut resolver = IdResolver::new(resolver_opts);
+            let resolver = IdResolver::new(resolver_opts);
             let Ok(Some(doc)) = resolver.did.resolve(did.to_string(), None).await else {
                 metrics::BACKFILLER_REPOS_FAILED_TOTAL.inc();
-                metrics::BACKFILLER_REPOS_RUNNING.dec();
                 return Err(WintermuteError::Other(format!(
                     "did resolution failed for: {did}"
                 )));
@@ -214,7 +282,6 @@ impl BackfillerManager {
 
             let Some(pds_url) = endpoint else {
                 metrics::BACKFILLER_REPOS_FAILED_TOTAL.inc();
-                metrics::BACKFILLER_REPOS_RUNNING.dec();
                 return Err(WintermuteError::Other(format!("no pds found: {did}")));
             };
 
@@ -223,12 +290,19 @@ impl BackfillerManager {
         };
 
         let repo_url = format!("{pds_endpoint}/xrpc/com.atproto.sync.getRepo?did={did}");
-        let response = match http_client.get(&repo_url).send().await {
+        let repo_url = match http_client.checked(&repo_url) {
+            Ok(url) => url,
+            Err(e) => {
+                metrics::BACKFILLER_CAR_FETCH_ERRORS_TOTAL.inc();
+                metrics::BACKFILLER_REPOS_FAILED_TOTAL.inc();
+                return Err(WintermuteError::Other(format!("refused: {e}")));
+            }
+        };
+        let response = match http_client.get(repo_url, Redirects::Follow(3)).await {
             Ok(r) => r,
             Err(e) => {
                 metrics::BACKFILLER_CAR_FETCH_ERRORS_TOTAL.inc();
                 metrics::BACKFILLER_REPOS_FAILED_TOTAL.inc();
-                metrics::BACKFILLER_REPOS_RUNNING.dec();
                 return Err(WintermuteError::Other(format!("http error: {e}")));
             }
         };
@@ -236,7 +310,6 @@ impl BackfillerManager {
         if !response.status().is_success() {
             metrics::BACKFILLER_CAR_FETCH_ERRORS_TOTAL.inc();
             metrics::BACKFILLER_REPOS_FAILED_TOTAL.inc();
-            metrics::BACKFILLER_REPOS_RUNNING.dec();
             return Err(WintermuteError::Other(format!(
                 "http error: {}",
                 response.status()
@@ -244,12 +317,34 @@ impl BackfillerManager {
         }
 
         let car_bytes = response.bytes().await?;
+        let provenance = crate::reconcile::Provenance {
+            generation,
+            source: crate::reconcile::Source::Backfill {
+                host: pds_endpoint.clone(),
+                fetched_at,
+            },
+        };
+        Self::process_car_bytes(storage, did, &car_bytes, job.priority, Some(provenance)).await?;
+
+        metrics::BACKFILLER_REPOS_PROCESSED_TOTAL.inc();
+
+        Ok(())
+    }
+
+    pub async fn process_car_bytes(
+        storage: &Storage,
+        did: &str,
+        car_bytes: &[u8],
+        priority: bool,
+        provenance: Option<crate::reconcile::Provenance>,
+    ) -> Result<usize, WintermuteError> {
+        use crate::metrics;
+
         let mut reader = match CarReader::new(Cursor::new(car_bytes.to_vec())).await {
             Ok(r) => r,
             Err(e) => {
                 metrics::BACKFILLER_CAR_PARSE_ERRORS_TOTAL.inc();
                 metrics::BACKFILLER_REPOS_FAILED_TOTAL.inc();
-                metrics::BACKFILLER_REPOS_RUNNING.dec();
                 return Err(WintermuteError::Repo(format!("car read failed: {e}")));
             }
         };
@@ -281,7 +376,6 @@ impl BackfillerManager {
         if repo.did() != did {
             metrics::BACKFILLER_VERIFICATION_ERRORS_TOTAL.inc();
             metrics::BACKFILLER_REPOS_FAILED_TOTAL.inc();
-            metrics::BACKFILLER_REPOS_RUNNING.dec();
             return Err(WintermuteError::Repo(format!(
                 "did mismatch: expected {did}, got {}",
                 repo.did()
@@ -315,7 +409,7 @@ impl BackfillerManager {
                 continue;
             };
 
-            if !collection.starts_with("app.bsky.") && !collection.starts_with("chat.bsky.") {
+            if !crate::config::ingest_collection_allowed(collection) {
                 metrics::BACKFILLER_RECORDS_FILTERED_TOTAL.inc();
                 continue;
             }
@@ -336,26 +430,26 @@ impl BackfillerManager {
                     record: Some(record_json),
                     indexed_at: now.clone(),
                     rev: rev.clone(),
+                    provenance: provenance.clone(),
                 });
             }
         }
 
         if !batch_jobs.is_empty() {
-            if job.priority {
+            if priority {
                 storage.enqueue_firehose_backfill_priority_batch(&batch_jobs)?;
             } else {
                 storage.enqueue_firehose_backfill_batch(&batch_jobs)?;
             }
         }
 
-        metrics::BACKFILLER_REPOS_PROCESSED_TOTAL.inc();
-        metrics::BACKFILLER_REPOS_RUNNING.dec();
-
-        Ok(())
+        Ok(batch_jobs.len())
     }
 }
 
 pub fn convert_record_to_ipld(record_json: &serde_json::Value) -> serde_json::Value {
+    use base64::Engine;
+
     match record_json {
         serde_json::Value::Object(map) => {
             let mut new_map = serde_json::Map::new();
@@ -378,6 +472,10 @@ pub fn convert_record_to_ipld(record_json: &serde_json::Value) -> serde_json::Va
                 if let Ok(cid) = lexicon_cid::Cid::try_from(&bytes[..]) {
                     return serde_json::json!({"$link": cid.to_string()});
                 }
+
+                // Non-CID byte array: encode as $bytes (AT Protocol IPLD format)
+                let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                return serde_json::json!({"$bytes": encoded});
             }
 
             serde_json::Value::Array(arr.iter().map(convert_record_to_ipld).collect())
