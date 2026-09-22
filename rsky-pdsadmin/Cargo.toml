@@ -5,6 +5,7 @@ members = ["."]
 name = "rsky-pdsadmin"
 version = "0.1.1"
 edition = "2024"
+rust-version = "1.86"
 description = "Administrative CLI tool for rsky-pds"
 authors = ["RSKY Team"]
 license = "MIT"

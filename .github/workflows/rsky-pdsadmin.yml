@@ -16,10 +16,6 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-      - name: Install nightly toolchain
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: rustfmt
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
       - name: Run cargo fmt
@@ -32,15 +28,13 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-      - name: Install nightly toolchain
-        uses: dtolnay/rust-toolchain@nightly
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: rsky-pdsadmin
       - name: Run cargo check
         working-directory: ./rsky-pdsadmin
-        run: cargo check
+        run: cargo check --locked
 
   # Build and test job for rsky-pdsadmin
   build-and-test:
@@ -49,18 +43,16 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-      - name: Install nightly toolchain
-        uses: dtolnay/rust-toolchain@nightly
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: rsky-pdsadmin
       - name: Run cargo build
         working-directory: ./rsky-pdsadmin
-        run: cargo build --release
+        run: cargo build --release --locked
       - name: Run cargo test
         working-directory: ./rsky-pdsadmin
-        run: cargo test
+        run: cargo test --locked
 
   # Final job that depends on all tests to signal success
   ci-success:

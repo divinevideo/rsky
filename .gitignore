@@ -1,6 +1,5 @@
 /target/
 rsky-pdsadmin/target/
-rsky-pdsadmin/Cargo.lock
 **/*.rs.bk
 .openapi-generator-ignore
 .openapi-generator
