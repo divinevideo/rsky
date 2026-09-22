@@ -28,25 +28,18 @@ pub async fn inner_get_author_feed(
     state_local_viewer: &State<SharedLocalViewer>,
     actor_store: &State<ActorStore>,
     account_manager: AccountManager,
-) -> Result<ReadAfterWriteResponse<AuthorFeed>> {
-    let requester: Option<String> = auth.did_opt().await?;
-    match requester {
-        None => Ok(ReadAfterWriteResponse::HandlerPipeThrough(res)),
-        Some(requester) => {
-            let read_afer_write_response = handle_read_after_write(
-                METHOD_NSID.to_string(),
-                requester,
-                res,
-                get_author_munge,
-                blobstore_factory,
-                state_local_viewer,
-                actor_store,
-                account_manager,
-            )
-            .await?;
-            Ok(read_afer_write_response)
-        }
-    }
+) -> ReadAfterWriteResponse<AuthorFeed> {
+    handle_read_after_write(
+        METHOD_NSID.to_string(),
+        auth.requester_did().unwrap_or_default(),
+        res,
+        get_author_munge,
+        blobstore_factory,
+        state_local_viewer,
+        actor_store,
+        account_manager,
+    )
+    .await
 }
 
 /// Get a view of an actor's 'author feed' (post and reposts by the author). Does not require auth.
@@ -97,7 +90,7 @@ pub async fn get_author_feed(
                 "not found".to_string(),
             ));
         }
-        Some(_) => match inner_get_author_feed(
+        Some(_) => Ok(inner_get_author_feed(
             actor,
             limit,
             cursor,
@@ -109,11 +102,7 @@ pub async fn get_author_feed(
             actor_store,
             account_manager,
         )
-        .await
-        {
-            Ok(response) => Ok(response),
-            Err(_) => Err(ApiError::RuntimeError),
-        },
+        .await),
     }
 }
 

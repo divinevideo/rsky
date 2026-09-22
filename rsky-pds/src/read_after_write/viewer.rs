@@ -362,7 +362,9 @@ impl LocalViewer {
             (Some(_), Some(_)) => {
                 let collection = AtUri::new(embed.record.uri.clone(), None)?.get_collection();
                 if collection == Ids::AppBskyFeedPost.as_str() {
-                    let appview_agent = self.get_authenticated_agent_for_nsid(&collection).await?;
+                    let appview_agent = self
+                        .get_authenticated_agent_for_nsid(Ids::AppBskyFeedGetPosts.as_str())
+                        .await?;
                     let res: AppBskyFeedGetPostsOutput = appview_agent
                         .service
                         .app
@@ -395,7 +397,9 @@ impl LocalViewer {
                         }
                     }
                 } else if collection == Ids::AppBskyFeedGenerator.as_str() {
-                    let appview_agent = self.get_authenticated_agent_for_nsid(&collection).await?;
+                    let appview_agent = self
+                        .get_authenticated_agent_for_nsid(Ids::AppBskyFeedGetFeedGenerator.as_str())
+                        .await?;
                     let res: AppBskyFeedGetFeedGeneratorOutput = appview_agent
                         .service
                         .app
@@ -412,7 +416,9 @@ impl LocalViewer {
                         serde_json::from_value(serde_json::to_value(&res.view)?)?;
                     Ok(Some(record::ViewUnion::GeneratorView(generator_view)))
                 } else if collection == Ids::AppBskyGraphList.as_str() {
-                    let appview_agent = self.get_authenticated_agent_for_nsid(&collection).await?;
+                    let appview_agent = self
+                        .get_authenticated_agent_for_nsid(Ids::AppBskyGraphGetList.as_str())
+                        .await?;
                     let res: AppBskyGraphGetListOutput = appview_agent
                         .service
                         .app

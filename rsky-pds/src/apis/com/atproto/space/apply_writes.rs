@@ -11,7 +11,7 @@ use crate::space_auth::session_permits;
 use crate::space_scope::{SpaceAction, SpaceRequest};
 use rocket::serde::json::Json;
 use rocket::State;
-use rsky_common::tid::TID;
+use rsky_common::tid::Ticker;
 use rsky_lexicon::com::atproto::space::{
     ApplyWritesInput, ApplyWritesOutput, ApplyWritesResult, CreateResult, DeleteResult,
     UpdateResult,
@@ -65,7 +65,7 @@ pub async fn space_apply_writes(
         let collection = write.collection;
         let rkey = match (action, write.rkey) {
             (_, Some(rkey)) if !rkey.is_empty() => rkey,
-            (SpaceAction::Create, _) => TID::next_str(None).map_err(|_| ApiError::RuntimeError)?,
+            (SpaceAction::Create, _) => Ticker::new().next(None).to_string(),
             _ => {
                 return Err(ApiError::InvalidRequest(
                     "rkey is required for update and delete".to_string(),

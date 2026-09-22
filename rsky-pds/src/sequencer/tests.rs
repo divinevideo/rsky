@@ -590,10 +590,17 @@ async fn account_event_matches_reference_shape() {
 #[tokio::test]
 async fn sync_evt_data_from_commit_requires_commit_block() {
     let cid = Cid::from_str(TEST_CID).unwrap();
-    let data = commit_data(cid);
+    let mut data = commit_data(cid);
+    let unrelated = data
+        .commit_data
+        .relevant_blocks
+        .add("an unrelated record")
+        .unwrap();
     let sync_data = sync_evt_data_from_commit(data).await.unwrap();
     assert_eq!(sync_data.cid, cid);
     assert_eq!(sync_data.rev, "3jzfcijpj2z2a");
+    assert_eq!(sync_data.blocks.get(cid), Some(&vec![1, 2, 3]));
+    assert!(!sync_data.blocks.has(unrelated));
 
     let mut missing = commit_data(cid);
     missing.commit_data.relevant_blocks = BlockMap::new();

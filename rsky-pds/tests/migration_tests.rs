@@ -542,6 +542,45 @@ async fn importing_the_same_car_twice_changes_nothing() {
     );
 }
 
+#[tokio::test]
+async fn importing_a_newer_car_updates_existing_record_values() {
+    let _plc = published_key_lock().await;
+    let (_source_dir, source) = common::get_client().await;
+    let source_token = account(&source).await;
+    let original = seed_and_export(&source, &source_token).await;
+    let (_target_dir, target) = common::get_client().await;
+    let target_token = account(&target).await;
+    assert_eq!(
+        import_repo(&target, &target_token, &original)
+            .await
+            .status(),
+        Status::Ok
+    );
+    let updated = json!({"$type":"com.example.record", "text":"updated during migration"});
+    let response = source.post("/xrpc/com.atproto.repo.putRecord")
+        .header(ContentType::JSON).header(bearer(&source_token))
+        .body(json!({"repo":DID,"collection":"com.example.record","rkey":"two","validate":false,"record":updated}).to_string())
+        .dispatch().await;
+    assert_eq!(response.status(), Status::Ok);
+    let expected = json_body(response).await;
+    let current = export_repo(&source).await;
+    assert_eq!(
+        import_repo(&target, &target_token, &current).await.status(),
+        Status::Ok
+    );
+    activate(&target, &target_token).await;
+    let records = list_records(&target).await;
+    assert_eq!(records["records"].as_array().unwrap().len(), 2);
+    let record = records["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["uri"] == expected["uri"])
+        .unwrap();
+    assert_eq!(record["cid"], expected["cid"]);
+    assert_eq!(record["value"], updated);
+}
+
 // ---------------------------------------------------------------------------
 // com.atproto.sync.getBlocks / com.atproto.sync.getRecord
 // ---------------------------------------------------------------------------

@@ -23,11 +23,10 @@ pub async fn inner_get_profiles(
     state_local_viewer: &State<SharedLocalViewer>,
     actor_store: &State<ActorStore>,
     account_manager: AccountManager,
-) -> Result<ReadAfterWriteResponse<GetProfilesOutput>, ApiError> {
-    let requester: String = auth.did_opt().await?.unwrap_or_default();
-    let read_afer_write_response = handle_read_after_write(
+) -> ReadAfterWriteResponse<GetProfilesOutput> {
+    handle_read_after_write(
         METHOD_NSID.to_string(),
-        requester,
+        auth.requester_did().unwrap_or_default(),
         res,
         get_profiles_munge,
         blobstore_factory,
@@ -35,8 +34,7 @@ pub async fn inner_get_profiles(
         actor_store,
         account_manager,
     )
-    .await?;
-    Ok(read_afer_write_response)
+    .await
 }
 
 /// Get detailed profile views of multiple actors.
@@ -55,22 +53,16 @@ pub async fn get_profiles(
 ) -> Result<ReadAfterWriteResponse<GetProfilesOutput>, ApiError> {
     match cfg.bsky_app_view {
         None => Err(ApiError::AccountNotFound),
-        Some(_) => {
-            match inner_get_profiles(
-                actors,
-                auth,
-                res,
-                blobstore_factory,
-                state_local_viewer,
-                actor_store,
-                account_manager,
-            )
-            .await
-            {
-                Ok(response) => Ok(response),
-                Err(error) => Err(error),
-            }
-        }
+        Some(_) => Ok(inner_get_profiles(
+            actors,
+            auth,
+            res,
+            blobstore_factory,
+            state_local_viewer,
+            actor_store,
+            account_manager,
+        )
+        .await),
     }
 }
 

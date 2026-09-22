@@ -262,6 +262,7 @@ pub struct SafeClient {
     policy: NetworkPolicy,
     resolver: Arc<SafeResolver>,
     client: reqwest::Client,
+    roots: Vec<reqwest::Certificate>,
 }
 
 impl std::fmt::Debug for SafeClient {
@@ -284,16 +285,31 @@ impl SafeClient {
         timeout: Duration,
         lookup: Arc<dyn Lookup>,
     ) -> Result<Self, FetchError> {
+        Self::with_lookup_and_roots(policy, timeout, lookup, Vec::new())
+    }
+
+    /// Add explicit trust roots for a private service without weakening
+    /// certificate verification, destination policy, or redirect handling.
+    pub fn with_lookup_and_roots(
+        policy: NetworkPolicy,
+        timeout: Duration,
+        lookup: Arc<dyn Lookup>,
+        roots: Vec<reqwest::Certificate>,
+    ) -> Result<Self, FetchError> {
         let resolver = Arc::new(SafeResolver::new(policy, lookup));
-        let client = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .timeout(timeout)
             .redirect(Policy::none())
-            .dns_resolver(resolver.clone())
-            .build()?;
+            .dns_resolver(resolver.clone());
+        for root in &roots {
+            builder = builder.add_root_certificate(root.clone());
+        }
+        let client = builder.build()?;
         Ok(Self {
             policy,
             resolver,
             client,
+            roots,
         })
     }
 
@@ -301,9 +317,13 @@ impl SafeClient {
     /// for callers that need their own default headers or timeouts. Check
     /// every URL sent through it with [`SafeClient::check`].
     pub fn builder(&self) -> reqwest::ClientBuilder {
-        reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .redirect(Policy::none())
-            .dns_resolver(self.resolver.clone())
+            .dns_resolver(self.resolver.clone());
+        for root in &self.roots {
+            builder = builder.add_root_certificate(root.clone());
+        }
+        builder
     }
 
     #[must_use]

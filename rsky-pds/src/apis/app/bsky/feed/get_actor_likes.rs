@@ -26,25 +26,18 @@ pub async fn inner_get_actor_likes(
     state_local_viewer: &State<SharedLocalViewer>,
     actor_store: &State<ActorStore>,
     account_manager: AccountManager,
-) -> Result<ReadAfterWriteResponse<AuthorFeed>> {
-    let requester: Option<String> = auth.did_opt().await?;
-    match requester {
-        None => Ok(ReadAfterWriteResponse::HandlerPipeThrough(res)),
-        Some(requester) => {
-            let read_afer_write_response = handle_read_after_write(
-                METHOD_NSID.to_string(),
-                requester,
-                res,
-                get_author_munge,
-                blobstore_factory,
-                state_local_viewer,
-                actor_store,
-                account_manager,
-            )
-            .await?;
-            Ok(read_afer_write_response)
-        }
-    }
+) -> ReadAfterWriteResponse<AuthorFeed> {
+    handle_read_after_write(
+        METHOD_NSID.to_string(),
+        auth.requester_did().unwrap_or_default(),
+        res,
+        get_author_munge,
+        blobstore_factory,
+        state_local_viewer,
+        actor_store,
+        account_manager,
+    )
+    .await
 }
 
 /// Get a list of posts liked by an actor. Does not require auth.
@@ -70,7 +63,7 @@ pub async fn get_actor_likes(
     }
     match cfg.bsky_app_view {
         None => Err(ApiError::RuntimeError),
-        Some(_) => match inner_get_actor_likes(
+        Some(_) => Ok(inner_get_actor_likes(
             actor,
             limit,
             cursor,
@@ -81,14 +74,7 @@ pub async fn get_actor_likes(
             actor_store,
             account_manager,
         )
-        .await
-        {
-            Ok(response) => Ok(response),
-            Err(error) => {
-                tracing::error!("{error}");
-                Err(ApiError::RuntimeError)
-            }
-        },
+        .await),
     }
 }
 

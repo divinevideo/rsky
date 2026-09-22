@@ -581,12 +581,7 @@ pub async fn build_rocket(rocket_cfg: Option<RocketConfig>) -> Rocket<Build> {
             cfg.subscription.max_buffer as usize,
         )),
     };
-    let mut background_sequencer = sequencer.sequencer.write().await.clone();
-    tokio::spawn(async move {
-        if let Err(error) = background_sequencer.start().await {
-            tracing::error!(%error, "Sequencer exited");
-        }
-    });
+    sequencer.sequencer.read().await.clone().spawn();
 
     let blob_attempts = blob_attempts::AttemptJournal::open(
         &cfg.service_db.blob_attempts_db_location,

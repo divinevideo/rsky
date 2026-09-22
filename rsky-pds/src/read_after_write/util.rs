@@ -114,7 +114,7 @@ pub async fn handle_read_after_write<T: DeserializeOwned + serde::Serialize>(
     state_local_viewer: &State<SharedLocalViewer>,
     actor_store: &State<ActorStore>,
     account_manager: AccountManager,
-) -> Result<ReadAfterWriteResponse<T>> {
+) -> ReadAfterWriteResponse<T> {
     match read_after_write_internal(
         nsid,
         requester.clone(),
@@ -127,14 +127,14 @@ pub async fn handle_read_after_write<T: DeserializeOwned + serde::Serialize>(
     )
     .await
     {
-        Ok(read_after_write_result) => Ok(read_after_write_result),
+        Ok(read_after_write_result) => read_after_write_result,
         Err(err) => {
             tracing::warn!(
                 "Error in read after write munge {} {}",
                 err.to_string(),
                 requester
             );
-            Ok(ReadAfterWriteResponse::HandlerPipeThrough(res))
+            ReadAfterWriteResponse::HandlerPipeThrough(res)
         }
     }
 }
@@ -260,3 +260,7 @@ mod tests {
         assert!(wrapped.as_object().unwrap().contains_key("body"));
     }
 }
+
+#[cfg(test)]
+#[path = "util_response_tests.rs"]
+mod response_contract_tests;

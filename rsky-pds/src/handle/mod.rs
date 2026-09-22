@@ -140,3 +140,7 @@ fn ensure_handle_service_constraints(
 pub mod errors;
 pub mod explicit_slurs;
 pub mod reserved;
+
+#[cfg(test)]
+#[path = "handle_tests.rs"]
+mod tests;

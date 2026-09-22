@@ -1087,6 +1087,114 @@ async fn invite_helper_direct_queries() {
         .await
         .unwrap()
         .is_empty());
+
+    am.create_invite_codes(
+        vec![AccountCodes {
+            account: "did:plc:issuer".to_owned(),
+            codes: vec!["direct-code".to_owned()],
+        }],
+        1,
+    )
+    .await
+    .unwrap();
+    invite::ensure_invite_is_available("direct-code".to_owned(), &am.db)
+        .await
+        .unwrap();
+    invite::record_invite_use(
+        "did:plc:direct-use".to_owned(),
+        Some("direct-code".to_owned()),
+        rsky_common::now(),
+        &am.db,
+    )
+    .await
+    .unwrap();
+    let err = invite::ensure_invite_is_available("direct-code".to_owned(), &am.db)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("Not enough uses"));
+    let invited_by = am
+        .get_invited_by_for_accounts(vec!["did:plc:direct-use".to_owned()])
+        .await
+        .unwrap();
+    assert_eq!(invited_by["did:plc:direct-use"].code, "direct-code");
+}
+
+#[tokio::test]
+async fn rotation_retries_after_another_writer_wins_the_refresh_id() {
+    let (_dir, am) = test_manager().await;
+    let did = "did:plc:refresh-race";
+    let (_, refresh_jwt) = create_test_account(&am, did, "refresh-race.test").await;
+    let original = auth::decode_refresh_token(refresh_jwt).unwrap();
+
+    // Rotation first reads the old token, then prunes expired tokens. This
+    // trigger models a concurrent writer claiming the successor id during
+    // that gap, so the first update loses and the retry must reuse its id.
+    am.db
+        .run(move |conn| {
+            conn.execute_batch(
+                "INSERT INTO refresh_token (id, did, \"expiresAt\") \
+                 VALUES ('expired-sentinel', 'did:plc:refresh-race', '1970-01-01T00:00:01.000Z');
+                 CREATE TRIGGER other_refresh_wins AFTER DELETE ON refresh_token
+                 WHEN OLD.id = 'expired-sentinel'
+                 BEGIN
+                   UPDATE refresh_token SET \"nextId\" = 'concurrent-winner'
+                   WHERE did = 'did:plc:refresh-race' AND id != 'expired-sentinel';
+                 END;",
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let (_, refreshed_jwt) = am
+        .rotate_refresh_token(&original.jti)
+        .await
+        .unwrap()
+        .unwrap();
+    let refreshed = auth::decode_refresh_token(refreshed_jwt).unwrap();
+    assert_eq!(refreshed.jti, "concurrent-winner");
+    assert!(auth::get_refresh_token("concurrent-winner", &am.db)
+        .await
+        .unwrap()
+        .is_some());
+}
+
+#[tokio::test]
+async fn rotation_propagates_a_storage_error_without_creating_a_successor() {
+    let (_dir, am) = test_manager().await;
+    let (_, refresh_jwt) =
+        create_test_account(&am, "did:plc:refresh-error", "refresh-error.test").await;
+    let original = auth::decode_refresh_token(refresh_jwt).unwrap();
+    am.db
+        .run(move |conn| {
+            conn.execute_batch(
+                "CREATE TRIGGER reject_refresh_update BEFORE UPDATE ON refresh_token
+                 BEGIN SELECT RAISE(ABORT, 'synthetic refresh storage failure'); END;",
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let err = am.rotate_refresh_token(&original.jti).await.unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("synthetic refresh storage failure"));
+    let stored = auth::get_refresh_token(&original.jti, &am.db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(stored.next_id.is_none());
+    let token_ids = am
+        .db
+        .run(|conn| {
+            let mut stmt = conn.prepare("SELECT id FROM refresh_token WHERE did = ?1")?;
+            let rows = stmt.query_map(["did:plc:refresh-error"], |row| row.get::<_, String>(0))?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(token_ids, vec![original.jti]);
 }
 
 #[tokio::test]

@@ -92,6 +92,15 @@ impl Sequencer {
         self.events.subscribe()
     }
 
+    /// Runs the poller in the background, reporting a failure to start.
+    pub fn spawn(mut self) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            if let Err(error) = self.start().await {
+                tracing::error!(%error, "Sequencer exited");
+            }
+        })
+    }
+
     /// Polls the sequencer db for newly sequenced events and emits them.
     /// Sleeps on a notification handle between polls rather than busy-polling.
     pub async fn start(&mut self) -> Result<()> {
@@ -224,54 +233,55 @@ impl Sequencer {
                 }
                 let mut stmt = conn.prepare(&sql)?;
                 let rows = stmt
-                    .query_map(params_from_iter(sql_params), repo_seq_from_row)?
-                    .collect::<Result<Vec<models::RepoSeq>, rusqlite::Error>>()?;
+                    .query_map(params_from_iter(sql_params), |row| {
+                        // Persisted rows always have their INTEGER PRIMARY KEY,
+                        // unlike an event that has not been sequenced yet.
+                        Ok((row.get::<_, i64>(0)?, repo_seq_from_row(row)?))
+                    })?
+                    .collect::<Result<Vec<_>, rusqlite::Error>>()?;
                 Ok(rows)
             })
             .await?;
 
         let mut seq_evts: Vec<SeqEvt> = Vec::new();
-        for row in rows {
+        for (seq, row) in rows {
             let time = row.sequenced_at;
-            match row.seq {
-                None => continue, // should never hit this because of the primary key
-                Some(seq) => match row.event_type.as_str() {
-                    "append" | "rebase" => {
-                        seq_evts.push(SeqEvt::TypedCommitEvt(Box::new(TypedCommitEvt {
-                            r#type: "commit".to_string(),
-                            seq,
-                            time,
-                            evt: cbor_to_struct(row.event)?,
-                        })));
-                    }
-                    "sync" => {
-                        seq_evts.push(SeqEvt::TypedSyncEvt(TypedSyncEvt {
-                            r#type: "sync".to_string(),
-                            seq,
-                            time,
-                            evt: cbor_to_struct(row.event)?,
-                        }));
-                    }
-                    "identity" => {
-                        seq_evts.push(SeqEvt::TypedIdentityEvt(TypedIdentityEvt {
-                            r#type: "identity".to_string(),
-                            seq,
-                            time,
-                            evt: cbor_to_struct(row.event)?,
-                        }));
-                    }
-                    "account" => {
-                        seq_evts.push(SeqEvt::TypedAccountEvt(TypedAccountEvt {
-                            r#type: "account".to_string(),
-                            seq,
-                            time,
-                            evt: cbor_to_struct(row.event)?,
-                        }));
-                    }
-                    _ => {
-                        tracing::error!("request_seq_range invalid event type");
-                    }
-                },
+            match row.event_type.as_str() {
+                "append" | "rebase" => {
+                    seq_evts.push(SeqEvt::TypedCommitEvt(Box::new(TypedCommitEvt {
+                        r#type: "commit".to_string(),
+                        seq,
+                        time,
+                        evt: cbor_to_struct(row.event)?,
+                    })));
+                }
+                "sync" => {
+                    seq_evts.push(SeqEvt::TypedSyncEvt(TypedSyncEvt {
+                        r#type: "sync".to_string(),
+                        seq,
+                        time,
+                        evt: cbor_to_struct(row.event)?,
+                    }));
+                }
+                "identity" => {
+                    seq_evts.push(SeqEvt::TypedIdentityEvt(TypedIdentityEvt {
+                        r#type: "identity".to_string(),
+                        seq,
+                        time,
+                        evt: cbor_to_struct(row.event)?,
+                    }));
+                }
+                "account" => {
+                    seq_evts.push(SeqEvt::TypedAccountEvt(TypedAccountEvt {
+                        r#type: "account".to_string(),
+                        seq,
+                        time,
+                        evt: cbor_to_struct(row.event)?,
+                    }));
+                }
+                _ => {
+                    tracing::error!("request_seq_range invalid event type");
+                }
             }
         }
 

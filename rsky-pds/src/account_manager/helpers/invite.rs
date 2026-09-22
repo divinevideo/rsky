@@ -34,39 +34,44 @@ fn placeholders(len: usize) -> String {
 }
 
 pub async fn ensure_invite_is_available(invite_code: String, db: &Db) -> Result<()> {
-    db.run(move |conn| {
-        let invite: Option<models::InviteCode> = conn
-            .query_row(
-                &format!(
-                    "{SELECT_INVITE_CODE} \
+    db.run(move |conn| ensure_invite_is_available_in(conn, &invite_code))
+        .await
+}
+
+pub(crate) fn ensure_invite_is_available_in(
+    conn: &rusqlite::Connection,
+    invite_code: &str,
+) -> Result<()> {
+    let invite: Option<models::InviteCode> = conn
+        .query_row(
+            &format!(
+                "{SELECT_INVITE_CODE} \
                      LEFT JOIN actor ON invite_code.\"forAccount\" = actor.did \
                          AND actor.\"takedownRef\" IS NULL \
                      WHERE code = ?1"
-                ),
-                params![invite_code],
-                invite_code_from_row,
-            )
-            .optional()?;
-
-        let Some(invite) = invite else {
-            bail!("InvalidInviteCode: None or disabled. Provided invite code not available `{invite_code:?}`")
-        };
-        if invite.disabled > 0 {
-            bail!("InvalidInviteCode: None or disabled. Provided invite code not available `{invite_code:?}`")
-        }
-
-        let uses: i64 = conn.query_row(
-            "SELECT count(*) FROM invite_code_use WHERE code = ?1",
+            ),
             params![invite_code],
-            |row| row.get(0),
-        )?;
+            invite_code_from_row,
+        )
+        .optional()?;
 
-        if invite.available_uses as i64 <= uses {
-            bail!("InvalidInviteCode: Not enough uses. Provided invite code not available `{invite_code:?}`")
-        }
-        Ok(())
-    })
-    .await
+    let Some(invite) = invite else {
+        bail!("InvalidInviteCode: None or disabled. Provided invite code not available `{invite_code:?}`")
+    };
+    if invite.disabled > 0 {
+        bail!("InvalidInviteCode: None or disabled. Provided invite code not available `{invite_code:?}`")
+    }
+
+    let uses: i64 = conn.query_row(
+        "SELECT count(*) FROM invite_code_use WHERE code = ?1",
+        params![invite_code],
+        |row| row.get(0),
+    )?;
+
+    if invite.available_uses as i64 <= uses {
+        bail!("InvalidInviteCode: Not enough uses. Provided invite code not available `{invite_code:?}`")
+    }
+    Ok(())
 }
 
 pub async fn record_invite_use(
@@ -75,15 +80,21 @@ pub async fn record_invite_use(
     now: String,
     db: &Db,
 ) -> Result<()> {
+    db.run(move |conn| record_invite_use_in(conn, &did, invite_code.as_deref(), &now))
+        .await
+}
+
+pub(crate) fn record_invite_use_in(
+    conn: &rusqlite::Connection,
+    did: &str,
+    invite_code: Option<&str>,
+    now: &str,
+) -> Result<()> {
     if let Some(invite_code) = invite_code {
-        db.run(move |conn| {
-            conn.execute(
-                "INSERT INTO invite_code_use (code, \"usedBy\", \"usedAt\") VALUES (?1, ?2, ?3)",
-                params![invite_code, did, now],
-            )?;
-            Ok(())
-        })
-        .await?;
+        conn.execute(
+            "INSERT INTO invite_code_use (code, \"usedBy\", \"usedAt\") VALUES (?1, ?2, ?3)",
+            params![invite_code, did, now],
+        )?;
     }
     Ok(())
 }

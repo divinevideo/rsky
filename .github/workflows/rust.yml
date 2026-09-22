@@ -176,10 +176,23 @@ jobs:
         run: |
           docker exec -i test-pg psql -U postgres -d bsky_test \
             -v ON_ERROR_STOP=1 -q < rsky-feedgen/migrations/2024-11-16-235919_020/up.sql
+      - name: Start Redis for PDS replay and rate-limit tests
+        if: matrix.package == 'rsky-pds'
+        run: |
+          docker run -d --name test-redis -p 6379:6379 redis:7-alpine
+          for _ in $(seq 1 30); do
+            if docker exec test-redis redis-cli ping | grep -q PONG; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs test-redis
+          exit 1
       - name: Run cargo test for ${{ matrix.package }}
         run: cargo test --release -p ${{ matrix.package }}
         env:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/bsky_test
+          TEST_REDIS_URL: ${{ matrix.package == 'rsky-pds' && 'redis://127.0.0.1:6379' || '' }}
       # The transcode e2e tests are #[ignore]d so plain `cargo test` doesn't
       # require ffmpeg on every dev machine; CI installs it and runs them
       # explicitly, otherwise the video normalization fix has zero coverage
@@ -199,11 +212,22 @@ jobs:
   coverage-pds:
     needs: determine-workspace-members
     runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 15
     env:
       CARGO_BUILD_JOBS: 2
       RUST_TEST_THREADS: 2
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
+      TEST_REDIS_URL: redis://127.0.0.1:6379
     if: |
       contains(fromJson(needs.determine-workspace-members.outputs.workspace_members), 'rsky-pds') ||
       contains(fromJson(needs.determine-workspace-members.outputs.workspace_members), 'rsky-oauth') ||

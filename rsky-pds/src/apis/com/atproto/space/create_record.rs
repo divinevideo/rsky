@@ -11,7 +11,7 @@ use crate::space_auth::session_permits;
 use crate::space_scope::{SpaceAction, SpaceRequest};
 use rocket::serde::json::Json;
 use rocket::State;
-use rsky_common::tid::TID;
+use rsky_common::tid::Ticker;
 use rsky_lexicon::com::atproto::space::{CreateRecordInput, CreateRecordOutput};
 use rsky_syntax::nsid::ensure_valid_nsid;
 
@@ -48,7 +48,7 @@ pub async fn space_create_record(
     let rkey = match rkey {
         Some(rkey) if valid_key_part(&rkey, 512) => rkey,
         Some(rkey) => return Err(ApiError::InvalidRequest(format!("invalid rkey: {rkey}"))),
-        None => TID::next_str(None).map_err(|_| ApiError::RuntimeError)?,
+        None => Ticker::new().next(None).to_string(),
     };
     if !session_permits(
         &credentials,

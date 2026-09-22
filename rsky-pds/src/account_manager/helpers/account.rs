@@ -170,6 +170,16 @@ pub async fn register_actor(
     deactivated: Option<bool>,
     db: &Db,
 ) -> Result<()> {
+    db.run(move |conn| register_actor_in(conn, &did, &handle, deactivated))
+        .await
+}
+
+pub(crate) fn register_actor_in(
+    conn: &rusqlite::Connection,
+    did: &str,
+    handle: &str,
+    deactivated: Option<bool>,
+) -> Result<()> {
     let system_time = SystemTime::now();
     let dt: DateTime<UtcOffset> = system_time.into();
     let created_at = format!("{}", dt.format(RFC3339_VARIANT));
@@ -185,20 +195,16 @@ pub async fn register_actor(
         _ => None,
     };
 
-    let registered = db
-        .run(move |conn| {
-            Ok(conn
-                .query_row(
-                    "INSERT INTO actor (did, handle, \"createdAt\", \"deactivatedAt\", \"deleteAfter\") \
-                     VALUES (?1, ?2, ?3, ?4, ?5) \
-                     ON CONFLICT (did) DO NOTHING \
-                     RETURNING did",
-                    params![did, handle, created_at, deactivate_at, deactivate_after],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()?)
-        })
-        .await?;
+    let registered = conn
+        .query_row(
+            "INSERT INTO actor (did, handle, \"createdAt\", \"deactivatedAt\", \"deleteAfter\") \
+             VALUES (?1, ?2, ?3, ?4, ?5) \
+             ON CONFLICT (did) DO NOTHING \
+             RETURNING did",
+            params![did, handle, created_at, deactivate_at, deactivate_after],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
     match registered {
         Some(_) => Ok(()),
         None => Err(anyhow::Error::new(
@@ -208,20 +214,26 @@ pub async fn register_actor(
 }
 
 pub async fn register_account(did: String, email: String, password: String, db: &Db) -> Result<()> {
-    let registered = db
-        .run(move |conn| {
-            Ok(conn
-                .query_row(
-                    "INSERT INTO account (did, email, \"passwordScrypt\") \
-                     VALUES (?1, ?2, ?3) \
-                     ON CONFLICT (did) DO NOTHING \
-                     RETURNING did",
-                    params![did, email, password],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()?)
-        })
-        .await?;
+    db.run(move |conn| register_account_in(conn, &did, &email, &password))
+        .await
+}
+
+pub(crate) fn register_account_in(
+    conn: &rusqlite::Connection,
+    did: &str,
+    email: &str,
+    password: &str,
+) -> Result<()> {
+    let registered = conn
+        .query_row(
+            "INSERT INTO account (did, email, \"passwordScrypt\") \
+             VALUES (?1, ?2, ?3) \
+             ON CONFLICT (did) DO NOTHING \
+             RETURNING did",
+            params![did, email, password],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
     match registered {
         Some(_) => Ok(()),
         None => Err(anyhow::Error::new(

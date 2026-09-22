@@ -98,10 +98,8 @@ pub async fn inner_resolve_identity(
         }
         (None, _) => INVALID_HANDLE.to_string(),
     };
-    let did_doc = serde_json::to_value(&doc).map_err(|error| {
-        tracing::error!("@LOG: ERROR: {error}");
-        ApiError::RuntimeError
-    })?;
+    // DID documents contain only strings, lists, and optional string fields.
+    let did_doc = serde_json::json!(doc);
     Ok(IdentityInfo {
         did,
         handle,
@@ -123,28 +121,5 @@ pub async fn resolve_identity(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn classifies_dids_and_handles() {
-        assert!(matches!(
-            classify_identifier("did:plc:w4xbfzo7kqfes5zb7r6qv3rw"),
-            Identifier::Did(_)
-        ));
-        assert!(matches!(
-            classify_identifier("did:web:example.com"),
-            Identifier::Did(_)
-        ));
-        match classify_identifier("Alice.Test") {
-            Identifier::Handle(handle) => assert_eq!(handle, "alice.test"),
-            Identifier::Did(_) => panic!("expected handle"),
-        }
-    }
-
-    #[test]
-    fn matches_handles_case_insensitively() {
-        assert!(handles_match("alice.test", "Alice.Test"));
-        assert!(!handles_match("alice.test", "bob.test"));
-    }
-}
+#[path = "resolve_identity_tests.rs"]
+mod tests;

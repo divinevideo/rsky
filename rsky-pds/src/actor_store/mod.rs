@@ -1318,3 +1318,7 @@ impl ActorStoreTransactor {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "repair_reader_compatibility_tests.rs"]
+mod repair_reader_compatibility_tests;

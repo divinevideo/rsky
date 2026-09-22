@@ -65,16 +65,16 @@ pub async fn safe_resolve_did_doc(
     id_resolver: &State<SharedIdResolver>,
     did: &String,
     force_refresh: Option<bool>,
-) -> Result<Option<DidDocument>> {
+) -> Option<DidDocument> {
     let lock = id_resolver.id_resolver.read().await;
     match lock.did.resolve(did.clone(), force_refresh).await {
-        Ok(did_doc) => Ok(did_doc),
+        Ok(did_doc) => did_doc,
         Err(err) => {
             tracing::error!(
                 "@LOG: failed to resolve did doc for `{did}` with error: `{}`",
                 err.to_string()
             );
-            Ok(None)
+            None
         }
     }
 }
@@ -151,36 +151,47 @@ pub async fn assert_valid_did_documents_for_service(
         }
         let url =
             crate::outbound::client().checked(&format!("https://{host}/.well-known/did.json"))?;
-        let response = crate::outbound::client()
-            .get(url, rsky_identity::safe_fetch::Redirects::Follow(3))
+        assert_valid_web_did_document(crate::outbound::client(), url, &expected_signing_key)
             .await?;
-        let (status, body) =
-            rsky_identity::safe_fetch::SafeClient::read_bounded(response, 64 * 1024).await?;
-        if !status.is_success() {
-            bail!("did:web document request answered {status}")
-        }
-        let doc: DidDocument = serde_json::from_slice(&body)?;
-        let pds_endpoint = doc.service.as_deref().and_then(|services| {
-            services
-                .iter()
-                .find(|s| s.id.ends_with("atproto_pds"))
-                .map(|s| s.service_endpoint.clone())
-        });
-        let signing_key = get_verification_material(&doc, "atproto")
-            .and_then(|material| get_did_key_from_multibase(material).ok().flatten());
-        assert_valid_doc_contents(
-            AssertionContents {
-                pds_endpoint,
-                signing_key,
-                rotation_keys: None,
-            },
-            &expected_signing_key,
-        )
-        .await?;
     } else {
         bail!("Unsupported did method: {did}")
     }
     Ok(())
+}
+
+/// Fetch and validate a did:web document through the caller's network-bound
+/// transport. Host-form validation is performed by the activation caller.
+pub async fn assert_valid_web_did_document(
+    client: &rsky_identity::safe_fetch::SafeClient,
+    url: url::Url,
+    expected_signing_key: &str,
+) -> Result<()> {
+    let response = client
+        .get(url, rsky_identity::safe_fetch::Redirects::Follow(3))
+        .await?;
+    let (status, body) =
+        rsky_identity::safe_fetch::SafeClient::read_bounded(response, 64 * 1024).await?;
+    if !status.is_success() {
+        bail!("did:web document request answered {status}")
+    }
+    let doc: DidDocument = serde_json::from_slice(&body)?;
+    let pds_endpoint = doc.service.as_deref().and_then(|services| {
+        services
+            .iter()
+            .find(|s| s.id.ends_with("atproto_pds"))
+            .map(|s| s.service_endpoint.clone())
+    });
+    let signing_key = get_verification_material(&doc, "atproto")
+        .and_then(|material| get_did_key_from_multibase(material).ok().flatten());
+    assert_valid_doc_contents(
+        AssertionContents {
+            pds_endpoint,
+            signing_key,
+            rotation_keys: None,
+        },
+        expected_signing_key,
+    )
+    .await
 }
 
 pub async fn assert_valid_doc_contents(
@@ -254,88 +265,5 @@ pub mod revoke_app_password;
 pub mod update_email;
 
 #[cfg(test)]
-mod tests {
-    use super::{did_doc_for_session, validate_handle};
-    use crate::SharedIdResolver;
-    use rsky_identity::types::IdentityResolverOpts;
-    use rsky_identity::IdResolver;
-    use std::io::{Read, Write};
-
-    /// Serves one DID document for every request.
-    fn serve_document(body: &'static str) -> String {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(mut stream) = stream else { continue };
-                let mut buf = [0u8; 2048];
-                let _ = stream.read(&mut buf);
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                let _ = stream.write_all(response.as_bytes());
-            }
-        });
-        format!("http://127.0.0.1:{port}")
-    }
-
-    fn resolver(plc_url: String) -> SharedIdResolver {
-        SharedIdResolver {
-            id_resolver: tokio::sync::RwLock::new(IdResolver::new(IdentityResolverOpts {
-                timeout: Some(std::time::Duration::from_millis(500)),
-                plc_url: Some(plc_url),
-                did_cache: None,
-                backup_nameservers: None,
-            })),
-        }
-    }
-
-    #[tokio::test]
-    async fn session_did_doc_is_optional_and_never_fails_the_session() {
-        let did = "did:plc:sessiondoc";
-        let good = resolver(serve_document(
-            r#"{"id":"did:plc:sessiondoc","alsoKnownAs":["at://doc.test"],"verificationMethod":[],"service":[]}"#,
-        ));
-        assert_eq!(did_doc_for_session(false, &good, did).await, None);
-        let doc = did_doc_for_session(true, &good, did).await.unwrap();
-        assert_eq!(doc["id"], did);
-        let unreachable = resolver("http://127.0.0.1:1".to_owned());
-        assert_eq!(did_doc_for_session(true, &unreachable, did).await, None);
-    }
-
-    fn domains() -> Vec<String> {
-        vec![
-            ".pds.example.com".to_string(),
-            "alt.example.net".to_string(),
-        ]
-    }
-
-    #[test]
-    fn accepts_direct_child_of_service_domain() {
-        assert!(validate_handle("alice.pds.example.com", &domains()));
-    }
-
-    #[test]
-    fn accepts_direct_child_of_secondary_domain() {
-        assert!(validate_handle("bob.alt.example.net", &domains()));
-    }
-
-    #[test]
-    fn rejects_evil_suffix_domain() {
-        assert!(!validate_handle("alice.evilpds.example.com", &domains()));
-        assert!(!validate_handle("evilpds.example.com", &domains()));
-    }
-
-    #[test]
-    fn rejects_multi_label_handles() {
-        assert!(!validate_handle("a.b.pds.example.com", &domains()));
-    }
-
-    #[test]
-    fn rejects_bare_service_domain() {
-        assert!(!validate_handle("pds.example.com", &domains()));
-        assert!(!validate_handle("alt.example.net", &domains()));
-    }
-}
+#[path = "server_tests.rs"]
+mod tests;

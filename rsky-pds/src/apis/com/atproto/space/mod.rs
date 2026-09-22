@@ -444,13 +444,7 @@ pub async fn deliver_notifications(
         .expect("reqwest client");
     for subscriber in subscribers {
         let aud = subscriber.service.as_deref().unwrap_or(fallback_aud);
-        let token = match mint_space_service_token(keypair, iss, aud, lxm) {
-            Ok(token) => token,
-            Err(error) => {
-                tracing::warn!(%error, "failed to mint notification token");
-                return;
-            }
-        };
+        let token = mint_space_service_token(keypair, iss, aud, lxm);
         let url = format!("{}/xrpc/{lxm}", subscriber.endpoint.trim_end_matches('/'));
         let url = match crate::outbound::client().checked(&url) {
             Ok(url) => url,

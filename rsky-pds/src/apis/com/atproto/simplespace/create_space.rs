@@ -9,7 +9,7 @@ use crate::auth_verifier::AccessSpace;
 use crate::space_scope::ManageOp;
 use rocket::serde::json::Json;
 use rocket::State;
-use rsky_common::tid::TID;
+use rsky_common::tid::Ticker;
 use rsky_lexicon::com::atproto::simplespace::{CreateSpaceInput, CreateSpaceOutput};
 use rsky_space::space_id::SpaceId;
 use rsky_syntax::nsid::ensure_valid_nsid;
@@ -43,7 +43,7 @@ pub async fn simplespace_create_space(
     let skey = match skey {
         Some(skey) if valid_key_part(&skey, 512) => skey,
         Some(skey) => return Err(ApiError::InvalidRequest(format!("invalid skey: {skey}"))),
-        None => TID::next_str(None).map_err(|_| ApiError::RuntimeError)?,
+        None => Ticker::new().next(None).to_string(),
     };
     let space = SpaceId::new(did.clone(), space_type.clone(), skey.clone());
     require_manage(&credentials, &did, &space, ManageOp::Create)?;

@@ -177,17 +177,28 @@ impl AccountManager {
         })?;
         let refresh_payload = auth::decode_refresh_token(refresh_jwt.clone())?;
         let now = rsky_common::now();
+        let repo_cid = repo_cid.to_string();
 
-        if let Some(invite_code) = invite_code.clone() {
-            invite::ensure_invite_is_available(invite_code, &self.db).await?;
-        }
-        account::register_actor(did.clone(), handle, deactivated, &self.db).await?;
-        if let (Some(email), Some(password_encrypted)) = (email, password_encrypted) {
-            account::register_account(did.clone(), email, password_encrypted, &self.db).await?;
-        }
-        invite::record_invite_use(did.clone(), invite_code, now, &self.db).await?;
-        auth::store_refresh_token(refresh_payload, None, &self.db).await?;
-        repo::update_root(did, repo_cid, repo_rev, &self.db).await?;
+        // An account cannot be visible until every row needed to serve its
+        // credentials and repository root exists. A later constraint or
+        // storage failure rolls the actor row and invite use back too.
+        self.db
+            .tx(move |tx| {
+                if let Some(code) = invite_code.as_deref() {
+                    invite::ensure_invite_is_available_in(tx, code)?;
+                }
+                account::register_actor_in(tx, &did, &handle, deactivated)?;
+                if let (Some(email), Some(password_encrypted)) =
+                    (email.as_deref(), password_encrypted.as_deref())
+                {
+                    account::register_account_in(tx, &did, email, password_encrypted)?;
+                }
+                invite::record_invite_use_in(tx, &did, invite_code.as_deref(), &now)?;
+                auth::store_refresh_token_tx(tx, &refresh_payload, None)?;
+                repo::update_root_in(tx, &did, &repo_cid, &repo_rev, &now)?;
+                Ok(())
+            })
+            .await?;
         Ok((access_jwt, refresh_jwt))
     }
 

@@ -408,6 +408,12 @@ through XRPC, which is how the Blacksky client performs them:
 
 ## Testing and coverage
 
+The HTTPS integration fixture requires `openssl` on `PATH`; it generates a
+temporary CA and trusts it only in the fixture's client. Redis integration
+tests use `TEST_REDIS_URL` when set. To exercise the same paths as CI, start a
+local Redis instance and run, for example,
+`TEST_REDIS_URL=redis://127.0.0.1:6379 cargo test -p rsky-pds`.
+
 `cargo test -p rsky-pds` runs the unit and integration suites. The
 TypeScript-compatibility fixtures under `tests/fixtures/ts-pds-0.5.27/` are
 tracked in git (the `data/` directory is exempt from the workspace's

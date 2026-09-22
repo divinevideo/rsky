@@ -1122,8 +1122,7 @@ async fn host_methods_and_notifications() {
         MEMBER_DID,
         &format!("{AUTHOR_DID}#atproto_space_host"),
         NOTIFY_WRITE_LXM,
-    )
-    .unwrap();
+    );
     let (status, _) = post_json(
         &s.client,
         "/xrpc/com.atproto.space.notifyWrite",
@@ -1142,8 +1141,7 @@ async fn host_methods_and_notifications() {
 
     // an iss/did mismatch is rejected
     let bad_token =
-        mint_space_service_token(&member_keypair, MEMBER_DID, AUTHOR_DID, NOTIFY_WRITE_LXM)
-            .unwrap();
+        mint_space_service_token(&member_keypair, MEMBER_DID, AUTHOR_DID, NOTIFY_WRITE_LXM);
     let (status, _) = post_json(
         &s.client,
         "/xrpc/com.atproto.space.notifyWrite",
@@ -1343,8 +1341,7 @@ async fn inbound_notify_space_deleted_flags_local_repos() {
         .unwrap();
     // aud names the recipient (the local authority), per audience validation.
     let token =
-        mint_space_service_token(&keypair, AUTHOR_DID, AUTHOR_DID, NOTIFY_SPACE_DELETED_LXM)
-            .unwrap();
+        mint_space_service_token(&keypair, AUTHOR_DID, AUTHOR_DID, NOTIFY_SPACE_DELETED_LXM);
     let (status, _) = post_json(
         &client,
         "/xrpc/com.atproto.space.notifySpaceDeleted",
@@ -1369,8 +1366,7 @@ async fn inbound_notify_space_deleted_flags_local_repos() {
         AUTHOR_DID,
         "did:web:somesyncer.example",
         NOTIFY_SPACE_DELETED_LXM,
-    )
-    .unwrap();
+    );
     let (status, _) = post_json(
         &client,
         "/xrpc/com.atproto.space.notifySpaceDeleted",
@@ -1394,8 +1390,7 @@ async fn inbound_notify_space_deleted_flags_local_repos() {
         AUTHOR_DID,
         "did:web:somesyncer.example",
         NOTIFY_WRITE_LXM,
-    )
-    .unwrap();
+    );
     let (status, _) = post_json(
         &client,
         "/xrpc/com.atproto.space.notifySpaceDeleted",
@@ -1584,7 +1579,7 @@ fn craft_credential_jwt(iss: &str, sub: &str, keypair: Option<&secp256k1::Keypai
         }),
     };
     encode(&header, &claims, |input| match keypair {
-        Some(keypair) => rsky_pds::space_auth::sign_with_keypair(keypair, input),
+        Some(keypair) => Ok(rsky_pds::space_auth::sign_with_keypair(keypair, input)),
         None => Ok(vec![0u8; 64]),
     })
     .unwrap()
@@ -1717,7 +1712,10 @@ async fn credential_edge_cases() {
             cnf: None,
         };
         encode(&header, &claims, |input| {
-            rsky_pds::space_auth::sign_with_keypair(&member_keypair, input)
+            Ok(rsky_pds::space_auth::sign_with_keypair(
+                &member_keypair,
+                input,
+            ))
         })
         .unwrap()
     };
@@ -1804,8 +1802,7 @@ async fn notify_edges_and_allowlist_view() {
         "did:plc:unknownissuer",
         AUTHOR_DID,
         NOTIFY_SPACE_DELETED_LXM,
-    )
-    .unwrap();
+    );
     let (status, _) = post_json(
         &s.client,
         "/xrpc/com.atproto.space.notifySpaceDeleted",
@@ -1887,11 +1884,13 @@ async fn delete_space_notifies_remote_writers() {
         )
         .await
         .unwrap();
-    reader
-        .space
-        .upsert_writer(&s.space, "did:plc:remotewriterxyz", "3krev", None)
-        .await
-        .unwrap();
+    for writer in ["did:plc:remotewriteraaaaaaaaaaaa", "did:web:127.0.0.1"] {
+        reader
+            .space
+            .upsert_writer(&s.space, writer, "3krev", None)
+            .await
+            .unwrap();
+    }
 
     let (status, _) = post_json(
         &s.client,
@@ -2043,4 +2042,433 @@ async fn missing_key_material_is_an_internal_error() {
     )
     .await;
     assert_eq!(status, Status::InternalServerError);
+}
+
+#[tokio::test]
+async fn space_lists_paginate_and_repo_subscriptions_can_be_withdrawn() {
+    let s = setup().await;
+    create_post(&s, "3kfirst", "hello").await;
+    let credential = mint_credential(&s).await;
+    for (method, field, expected) in [
+        ("simplespace.listMembers", "members", AUTHOR_DID),
+        ("space.listRepos", "repos", AUTHOR_DID),
+    ] {
+        let token = if field == "members" {
+            &s.author_token
+        } else {
+            &credential
+        };
+        let (status, page) = get_json(
+            &s.client,
+            &format!("/xrpc/com.atproto.{method}?space={}&limit=1", s.space),
+            token,
+        )
+        .await;
+        assert_eq!(status, Status::Ok);
+        assert_eq!(page[field].as_array().unwrap().len(), 1);
+        assert_eq!(page["cursor"], expected);
+    }
+    let (status, page) = get_json(
+        &s.client,
+        "/xrpc/com.atproto.space.listSpaces?limit=1",
+        &s.author_token,
+    )
+    .await;
+    assert_eq!(status, Status::Ok);
+    assert_eq!(page["spaces"].as_array().unwrap().len(), 1);
+    assert_eq!(page["cursor"], s.space);
+    let (status, next) = get_json(
+        &s.client,
+        &format!(
+            "/xrpc/com.atproto.space.listSpaces?limit=1&cursor={}",
+            s.space
+        ),
+        &s.author_token,
+    )
+    .await;
+    assert_eq!(status, Status::Ok);
+    assert!(next["spaces"].as_array().unwrap().is_empty());
+    for method in ["registerNotify", "unregisterNotify", "unregisterNotify"] {
+        let (status, body) = post_json(&s.client, &format!("/xrpc/com.atproto.space.{method}"), &credential,
+            json!({"space":s.space,"repo":AUTHOR_DID,"endpoint":"https://subscriber.example.invalid"})).await;
+        assert_eq!(status, Status::Ok, "{body}");
+    }
+    let actors = s.client.rocket().state::<ActorStore>().unwrap();
+    let factory = s
+        .client
+        .rocket()
+        .state::<rsky_pds::actor_store::blobstore::BlobstoreFactory>()
+        .unwrap();
+    let reader = actors
+        .read(AUTHOR_DID.into(), factory.blobstore(AUTHOR_DID.into()))
+        .await
+        .unwrap();
+    assert!(reader
+        .space
+        .repo_notify_endpoints(&s.space, &rsky_common::now())
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn host_write_notifications_relay_to_registered_subscribers() {
+    let s = setup().await;
+    let credential = mint_credential(&s).await;
+    let (status, _) = post_json(
+        &s.client,
+        "/xrpc/com.atproto.space.registerNotify",
+        &credential,
+        json!({"space":s.space,"endpoint":"http://127.0.0.1:1"}),
+    )
+    .await;
+    assert_eq!(status, Status::Ok);
+    let key = actor_keypair(&s.client, MEMBER_DID).await;
+    let token = mint_space_service_token(&key, MEMBER_DID, AUTHOR_DID, NOTIFY_WRITE_LXM);
+    let (status, body) = post_json(
+        &s.client,
+        "/xrpc/com.atproto.space.notifyWrite",
+        &token,
+        json!({"space":s.space,"repo":MEMBER_DID,"rev":"3kcoverage"}),
+    )
+    .await;
+    assert_eq!(status, Status::Ok, "{body}");
+    s.client
+        .rocket()
+        .state::<ActorStore>()
+        .unwrap()
+        .background_queue
+        .process_all()
+        .await;
+    let (status, body) = get_json(
+        &s.client,
+        &format!("/xrpc/com.atproto.space.listRepos?space={}", s.space),
+        &credential,
+    )
+    .await;
+    assert_eq!(status, Status::Ok);
+    assert!(body["repos"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|repo| repo["did"] == MEMBER_DID && repo["rev"] == "3kcoverage"));
+}
+
+#[tokio::test]
+async fn space_management_reports_missing_repository_storage() {
+    let s = setup().await;
+    let (status, first) = get_json(
+        &s.client,
+        &format!(
+            "/xrpc/com.atproto.simplespace.listMembers?space={}&limit=1",
+            s.space
+        ),
+        &s.author_token,
+    )
+    .await;
+    assert_eq!(status, Status::Ok);
+    assert_eq!(first["members"].as_array().unwrap().len(), 1);
+    assert!(first["cursor"].is_string());
+    let (status, second) = get_json(
+        &s.client,
+        &format!(
+            "/xrpc/com.atproto.simplespace.listMembers?space={}&limit=1&cursor={}",
+            s.space,
+            first["cursor"].as_str().unwrap()
+        ),
+        &s.author_token,
+    )
+    .await;
+    assert_eq!(status, Status::Ok);
+    assert_eq!(second["members"].as_array().unwrap().len(), 1);
+    assert_ne!(first["members"][0]["did"], second["members"][0]["did"]);
+
+    let mut generated_spaces = Vec::new();
+    for _ in 0..2 {
+        let (status, body) = post_json(
+            &s.client,
+            "/xrpc/com.atproto.simplespace.createSpace",
+            &s.author_token,
+            json!({"type": SPACE_TYPE}),
+        )
+        .await;
+        assert_eq!(status, Status::Ok);
+        let uri = body["uri"].as_str().unwrap().to_owned();
+        let parsed = rsky_space::space_id::SpaceId::parse(&uri).unwrap();
+        assert_eq!(parsed.authority, AUTHOR_DID);
+        assert!(rsky_common::tid::TID::new(parsed.skey).is_ok());
+        generated_spaces.push(uri);
+    }
+    assert_ne!(generated_spaces[0], generated_spaces[1]);
+    let (status, created) = post_json(&s.client, "/xrpc/com.atproto.space.createRecord", &s.author_token,
+        json!({"space": s.space, "repo": AUTHOR_DID, "collection": COLLECTION, "record": {"text": "automatic record key"}})).await;
+    assert_eq!(status, Status::Ok);
+    let (status, batch) = post_json(&s.client, "/xrpc/com.atproto.space.applyWrites", &s.author_token,
+        json!({"space": s.space, "repo": AUTHOR_DID, "writes": [{"action": "create", "collection": COLLECTION, "value": {"text": "automatic batch key"}}]})).await;
+    assert_eq!(status, Status::Ok);
+    assert_ne!(created["uri"], batch["results"][0]["uri"]);
+    for uri in [&created["uri"], &batch["results"][0]["uri"]] {
+        assert!(rsky_common::tid::TID::new(
+            uri.as_str().unwrap().rsplit('/').next().unwrap().to_owned()
+        )
+        .is_ok());
+    }
+
+    let actors = s.client.rocket().state::<ActorStore>().unwrap();
+    actors.unlink(AUTHOR_DID).await.unwrap();
+    for (method, body) in [
+        (
+            "createSpace",
+            json!({"type": SPACE_TYPE, "skey": "another"}),
+        ),
+        ("addMember", json!({"space": s.space, "did": MEMBER_DID})),
+        ("removeMember", json!({"space": s.space, "did": MEMBER_DID})),
+        (
+            "updateSpace",
+            json!({"space": s.space, "config": {"policy": "public"}}),
+        ),
+        ("deleteSpace", json!({"space": s.space})),
+    ] {
+        let (status, body) = post_json(
+            &s.client,
+            &format!("/xrpc/com.atproto.simplespace.{method}"),
+            &s.author_token,
+            body,
+        )
+        .await;
+        assert_eq!(status, Status::BadRequest, "{method}: {body}");
+        assert_eq!(body["error"], "RepoNotFound");
+    }
+    let (status, body) = post_json(&s.client, "/xrpc/com.atproto.space.putRecord", &s.author_token,
+        json!({"space": s.space, "repo": AUTHOR_DID, "collection": COLLECTION, "rkey": "missing-store", "record": {"text": "cannot persist"}})).await;
+    assert_eq!(status, Status::BadRequest);
+    assert_eq!(body["error"], "RepoNotFound");
+    for path in [
+        format!(
+            "/xrpc/com.atproto.simplespace.listMembers?space={}",
+            s.space
+        ),
+        "/xrpc/com.atproto.space.listSpaces".to_owned(),
+    ] {
+        let (status, body) = get_json(&s.client, &path, &s.author_token).await;
+        assert_eq!(status, Status::BadRequest, "{path}: {body}");
+        assert_eq!(body["error"], "RepoNotFound");
+    }
+}
+
+#[tokio::test]
+async fn a_read_only_space_grant_cannot_create_a_space() {
+    use common::oauth::{
+        dpop_post, exchange_code_scoped, loopback_client_id, open_authorize_page_scoped,
+        run_par_scoped, sign_in_and_accept_scoped,
+    };
+    let (_dir, client) = common::oauth::get_oauth_client().await;
+    common::oauth::create_active_account(&client).await;
+    let key = common::oauth::dpop_key();
+    let scope = "atproto space:com.example.forum?action=read_self";
+    let client_id = loopback_client_id(scope);
+    let (request_uri, nonce) = run_par_scoped(&client, &key, &client_id, scope).await;
+    let mut session = open_authorize_page_scoped(&client, &client_id, &request_uri).await;
+    let code = sign_in_and_accept_scoped(&client, &client_id, &request_uri, &mut session).await;
+    let tokens = exchange_code_scoped(&client, &client_id, &key, &code, &nonce).await;
+    let (status, body) = dpop_post(
+        &client,
+        &key,
+        tokens["access_token"].as_str().unwrap(),
+        "/xrpc/com.atproto.simplespace.createSpace",
+        json!({"type": SPACE_TYPE, "skey": "unauthorized"}),
+    )
+    .await;
+    assert_eq!(status, Status::Unauthorized);
+    assert_eq!(body["error"], "AuthenticationRequired");
+    assert_eq!(
+        body["message"],
+        "session does not cover managing this space"
+    );
+}
+
+#[tokio::test]
+async fn credential_exchange_rejects_unknown_issuers_and_tokens_for_other_spaces() {
+    let s = setup().await;
+    // A valid issuance proof must reach delegation decoding even when the
+    // bearer payload itself is malformed; generic helpers omit proofs for it.
+    let path = "/xrpc/com.atproto.space.getSpaceCredential";
+    let response = s
+        .client
+        .post(path)
+        .header(ContentType::JSON)
+        .header(bearer("not.a.jwt"))
+        .header(dpop_proof(
+            "POST",
+            &format!("{}{path}", public_url(&s.client)),
+            None,
+        ))
+        .body(json!({"space":s.space}).to_string())
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::BadRequest);
+    let body: Value = response.into_json().await.unwrap();
+    assert_eq!(body["error"], "InvalidRequest");
+    assert!(body["message"]
+        .as_str()
+        .unwrap()
+        .contains("bad delegation token"));
+    let key = actor_keypair(&s.client, MEMBER_DID).await;
+    let space = rsky_space::space_id::SpaceId::parse(&s.space).unwrap();
+    let unknown = rsky_pds::space_auth::mint_delegation_token(
+        &key,
+        "did:plc:cccccccccccccccccccccccc",
+        &space,
+    )
+    .unwrap();
+    let (status, body) = post_json(
+        &s.client,
+        "/xrpc/com.atproto.space.getSpaceCredential",
+        &unknown,
+        json!({"space": s.space}),
+    )
+    .await;
+    assert_eq!(status, Status::BadRequest);
+    assert_eq!(body["error"], "InvalidRequest");
+    assert!(body["message"]
+        .as_str()
+        .unwrap()
+        .contains("could not resolve"));
+    let other = rsky_space::space_id::SpaceId::new(AUTHOR_DID, SPACE_TYPE, "another");
+    let wrong_space =
+        rsky_pds::space_auth::mint_delegation_token(&key, MEMBER_DID, &other).unwrap();
+    let (status, body) = post_json(
+        &s.client,
+        "/xrpc/com.atproto.space.getSpaceCredential",
+        &wrong_space,
+        json!({"space": s.space}),
+    )
+    .await;
+    assert_eq!(status, Status::BadRequest);
+    assert_eq!(body["error"], "InvalidRequest");
+    assert!(body.get("credential").is_none());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn committed_member_writes_survive_broken_notification_state() {
+    let s = setup().await;
+    let credential = mint_credential(&s).await;
+    let (status, _) = post_json(
+        &s.client,
+        "/xrpc/com.atproto.space.registerNotify",
+        &credential,
+        json!({"space": s.space, "endpoint": "http://127.0.0.1:1"}),
+    )
+    .await;
+    assert_eq!(status, Status::Ok);
+    let actors = s.client.rocket().state::<ActorStore>().unwrap();
+    let author = actors.get_location(AUTHOR_DID).unwrap();
+    let member = actors.get_location(MEMBER_DID).unwrap();
+    // The member retains its valid signer; unavailable authority notification
+    // credentials must not turn its already committed write into a failed write.
+    std::fs::remove_file(&author.key_location).unwrap();
+    let write = |space: String, key: &str| json!({"space":space,"repo":MEMBER_DID,"collection":COLLECTION,"rkey":key,"record":{"text":"persist despite notification failure"}});
+    let (status, body) = post_json(
+        &s.client,
+        "/xrpc/com.atproto.space.createRecord",
+        &s.member_token,
+        write(s.space.clone(), "missing-key"),
+    )
+    .await;
+    assert_eq!(status, Status::Ok, "{body}");
+    assert!(body["cid"].is_string());
+    actors.background_queue.process_all().await;
+
+    rusqlite::Connection::open(&author.db_location)
+        .unwrap()
+        .execute_batch("DROP TABLE space_writer; DROP TABLE space_host_reg;")
+        .unwrap();
+    rusqlite::Connection::open(&member.db_location)
+        .unwrap()
+        .execute_batch("DROP TABLE space_repo_notify;")
+        .unwrap();
+    let (status, body) = post_json(
+        &s.client,
+        "/xrpc/com.atproto.space.createRecord",
+        &s.member_token,
+        write(s.space.clone(), "missing-tables"),
+    )
+    .await;
+    assert_eq!(status, Status::Ok, "{body}");
+    assert!(body["cid"].is_string());
+    actors.background_queue.process_all().await;
+
+    actors.unlink(AUTHOR_DID).await.unwrap();
+    std::fs::create_dir_all(&author.db_location).unwrap();
+    let (status, body) = post_json(
+        &s.client,
+        "/xrpc/com.atproto.space.createRecord",
+        &s.member_token,
+        write(s.space.clone(), "unreadable-authority"),
+    )
+    .await;
+    assert_eq!(status, Status::Ok, "{body}");
+    actors.background_queue.process_all().await;
+
+    #[derive(Clone)]
+    struct NotificationLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for NotificationLog {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let logs = NotificationLog(Default::default());
+    let writer = logs.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .without_time()
+        .with_writer(move || writer.clone())
+        .finish();
+    // This current-thread runtime polls both the request and spawned queue
+    // tasks on the scoped subscriber's thread until process_all drains them.
+    // Other tests keep their own thread-local tracing dispatchers.
+    let tracing_guard = tracing::subscriber::set_default(subscriber);
+    for authority in ["did:plc:cccccccccccccccccccccccc", "did:web:127.0.0.1"] {
+        let space = format!("at://{authority}/space/{SPACE_TYPE}/remote");
+        let (status, body) = post_json(
+            &s.client,
+            "/xrpc/com.atproto.space.createRecord",
+            &s.member_token,
+            write(space, "remote"),
+        )
+        .await;
+        assert_eq!(status, Status::Ok, "{authority}: {body}");
+        assert!(body["cid"].is_string());
+        actors.background_queue.process_all().await;
+    }
+    drop(tracing_guard);
+    let logs = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    assert!(
+        logs.contains("could not resolve space host for auto-registration"),
+        "{logs}"
+    );
+    assert!(logs.contains("did:web:127.0.0.1"), "{logs}");
+}
+
+#[tokio::test]
+async fn notification_withdrawal_reports_missing_repository_storage() {
+    let s = setup().await;
+    let credential = mint_credential(&s).await;
+    let (status, body) = post_json(&s.client, "/xrpc/com.atproto.space.unregisterNotify", &credential,
+        json!({"space":s.space,"repo":"did:plc:cccccccccccccccccccccccc","endpoint":"https://syncer.example.invalid"})).await;
+    assert_eq!(status, Status::BadRequest);
+    assert_eq!(body["error"], "RepoNotFound");
+    let (status, _) = post_json(
+        &s.client,
+        "/xrpc/com.atproto.simplespace.updateSpace",
+        &s.author_token,
+        json!({"space":s.space,"config":{"policy":"member-list"}}),
+    )
+    .await;
+    assert_eq!(status, Status::Ok);
 }

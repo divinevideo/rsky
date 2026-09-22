@@ -5,8 +5,9 @@
 
 use super::{mailer, Mailer};
 use anyhow::{anyhow, Result};
+use futures::future::BoxFuture;
 use lettre::message::Mailbox;
-use mailgun_rs::{EmailAddress, Mailgun, MailgunRegion, Message};
+use mailgun_rs::{EmailAddress, Mailgun, Message};
 use std::env;
 
 pub struct HtmlMailOpts {
@@ -60,7 +61,15 @@ impl ModerationMailer {
     }
 }
 
-pub(super) async fn send_through_mailgun(to: &str, subject: &str, html: &str) -> Result<()> {
+pub(super) async fn send_through_mailgun<F>(
+    to: &str,
+    subject: &str,
+    html: &str,
+    send_mailgun: F,
+) -> Result<()>
+where
+    F: FnOnce(Mailgun, EmailAddress) -> BoxFuture<'static, Result<()>>,
+{
     let recipient = EmailAddress::address(to);
     let message = Message {
         to: vec![recipient],
@@ -77,8 +86,7 @@ pub(super) async fn send_through_mailgun(to: &str, subject: &str, html: &str) ->
         &env::var("PDS_MODERATION_EMAIL_FROM_NAME").unwrap_or_default(),
         &env::var("PDS_MODERATION_EMAIL_FROM_ADDRESS").unwrap_or_default(),
     );
-    client.async_send(MailgunRegion::US, &sender).await?;
-    Ok(())
+    send_mailgun(client, sender).await
 }
 
 #[cfg(test)]

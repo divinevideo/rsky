@@ -24,25 +24,18 @@ pub async fn inner_get_profile(
     state_local_viewer: &State<SharedLocalViewer>,
     actor_store: &State<ActorStore>,
     account_manager: AccountManager,
-) -> Result<ReadAfterWriteResponse<ProfileViewDetailed>, ApiError> {
-    let requester: Option<String> = auth.did_opt().await?;
-    match requester {
-        None => Ok(ReadAfterWriteResponse::HandlerPipeThrough(res)),
-        Some(requester) => {
-            let read_afer_write_response = handle_read_after_write(
-                METHOD_NSID.to_string(),
-                requester,
-                res,
-                get_profile_munge,
-                blobstore_factory,
-                state_local_viewer,
-                actor_store,
-                account_manager,
-            )
-            .await?;
-            Ok(read_afer_write_response)
-        }
-    }
+) -> ReadAfterWriteResponse<ProfileViewDetailed> {
+    handle_read_after_write(
+        METHOD_NSID.to_string(),
+        auth.requester_did().unwrap_or_default(),
+        res,
+        get_profile_munge,
+        blobstore_factory,
+        state_local_viewer,
+        actor_store,
+        account_manager,
+    )
+    .await
 }
 
 /// Get detailed profile view of an actor. Does not require auth,
@@ -63,22 +56,16 @@ pub async fn get_profile(
 ) -> Result<ReadAfterWriteResponse<ProfileViewDetailed>, ApiError> {
     match cfg.bsky_app_view {
         None => Err(ApiError::AccountNotFound),
-        Some(_) => {
-            match inner_get_profile(
-                actor,
-                auth,
-                res,
-                blobstore_factory,
-                state_local_viewer,
-                actor_store,
-                account_manager,
-            )
-            .await
-            {
-                Ok(response) => Ok(response),
-                Err(error) => Err(error),
-            }
-        }
+        Some(_) => Ok(inner_get_profile(
+            actor,
+            auth,
+            res,
+            blobstore_factory,
+            state_local_viewer,
+            actor_store,
+            account_manager,
+        )
+        .await),
     }
 }
 

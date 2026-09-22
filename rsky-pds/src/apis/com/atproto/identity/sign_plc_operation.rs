@@ -118,43 +118,16 @@ pub async fn sign_plc_operation(
         }
     };
 
-    Ok(Json(wrap_operation(operation)?))
+    Ok(Json(wrap_operation(operation)))
 }
 
-fn wrap_operation(operation: Operation) -> Result<SignPlcOperationResponse, ApiError> {
-    match serde_json::to_value(operation) {
-        Ok(operation) => Ok(SignPlcOperationResponse { operation }),
-        Err(error) => {
-            tracing::error!("Error serializing signed operation\n{error}");
-            Err(ApiError::RuntimeError)
-        }
+fn wrap_operation(operation: Operation) -> SignPlcOperationResponse {
+    // Operation consists only of strings, lists, and string-keyed maps.
+    SignPlcOperationResponse {
+        operation: serde_json::json!(operation),
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::wrap_operation;
-    use crate::plc::types::Operation;
-    use std::collections::BTreeMap;
-
-    #[test]
-    fn response_nests_the_operation_under_the_lexicon_field() {
-        let operation = Operation {
-            r#type: "plc_operation".to_string(),
-            rotation_keys: vec!["did:key:zRotation".to_string()],
-            verification_methods: BTreeMap::from([(
-                "atproto".to_string(),
-                "did:key:zSigning".to_string(),
-            )]),
-            also_known_as: vec!["at://alice.test".to_string()],
-            services: BTreeMap::new(),
-            prev: Some("bafyprev".to_string()),
-            sig: Some("c2ln".to_string()),
-        };
-        let body = serde_json::to_value(wrap_operation(operation).unwrap()).unwrap();
-        assert_eq!(body["operation"]["type"], "plc_operation");
-        assert_eq!(body["operation"]["prev"], "bafyprev");
-        assert_eq!(body["operation"]["alsoKnownAs"][0], "at://alice.test");
-        assert!(body.get("type").is_none());
-    }
-}
+#[path = "sign_plc_operation_tests.rs"]
+mod tests;

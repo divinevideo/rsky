@@ -54,8 +54,7 @@ pub async fn inner_get_post_thread(
     account_manager: AccountManager,
 ) -> Result<ReadAfterWriteResponse<GetPostThreadOutput>> {
     let requester: String = auth
-        .did_opt()
-        .await?
+        .requester_did()
         .ok_or_else(|| anyhow!("Missing account did on authenticated request"))?;
     match res {
         Ok(res) => {
@@ -69,7 +68,7 @@ pub async fn inner_get_post_thread(
                 actor_store,
                 account_manager,
             )
-            .await?;
+            .await;
             Ok(read_afer_write_response)
         }
         Err(err) => match err.downcast_ref() {

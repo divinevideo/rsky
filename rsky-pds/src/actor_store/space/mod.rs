@@ -1186,3 +1186,7 @@ fn compact_oplog(tx: &Transaction, space_uri: &str, window: usize) -> Result<()>
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "notification_removal_tests.rs"]
+mod notification_removal_tests;

@@ -548,7 +548,7 @@ pub async fn store_refresh_token(
     .await
 }
 
-fn store_refresh_token_tx(
+pub(crate) fn store_refresh_token_tx(
     tx: &Transaction,
     payload: &RefreshToken,
     app_password_name: Option<&str>,

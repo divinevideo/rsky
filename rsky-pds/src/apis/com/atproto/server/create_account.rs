@@ -171,19 +171,7 @@ pub async fn create_account_for(
         }
     }
 
-    let did_doc = match safe_resolve_did_doc(id_resolver, &did, Some(true)).await {
-        Ok(res) => res,
-        Err(error) => {
-            if cfg.service.dev_mode {
-                tracing::warn!("DID doc resolution failed in dev mode, continuing: {error}");
-                None
-            } else {
-                tracing::error!("Error resolving DID Doc\n{error}");
-                actor_store.destroy(&did, blobstore.clone()).await?;
-                return Err(ApiError::RuntimeError);
-            }
-        }
-    };
+    let did_doc = safe_resolve_did_doc(id_resolver, &did, Some(true)).await;
 
     // Create Account
     let invited = invite_code.is_some();
@@ -483,30 +471,5 @@ fn resolve_invite_code(required: bool, provided: Option<&str>) -> Result<Option<
 }
 
 #[cfg(test)]
-mod tests {
-    use super::resolve_invite_code;
-    use crate::apis::ApiError;
-
-    #[test]
-    fn unrequired_invite_codes_are_dropped() {
-        assert_eq!(resolve_invite_code(false, None).unwrap(), None);
-        assert_eq!(resolve_invite_code(false, Some("")).unwrap(), None);
-        assert_eq!(resolve_invite_code(false, Some("abc-def")).unwrap(), None);
-    }
-
-    #[test]
-    fn required_invite_codes_must_be_present() {
-        assert!(matches!(
-            resolve_invite_code(true, None),
-            Err(ApiError::InvalidInviteCode)
-        ));
-        assert!(matches!(
-            resolve_invite_code(true, Some("  ")),
-            Err(ApiError::InvalidInviteCode)
-        ));
-        assert_eq!(
-            resolve_invite_code(true, Some(" abc-def ")).unwrap(),
-            Some("abc-def".to_string())
-        );
-    }
-}
+#[path = "create_account_tests.rs"]
+mod tests;

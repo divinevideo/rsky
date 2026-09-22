@@ -53,70 +53,54 @@ impl<'r> FromRequest<'r> for HandlerPipeThrough {
 
     #[tracing::instrument(skip_all)]
     async fn from_request(req: &'r Request<'_>) -> Outcome<Self, Self::Error> {
-        match Scoped::<RpcProxy>::from_request(req).await {
-            Outcome::Success(auth) => {
-                let requester: Option<String> = match auth.did_opt().await {
-                    Ok(requester) => requester,
-                    Err(api_error) => {
-                        req.local_cache(|| Some(api_error));
-                        return Outcome::Error((
-                            Status::Forbidden,
-                            anyhow::anyhow!("InsufficientScope"),
-                        ));
-                    }
-                };
-                let headers = req.headers().clone().into_iter().fold(
-                    BTreeMap::new(),
-                    |mut acc: BTreeMap<String, String>, cur| {
-                        let _ = acc.insert(cur.name().to_string(), cur.value().to_string());
-                        acc
-                    },
-                );
-                let proxy_req = ProxyRequest {
-                    headers,
-                    query: req.uri().query().map(|query| query.to_string()),
-                    path: req.uri().path().to_string(),
-                    method: req.method(),
-                    id_resolver: req.guard::<&State<SharedIdResolver>>().await.unwrap(),
-                    cfg: req.guard::<&State<ServerConfig>>().await.unwrap(),
-                    actor_store: req.guard::<&State<ActorStore>>().await.unwrap(),
-                };
-                match pipethrough(
-                    &proxy_req,
-                    requester,
-                    OverrideOpts {
-                        aud: None,
-                        lxm: None,
-                    },
-                )
-                .await
-                {
-                    Ok(res) => Outcome::Success(res),
-                    Err(error) => {
-                        if let Some(InvalidRequestError::XRPCError(XRPCError::FailedResponse {
-                            status,
-                            error,
-                            message,
-                            headers,
-                        })) = error.downcast_ref()
-                        {
-                            tracing::error!("@LOG: XRPC ERROR Status:{status}; Message: {message:?}; Error: {error:?}; Headers: {headers:?}");
-                        }
-                        let api_error = if crate::auth_verifier::is_expired_jwt(&error) {
-                            ApiError::ExpiredToken
-                        } else {
-                            pipethrough_error(&error)
-                        };
-                        req.local_cache(|| Some(api_error));
-                        Outcome::Error((Status::BadRequest, error))
-                    }
-                }
-            }
-            Outcome::Error(err) => {
+        let auth = rocket::outcome::try_outcome!(Scoped::<RpcProxy>::from_request(req)
+            .await
+            .map_error(|err| {
                 req.local_cache(|| Some(ApiError::RuntimeError));
-                Outcome::Error((Status::BadRequest, anyhow::Error::new(err.1)))
+                (Status::BadRequest, anyhow::Error::new(err.1))
+            }));
+        let requester = auth.requester_did();
+        let headers = req.headers().clone().into_iter().fold(
+            BTreeMap::new(),
+            |mut acc: BTreeMap<String, String>, cur| {
+                let _ = acc.insert(cur.name().to_string(), cur.value().to_string());
+                acc
+            },
+        );
+        let proxy_req = ProxyRequest {
+            headers,
+            query: req.uri().query().map(|query| query.to_string()),
+            path: req.uri().path().to_string(),
+            method: req.method(),
+            id_resolver: req.guard::<&State<SharedIdResolver>>().await.unwrap(),
+            cfg: req.guard::<&State<ServerConfig>>().await.unwrap(),
+            actor_store: req.guard::<&State<ActorStore>>().await.unwrap(),
+        };
+        match pipethrough(
+            &proxy_req,
+            requester,
+            OverrideOpts {
+                aud: None,
+                lxm: None,
+            },
+        )
+        .await
+        {
+            Ok(res) => Outcome::Success(res),
+            Err(error) => {
+                if let Some(InvalidRequestError::XRPCError(XRPCError::FailedResponse {
+                    status,
+                    error,
+                    message,
+                    headers,
+                })) = error.downcast_ref()
+                {
+                    tracing::error!("@LOG: XRPC ERROR Status:{status}; Message: {message:?}; Error: {error:?}; Headers: {headers:?}");
+                }
+                let api_error = pipethrough_error(&error);
+                req.local_cache(|| Some(api_error));
+                Outcome::Error((Status::BadRequest, error))
             }
-            _ => panic!("Unexpected outcome during Pipethrough"),
         }
     }
 }
@@ -696,46 +680,9 @@ mod default_service_tests {
 }
 
 #[cfg(test)]
-mod proxy_target_tests {
-    use super::{
-        cached_proxy_target, remember_proxy_target, PROXY_TARGETS, PROXY_TARGET_CAPACITY,
-        PROXY_TARGET_TTL,
-    };
+#[path = "pipethrough_target_tests.rs"]
+mod proxy_target_tests;
 
-    #[test]
-    fn proxy_targets_are_remembered_until_they_expire() {
-        let header = "did:web:cache.test#bsky_appview";
-        assert_eq!(cached_proxy_target(header), None);
-        remember_proxy_target(header, "https://cache.test");
-        assert_eq!(
-            cached_proxy_target(header).as_deref(),
-            Some("https://cache.test")
-        );
-        remember_proxy_target(header, "https://cache.test/again");
-        assert_eq!(
-            cached_proxy_target(header).as_deref(),
-            Some("https://cache.test/again")
-        );
-        {
-            let mut targets = PROXY_TARGETS.write().unwrap();
-            let expired = std::time::Instant::now() - PROXY_TARGET_TTL * 2;
-            targets.insert(
-                header.to_owned(),
-                ("https://cache.test".to_owned(), expired),
-            );
-            for i in 0..PROXY_TARGET_CAPACITY {
-                targets.insert(
-                    format!("did:web:full{i}#svc"),
-                    ("https://full.test".to_owned(), expired),
-                );
-            }
-        }
-        assert_eq!(cached_proxy_target(header), None);
-        remember_proxy_target(header, "https://cache.test/fresh");
-        assert_eq!(
-            cached_proxy_target(header).as_deref(),
-            Some("https://cache.test/fresh")
-        );
-        assert!(PROXY_TARGETS.read().unwrap().len() <= 2);
-    }
-}
+#[cfg(test)]
+#[path = "pipethrough_response_tests.rs"]
+mod response_error_contract_tests;

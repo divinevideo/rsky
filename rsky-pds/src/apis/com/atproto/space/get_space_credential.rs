@@ -140,18 +140,26 @@ pub async fn space_get_space_credential(
             &dpop_jkt,
         )
         .await
-        .map_err(|error| match error {
-            HostError::NotAuthorized => {
-                ApiError::AuthRequiredError("user not authorized for this space".to_string())
-            }
-            HostError::ClientNotAuthorized => {
-                ApiError::AuthRequiredError("client not authorized for this space".to_string())
-            }
-            HostError::AttestationRequired => ApiError::BadRequest(
-                "AttestationRequired".to_string(),
-                "this space requires a client attestation".to_string(),
-            ),
-            other => ApiError::InvalidRequest(other.to_string()),
-        })?;
+        .map_err(credential_error)?;
     Ok(Json(GetSpaceCredentialOutput { credential }))
 }
+
+fn credential_error(error: HostError) -> ApiError {
+    match error {
+        HostError::NotAuthorized => {
+            ApiError::AuthRequiredError("user not authorized for this space".to_string())
+        }
+        HostError::ClientNotAuthorized => {
+            ApiError::AuthRequiredError("client not authorized for this space".to_string())
+        }
+        HostError::AttestationRequired => ApiError::BadRequest(
+            "AttestationRequired".to_string(),
+            "this space requires a client attestation".to_string(),
+        ),
+        other => ApiError::InvalidRequest(other.to_string()),
+    }
+}
+
+#[cfg(test)]
+#[path = "get_space_credential_tests.rs"]
+mod tests;
