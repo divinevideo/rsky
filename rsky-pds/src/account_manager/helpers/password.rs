@@ -73,22 +73,61 @@ pub async fn verify_app_password(
     let did = did.to_owned();
     let password = password.to_owned();
     let password_encrypted = hash_app_password(&did, &password).await?;
-    db.run(move |conn| {
-        Ok(conn
-            .query_row(
-                "SELECT name, privileged FROM app_password \
+    let lookup_did = did.clone();
+    let found = db
+        .run(move |conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT name, privileged FROM app_password \
                  WHERE did = ?1 AND \"passwordScrypt\" = ?2",
-                params![did, password_encrypted],
-                |row| {
-                    Ok(AppPassDescript {
-                        name: row.get(0)?,
-                        privileged: row.get::<_, i64>(1)? == 1,
-                    })
-                },
-            )
-            .optional()?)
+                    params![lookup_did, password_encrypted],
+                    |row| {
+                        Ok(AppPassDescript {
+                            name: row.get(0)?,
+                            privileged: row.get::<_, i64>(1)? == 1,
+                        })
+                    },
+                )
+                .optional()?)
+        })
+        .await?;
+    if found.is_some() {
+        return Ok(found);
+    }
+
+    // Migrated app passwords retain their Argon2 PHC strings. Keep the
+    // scrypt lookup above, then check only this account's legacy rows.
+    let legacy_passwords = db
+        .run(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT name, privileged, \"passwordScrypt\" FROM app_password \
+                 WHERE did = ?1 AND \"passwordScrypt\" LIKE '$argon2%'",
+            )?;
+            let rows = stmt
+                .query_map(params![did], |row| {
+                    Ok((
+                        AppPassDescript {
+                            name: row.get(0)?,
+                            privileged: row.get::<_, i64>(1)? == 1,
+                        },
+                        row.get::<_, String>(2)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, rusqlite::Error>>()?;
+            Ok(rows)
+        })
+        .await?;
+    // Hash verification must not hold the shared database connection or
+    // block an async worker. A malformed row cannot authenticate or prevent
+    // another valid credential on the same account from being checked.
+    Ok(tokio::task::spawn_blocking(move || {
+        legacy_passwords.into_iter().find_map(|(descriptor, hash)| {
+            verify_argon2(&password, &hash)
+                .unwrap_or(false)
+                .then_some(descriptor)
+        })
     })
-    .await
+    .await?)
 }
 
 /// Hash a brand-new password with a freshly generated random salt.
@@ -256,6 +295,145 @@ pub async fn delete_app_password(did: &str, name: &str, db: &Db) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use argon2::password_hash::{PasswordHasher, SaltString};
+
+    const APP_DID: &str = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+    const OTHER_APP_DID: &str = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
+
+    // Reproduce the pre-SQLite implementation: the full SHA256(DID) digest
+    // is the Argon2 salt, encoded as unpadded base64 in the PHC string.
+    fn legacy_app_hash(did: &str, password: &str) -> String {
+        let salt = SaltString::encode_b64(&Sha256::digest(did)).unwrap();
+        Argon2::default()
+            .hash_password(password.as_bytes(), &salt)
+            .unwrap()
+            .to_string()
+    }
+
+    async fn app_password_db(rows: Vec<(&str, &str, String, bool)>) -> Db {
+        let db = crate::account_manager::db::get_migrated_db(":memory:")
+            .await
+            .unwrap();
+        let rows: Vec<_> = rows
+            .into_iter()
+            .map(|(did, name, hash, privileged)| {
+                (did.to_owned(), name.to_owned(), hash, privileged)
+            })
+            .collect();
+        db.run(move |conn| {
+            for (did, name, hash, privileged) in &rows {
+                conn.execute(
+                    "INSERT INTO app_password (did, name, \"passwordScrypt\", \"createdAt\", privileged) \
+                     VALUES (?1, ?2, ?3, '2026-01-01T00:00:00.000Z', ?4)",
+                    params![did, name, hash, privileged],
+                )?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+        db
+    }
+
+    #[tokio::test]
+    async fn migrated_argon2_app_password_preserves_name_and_privileges() {
+        let db = app_password_db(vec![
+            (
+                APP_DID,
+                "limited",
+                legacy_app_hash(APP_DID, "abcd-efgh-ijkl-mnop"),
+                false,
+            ),
+            (
+                APP_DID,
+                "privileged",
+                legacy_app_hash(APP_DID, "qrst-uvwx-yzab-cdef"),
+                true,
+            ),
+        ])
+        .await;
+
+        for (password, name, privileged) in [
+            ("abcd-efgh-ijkl-mnop", "limited", false),
+            ("qrst-uvwx-yzab-cdef", "privileged", true),
+        ] {
+            assert_eq!(
+                verify_app_password(APP_DID, password, &db).await.unwrap(),
+                Some(AppPassDescript {
+                    name: name.to_owned(),
+                    privileged
+                }),
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn app_passwords_reject_wrong_passwords_and_other_accounts() {
+        let scrypt_hash = hash_app_password(&APP_DID.to_owned(), &"new-password".to_owned())
+            .await
+            .unwrap();
+        let db = app_password_db(vec![
+            (
+                APP_DID,
+                "legacy",
+                legacy_app_hash(APP_DID, "old-password"),
+                false,
+            ),
+            (APP_DID, "current", scrypt_hash, true),
+            (
+                OTHER_APP_DID,
+                "unrelated",
+                legacy_app_hash(OTHER_APP_DID, "unrelated-password"),
+                false,
+            ),
+        ])
+        .await;
+        for (did, password) in [
+            (APP_DID, "wrong-password"),
+            (OTHER_APP_DID, "old-password"),
+            (OTHER_APP_DID, "new-password"),
+            ("did:plc:cccccccccccccccccccccccc", "old-password"),
+        ] {
+            assert_eq!(verify_app_password(did, password, &db).await.unwrap(), None);
+        }
+        assert_eq!(
+            verify_app_password(APP_DID, "new-password", &db)
+                .await
+                .unwrap(),
+            Some(AppPassDescript {
+                name: "current".to_owned(),
+                privileged: true
+            }),
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_app_hash_does_not_block_valid_legacy_password() {
+        let db = app_password_db(vec![
+            (APP_DID, "a-malformed", "$argon2id$invalid".to_owned(), true),
+            (APP_DID, "b-unknown", "not-a-hash".to_owned(), true),
+            (
+                APP_DID,
+                "c-valid",
+                legacy_app_hash(APP_DID, "old-password"),
+                false,
+            ),
+        ])
+        .await;
+        assert_eq!(
+            verify_app_password(APP_DID, "old-password", &db)
+                .await
+                .unwrap(),
+            Some(AppPassDescript {
+                name: "c-valid".to_owned(),
+                privileged: false
+            }),
+        );
+        assert_eq!(
+            verify_app_password(APP_DID, "wrong", &db).await.unwrap(),
+            None
+        );
+    }
 
     /// A scrypt hash produced by our own `gen_salt_and_hash`/`hash_with_salt`
     /// round-trips through `verify`.
