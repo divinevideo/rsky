@@ -110,6 +110,8 @@ fn rotate_keys_dry_run_reports_an_empty_account_database() {
     std::fs::create_dir_all(dir.path().join("rsky")).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_rotate-keys"))
         .arg("--dry-run")
+        // Assert fields independently of the invoking terminal's color settings.
+        .env("NO_COLOR", "1")
         .env("PDS_DATA_DIRECTORY", dir.path())
         .env("PDS_BLOBSTORE_DISK_LOCATION", dir.path().join("blobs"))
         .env(
@@ -146,6 +148,7 @@ fn rotate_keys_dry_run_reports_an_empty_account_database() {
     // reported as failed and make the operator command exit nonzero.
     let failed = Command::new(env!("CARGO_BIN_EXE_rotate-keys"))
         .args(["--dry-run", "--did", "did:plc:synthetic"])
+        .env("NO_COLOR", "1")
         .env("PDS_DATA_DIRECTORY", dir.path())
         .env("PDS_BLOBSTORE_DISK_LOCATION", dir.path().join("blobs"))
         .env(
