@@ -1,7 +1,7 @@
 use crate::db::sqlite::Db;
 use anyhow::{anyhow, bail, Result};
 use argon2::{
-    password_hash::{PasswordHash, PasswordVerifier},
+    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
 };
 use rand::rngs::OsRng;
@@ -59,7 +59,8 @@ pub async fn verify_account_password(did: &str, password: &String, db: &Db) -> R
         })
         .await?;
     if let Some(stored_hash) = found {
-        verify(password, &stored_hash)
+        let password = password.clone();
+        Ok(tokio::task::spawn_blocking(move || verify(&password, &stored_hash)).await??)
     } else {
         Ok(false)
     }
@@ -95,39 +96,30 @@ pub async fn verify_app_password(
         return Ok(found);
     }
 
-    // Migrated app passwords retain their Argon2 PHC strings. Keep the
-    // scrypt lookup above, then check only this account's legacy rows.
-    let legacy_passwords = db
-        .run(move |conn| {
-            let mut stmt = conn.prepare(
-                "SELECT name, privileged, \"passwordScrypt\" FROM app_password \
-                 WHERE did = ?1 AND \"passwordScrypt\" LIKE '$argon2%'",
-            )?;
-            let rows = stmt
-                .query_map(params![did], |row| {
-                    Ok((
-                        AppPassDescript {
-                            name: row.get(0)?,
-                            privileged: row.get::<_, i64>(1)? == 1,
-                        },
-                        row.get::<_, String>(2)?,
-                    ))
-                })?
-                .collect::<Result<Vec<_>, rusqlite::Error>>()?;
-            Ok(rows)
-        })
-        .await?;
-    // Hash verification must not hold the shared database connection or
-    // block an async worker. A malformed row cannot authenticate or prevent
-    // another valid credential on the same account from being checked.
-    Ok(tokio::task::spawn_blocking(move || {
-        legacy_passwords.into_iter().find_map(|(descriptor, hash)| {
-            verify_argon2(&password, &hash)
-                .unwrap_or(false)
-                .then_some(descriptor)
-        })
+    // Migrated app passwords retain the deterministic Argon2 hashes used by
+    // the old equality lookup. Compute that legacy form off the async worker.
+    let legacy_did = did.clone();
+    let legacy_password = password.clone();
+    let legacy_password_encrypted = tokio::task::spawn_blocking(move || {
+        hash_legacy_app_password(&legacy_did, &legacy_password)
     })
-    .await?)
+    .await??;
+    db.run(move |conn| {
+        Ok(conn
+            .query_row(
+                "SELECT name, privileged FROM app_password \
+                     WHERE did = ?1 AND \"passwordScrypt\" = ?2",
+                params![did, legacy_password_encrypted],
+                |row| {
+                    Ok(AppPassDescript {
+                        name: row.get(0)?,
+                        privileged: row.get::<_, i64>(1)? == 1,
+                    })
+                },
+            )
+            .optional()?)
+    })
+    .await
 }
 
 /// Hash a brand-new password with a freshly generated random salt.
@@ -209,9 +201,23 @@ fn verify_scrypt(password: &String, stored_hash: &str) -> Result<bool> {
 }
 
 pub async fn hash_app_password(did: &String, password: &String) -> Result<String> {
-    let digest = Sha256::digest(did);
-    let salt = hex::encode(&digest[0..16]);
-    hash_with_salt(password, &salt)
+    let did = did.clone();
+    let password = password.clone();
+    Ok(tokio::task::spawn_blocking(move || {
+        let digest = Sha256::digest(did);
+        let salt = hex::encode(&digest[0..16]);
+        hash_with_salt(&password, &salt)
+    })
+    .await??)
+}
+
+fn hash_legacy_app_password(did: &str, password: &str) -> Result<String> {
+    let salt =
+        SaltString::encode_b64(&Sha256::digest(did)).map_err(|error| anyhow!(error.to_string()))?;
+    Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .map(|hash| hash.to_string())
+        .map_err(|error| anyhow!(error.to_string()))
 }
 
 /// create an app password with format:
