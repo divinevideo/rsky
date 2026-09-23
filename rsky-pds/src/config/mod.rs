@@ -148,6 +148,25 @@ pub fn storage_cfg_from(
     (actor_store, service_db)
 }
 
+/// The storage layout the server resolves from its environment.
+pub fn storage_cfg_from_env() -> (ActorStoreConfig, ServiceDbConfig) {
+    storage_cfg_from(
+        env_str("PDS_DATA_DIRECTORY"),
+        StorageOverrides {
+            actor_store_directory: env_str("PDS_ACTOR_STORE_DIRECTORY"),
+            actor_store_cache_size: env_int("PDS_ACTOR_STORE_CACHE_SIZE"),
+            account_db_location: env_str("PDS_ACCOUNT_DB_LOCATION"),
+            sequencer_db_location: env_str("PDS_SEQUENCER_DB_LOCATION"),
+            did_cache_db_location: env_str("PDS_DID_CACHE_DB_LOCATION"),
+            lifecycle_db_location: env_str("PDS_LIFECYCLE_DB"),
+            lock_dir: env_str("PDS_LOCK_DIR"),
+            blob_attempts_db_location: env_str("PDS_BLOB_ATTEMPTS_DB"),
+            blob_generations_db_location: env_str("PDS_BLOB_GENERATIONS_DB"),
+            repair_db_location: env_str("PDS_REPAIR_DB"),
+        },
+    )
+}
+
 /// BksyAppViewConfig, ModServiceConfig, ReportServiceConfig, etc.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ServiceConfig {
@@ -355,21 +374,7 @@ pub fn env_to_cfg() -> ServerConfig {
         },
     };
     let crawlers_cfg = env_list("PDS_CRAWLERS");
-    let (actor_store_cfg, service_db_cfg) = storage_cfg_from(
-        env_str("PDS_DATA_DIRECTORY"),
-        StorageOverrides {
-            actor_store_directory: env_str("PDS_ACTOR_STORE_DIRECTORY"),
-            actor_store_cache_size: env_int("PDS_ACTOR_STORE_CACHE_SIZE"),
-            account_db_location: env_str("PDS_ACCOUNT_DB_LOCATION"),
-            sequencer_db_location: env_str("PDS_SEQUENCER_DB_LOCATION"),
-            did_cache_db_location: env_str("PDS_DID_CACHE_DB_LOCATION"),
-            lifecycle_db_location: env_str("PDS_LIFECYCLE_DB"),
-            lock_dir: env_str("PDS_LOCK_DIR"),
-            blob_attempts_db_location: env_str("PDS_BLOB_ATTEMPTS_DB"),
-            blob_generations_db_location: env_str("PDS_BLOB_GENERATIONS_DB"),
-            repair_db_location: env_str("PDS_REPAIR_DB"),
-        },
-    );
+    let (actor_store_cfg, service_db_cfg) = storage_cfg_from_env();
     let blobstore_cfg = blobstore_cfg_from(BlobstoreEnv {
         disk_location: env_str("PDS_BLOBSTORE_DISK_LOCATION"),
         disk_tmp_location: env_str("PDS_BLOBSTORE_DISK_TMP_LOCATION"),
