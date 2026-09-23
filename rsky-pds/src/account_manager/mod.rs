@@ -163,7 +163,10 @@ impl AccountManager {
             deactivated,
         } = opts;
         let password_encrypted: Option<String> = match password {
-            Some(password) => Some(password::gen_salt_and_hash(password)?),
+            Some(password) => Some(
+                tokio::task::spawn_blocking(move || password::gen_salt_and_hash(password))
+                    .await??,
+            ),
             None => None,
         };
 
@@ -492,7 +495,9 @@ impl AccountManager {
     pub async fn update_account_password(&self, opts: UpdateAccountPasswordOpts) -> Result<()> {
         self.admit(&opts.did)?;
         let UpdateAccountPasswordOpts { did, .. } = opts;
-        let password_encrypted = password::gen_salt_and_hash(opts.password)?;
+        let password_encrypted =
+            tokio::task::spawn_blocking(move || password::gen_salt_and_hash(opts.password))
+                .await??;
         try_join!(
             password::update_user_password(
                 UpdateUserPasswordOpts {

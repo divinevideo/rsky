@@ -325,7 +325,7 @@ impl RateLimits {
             .filter_map(|ip| ip.trim().parse().ok())
             .collect();
         (
-            env_bool("PDS_RATE_LIMITS_ENABLED").unwrap_or(false),
+            env_bool("PDS_RATE_LIMITS_ENABLED").unwrap_or(true),
             env_str("PDS_RATE_LIMIT_BYPASS_KEY"),
             bypass_ips,
         )
