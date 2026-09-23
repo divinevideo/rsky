@@ -89,7 +89,7 @@ impl BlobReader {
             .await?;
 
         match found {
-            None => bail!("Blob not found"),
+            None => Err(anyhow::Error::new(BlobError::BlobNotFoundError)),
             Some(found) => Ok(GetBlobMetadataOutput {
                 size: found.size,
                 mime_type: Some(found.mime_type),

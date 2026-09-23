@@ -54,7 +54,10 @@ async fn inner_list_records(
                 Ok(Record {
                     uri: record.uri.clone(),
                     cid: record.cid.clone(),
-                    value: serde_json::to_value(record)?,
+                    // Serialize only the record body. Serializing the whole
+                    // `RecordsForCollection` nests it as `value.value`, which
+                    // consumers reading `value.embed` never see.
+                    value: serde_json::to_value(record.value)?,
                 })
             })
             .collect::<Result<Vec<Record>>>()?;

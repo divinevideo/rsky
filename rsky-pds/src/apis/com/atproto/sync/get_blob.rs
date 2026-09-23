@@ -13,6 +13,7 @@ use aws_sdk_s3::primitives::AggregatedBytes;
 use lexicon_cid::Cid;
 use rocket::http::Header;
 use rocket::{Responder, State};
+use rsky_repo::error::BlobError;
 use std::str::FromStr;
 
 #[derive(Responder)]
@@ -68,15 +69,17 @@ pub async fn get_blob(
             ))
         }
         Err(error) => {
-            match error.downcast_ref() {
-                Some(GetObjectError::NoSuchKey(_)) => {
-                    tracing::error!("Error: {}", error);
-                    Err(ApiError::BlobNotFound)
-                }
-                _ => {
-                    tracing::error!("Error: {}", error);
-                    Err(ApiError::RuntimeError)
-                }
+            // A blob can be absent from the metadata table as well as from the
+            // object store. The metadata path returns `BlobNotFoundError`; the
+            // object store returns `NoSuchKey`. Both are a missing blob, not a
+            // server fault, so both map to 400/BlobNotFound.
+            let not_found = matches!(error.downcast_ref(), Some(GetObjectError::NoSuchKey(_)))
+                || error.downcast_ref::<BlobError>().is_some();
+            tracing::error!("Error: {}", error);
+            if not_found {
+                Err(ApiError::BlobNotFound)
+            } else {
+                Err(ApiError::RuntimeError)
             }
             // @TODO: Need to update error handling to return 404 if we have it but it's in tmp
         }
