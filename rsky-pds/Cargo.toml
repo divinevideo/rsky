@@ -95,7 +95,7 @@ subtle = "2.6.1"
 # `postgres-import`), which copies a pre-SQLite rsky-pds deployment into the
 # SQLite layout. Off by default so it never enters the server's dependency
 # graph or release binary.
-postgres = { version = "0.19", default-features = false, optional = true }
+postgres = { package = "tokio-postgres", version = "0.7", default-features = false, features = ["runtime"], optional = true }
 
 
 [features]

@@ -97,22 +97,24 @@ struct Source {
 }
 
 impl Source {
-    fn count(&mut self, table: &str) -> Result<i64> {
+    async fn count(&mut self, table: &str) -> Result<i64> {
         let sql = format!("SELECT count(*) FROM pds.{table}");
         let row = self
             .pg
             .query_one(&sql, &[])
+            .await
             .with_context(|| format!("counting pds.{table}"))?;
         Ok(row.get(0))
     }
 
-    fn rows(&mut self, sql: &str, table: &str) -> Result<Vec<postgres::Row>> {
+    async fn rows(&mut self, sql: &str, table: &str) -> Result<Vec<postgres::Row>> {
         self.pg
             .query(sql, &[])
+            .await
             .with_context(|| format!("reading pds.{table}"))
     }
 
-    fn rows_with(
+    async fn rows_with(
         &mut self,
         sql: &str,
         params: &[&(dyn postgres::types::ToSql + Sync)],
@@ -120,15 +122,18 @@ impl Source {
     ) -> Result<Vec<postgres::Row>> {
         self.pg
             .query(sql, params)
+            .await
             .with_context(|| format!("reading pds.{table}"))
     }
 }
 
-fn account_rows(src: &mut Source) -> Result<Vec<Vec<Value>>> {
-    let rows = src.rows(
-        "SELECT did, name, password, \"createdAt\" FROM pds.app_password",
-        "app_password",
-    )?;
+async fn account_rows(src: &mut Source) -> Result<Vec<Vec<Value>>> {
+    let rows = src
+        .rows(
+            "SELECT did, name, password, \"createdAt\" FROM pds.app_password",
+            "app_password",
+        )
+        .await?;
     Ok(rows
         .iter()
         .map(|r| {
@@ -144,17 +149,13 @@ fn account_rows(src: &mut Source) -> Result<Vec<Vec<Value>>> {
 }
 
 async fn import_account_database(src: &mut Source, path: &Path) -> Result<()> {
-    let db = rsky_pds::account_manager::db::get_migrated_db(path)
-        .await
-        .context("opening account.sqlite")?;
-
-    let app_password: Vec<Vec<Value>> = account_rows(src)?;
+    let app_password: Vec<Vec<Value>> = account_rows(src).await?;
 
     let invite_code: Vec<Vec<Value>> = src
         .rows(
             "SELECT code, \"availableUses\", disabled, \"forAccount\", \"createdBy\", \"createdAt\" FROM pds.invite_code",
             "invite_code",
-        )?
+        ).await?
         .iter()
         .map(|r| {
             vec![
@@ -172,7 +173,8 @@ async fn import_account_database(src: &mut Source, path: &Path) -> Result<()> {
         .rows(
             "SELECT code, \"usedBy\", \"usedAt\" FROM pds.invite_code_use",
             "invite_code_use",
-        )?
+        )
+        .await?
         .iter()
         .map(|r| {
             vec![
@@ -187,7 +189,8 @@ async fn import_account_database(src: &mut Source, path: &Path) -> Result<()> {
         .rows(
             "SELECT id, did, \"expiresAt\", \"nextId\", \"appPasswordName\" FROM pds.refresh_token",
             "refresh_token",
-        )?
+        )
+        .await?
         .iter()
         .map(|r| {
             vec![
@@ -204,7 +207,8 @@ async fn import_account_database(src: &mut Source, path: &Path) -> Result<()> {
         .rows(
             "SELECT did, cid, rev, \"indexedAt\" FROM pds.repo_root",
             "repo_root",
-        )?
+        )
+        .await?
         .iter()
         .map(|r| {
             vec![
@@ -220,7 +224,8 @@ async fn import_account_database(src: &mut Source, path: &Path) -> Result<()> {
         .rows(
             "SELECT did, handle, \"createdAt\", \"takedownRef\" FROM pds.actor",
             "actor",
-        )?
+        )
+        .await?
         .iter()
         .map(|r| {
             vec![
@@ -236,7 +241,7 @@ async fn import_account_database(src: &mut Source, path: &Path) -> Result<()> {
         .rows(
             "SELECT did, email, password, \"emailConfirmedAt\", \"invitesDisabled\" FROM pds.account",
             "account",
-        )?
+        ).await?
         .iter()
         .map(|r| {
             vec![
@@ -255,7 +260,8 @@ async fn import_account_database(src: &mut Source, path: &Path) -> Result<()> {
         .rows(
             "SELECT purpose, did, token, \"requestedAt\" FROM pds.email_token",
             "email_token",
-        )?
+        )
+        .await?
         .iter()
         .map(|r| {
             vec![
@@ -282,6 +288,9 @@ async fn import_account_database(src: &mut Source, path: &Path) -> Result<()> {
         return Ok(());
     }
 
+    let db = rsky_pds::account_manager::db::get_migrated_db(path)
+        .await
+        .context("opening account.sqlite")?;
     insert_all(
         &db,
         "INSERT INTO app_password (did, name, \"passwordScrypt\", \"createdAt\", privileged) VALUES (?, ?, ?, ?, ?)",
@@ -334,11 +343,9 @@ async fn import_account_database(src: &mut Source, path: &Path) -> Result<()> {
 }
 
 async fn import_did_cache(src: &mut Source, path: &Path) -> Result<()> {
-    let db = rsky_pds::did_cache::get_migrated_db(path)
-        .await
-        .context("opening did_cache.sqlite")?;
     let rows = src
-        .rows("SELECT did, doc, \"updatedAt\" FROM pds.did_doc", "did_doc")?
+        .rows("SELECT did, doc, \"updatedAt\" FROM pds.did_doc", "did_doc")
+        .await?
         .iter()
         .map(|r| {
             vec![
@@ -352,6 +359,9 @@ async fn import_did_cache(src: &mut Source, path: &Path) -> Result<()> {
         eprintln!("did_cache.sqlite: did_doc={}", rows.len());
         return Ok(());
     }
+    let db = rsky_pds::did_cache::get_migrated_db(path)
+        .await
+        .context("opening did_cache.sqlite")?;
     insert_all(
         &db,
         "INSERT INTO did_doc (did, doc, \"updatedAt\") VALUES (?, ?, ?)",
@@ -361,14 +371,12 @@ async fn import_did_cache(src: &mut Source, path: &Path) -> Result<()> {
 }
 
 async fn import_sequencer(src: &mut Source, path: &Path) -> Result<()> {
-    let db = rsky_pds::sequencer::db::get_migrated_db(path)
-        .await
-        .context("opening sequencer.sqlite")?;
     let rows = src
         .rows(
             "SELECT seq, did, \"eventType\", event, invalidated, \"sequencedAt\" FROM pds.repo_seq",
             "repo_seq",
-        )?
+        )
+        .await?
         .iter()
         .map(|r| {
             vec![
@@ -385,6 +393,9 @@ async fn import_sequencer(src: &mut Source, path: &Path) -> Result<()> {
         eprintln!("sequencer.sqlite: repo_seq={}", rows.len());
         return Ok(());
     }
+    let db = rsky_pds::sequencer::db::get_migrated_db(path)
+        .await
+        .context("opening sequencer.sqlite")?;
     insert_all(
         &db,
         "INSERT INTO repo_seq (seq, did, \"eventType\", event, invalidated, \"sequencedAt\") VALUES (?, ?, ?, ?, ?, ?)",
@@ -393,11 +404,13 @@ async fn import_sequencer(src: &mut Source, path: &Path) -> Result<()> {
     .await
 }
 
-fn actor_dids(src: &mut Source) -> Result<Vec<String>> {
-    let rows = src.rows(
-        "SELECT did FROM pds.actor UNION SELECT did FROM pds.repo_root UNION SELECT did FROM pds.record",
-        "actor dids",
-    )?;
+async fn actor_dids(src: &mut Source) -> Result<Vec<String>> {
+    let rows = src
+        .rows(
+            "SELECT did FROM pds.actor UNION SELECT did FROM pds.repo_root UNION SELECT did FROM pds.record",
+            "actor dids",
+        )
+        .await?;
     let mut dids: Vec<String> = rows.iter().map(|r| r.get::<_, String>("did")).collect();
     dids.sort();
     dids.dedup();
@@ -406,16 +419,14 @@ fn actor_dids(src: &mut Source) -> Result<Vec<String>> {
 
 async fn import_actor_store(src: &mut Source, actors_dir: &Path, did: &str) -> Result<()> {
     let path = actor_store_path(actors_dir, did);
-    let db = rsky_pds::actor_store::db::get_migrated_db(&path)
-        .await
-        .with_context(|| format!("opening {}", path.display()))?;
 
     let repo_root: Vec<Vec<Value>> = src
         .rows_with(
             "SELECT did, cid, rev, \"indexedAt\" FROM pds.repo_root WHERE did = $1",
             &[&did],
             "repo_root",
-        )?
+        )
+        .await?
         .iter()
         .map(|r| {
             vec![
@@ -432,7 +443,8 @@ async fn import_actor_store(src: &mut Source, actors_dir: &Path, did: &str) -> R
             "SELECT cid, \"repoRev\", size, content FROM pds.repo_block WHERE did = $1",
             &[&did],
             "repo_block",
-        )?
+        )
+        .await?
         .iter()
         .map(|r| {
             vec![
@@ -449,7 +461,7 @@ async fn import_actor_store(src: &mut Source, actors_dir: &Path, did: &str) -> R
             "SELECT uri, cid, collection, rkey, \"repoRev\", \"indexedAt\", \"takedownRef\" FROM pds.record WHERE did = $1",
             &[&did],
             "record",
-        )?
+        ).await?
         .iter()
         .map(|r| {
             vec![
@@ -470,7 +482,7 @@ async fn import_actor_store(src: &mut Source, actors_dir: &Path, did: &str) -> R
             "SELECT cid, \"mimeType\", size, \"tempKey\", width, height, \"createdAt\", \"takedownRef\" FROM pds.blob WHERE did = $1",
             &[&did],
             "blob",
-        )?
+        ).await?
         .iter()
         .map(|r| {
             vec![
@@ -491,7 +503,8 @@ async fn import_actor_store(src: &mut Source, actors_dir: &Path, did: &str) -> R
             "SELECT \"blobCid\", \"recordUri\" FROM pds.record_blob WHERE did = $1",
             &[&did],
             "record_blob",
-        )?
+        )
+        .await?
         .iter()
         .map(|r| {
             vec![
@@ -509,6 +522,7 @@ async fn import_actor_store(src: &mut Source, actors_dir: &Path, did: &str) -> R
             "SELECT uri, path, \"linkTo\" FROM pds.backlink WHERE uri LIKE $1",
             &[&backlink_prefix],
         )
+        .await
         .context("reading pds.backlink")?
         .iter()
         .filter(|r| {
@@ -530,7 +544,8 @@ async fn import_actor_store(src: &mut Source, actors_dir: &Path, did: &str) -> R
             "SELECT name, \"valueJson\" FROM pds.account_pref WHERE did = $1",
             &[&did],
             "account_pref",
-        )?
+        )
+        .await?
         .iter()
         .map(|r| {
             vec![
@@ -554,6 +569,13 @@ async fn import_actor_store(src: &mut Source, actors_dir: &Path, did: &str) -> R
         return Ok(());
     }
 
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let db = rsky_pds::actor_store::db::get_migrated_db(&path)
+        .await
+        .with_context(|| format!("opening {}", path.display()))?;
     insert_all(
         &db,
         "INSERT INTO repo_root (did, cid, rev, \"indexedAt\") VALUES (?, ?, ?, ?)",
@@ -615,8 +637,14 @@ async fn main() -> Result<()> {
         bail!("DATA_DIR {} is not a directory", data_dir.display());
     }
 
-    let pg = Client::connect(&database_url, postgres::NoTls)
+    let (pg, connection) = postgres::connect(&database_url, postgres::NoTls)
+        .await
         .context("connecting to the source PostgreSQL database")?;
+    tokio::spawn(async move {
+        if let Err(error) = connection.await {
+            eprintln!("source PostgreSQL connection error: {error}");
+        }
+    });
     let mut src = Source { pg, dry_run };
 
     // Report the source size before touching anything.
@@ -638,7 +666,7 @@ async fn main() -> Result<()> {
         "did_doc",
         "repo_seq",
     ] {
-        let count = src.count(table)?;
+        let count = src.count(table).await?;
         eprintln!("source pds.{table}: {count} rows");
     }
 
@@ -646,7 +674,7 @@ async fn main() -> Result<()> {
     import_did_cache(&mut src, &data_dir.join("did_cache.sqlite")).await?;
     import_sequencer(&mut src, &data_dir.join("sequencer.sqlite")).await?;
 
-    let dids = actor_dids(&mut src)?;
+    let dids = actor_dids(&mut src).await?;
     eprintln!("actor stores: {} DIDs", dids.len());
     for did in dids {
         import_actor_store(&mut src, &data_dir.join("actors"), &did).await?;
