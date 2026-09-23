@@ -187,7 +187,7 @@ async fn settings_come_from_the_environment() {
     std::env::remove_var("PDS_RATE_LIMITS_ENABLED");
     std::env::remove_var("PDS_RATE_LIMIT_BYPASS_KEY");
     std::env::remove_var("PDS_RATE_LIMIT_BYPASS_IPS");
-    assert!(!RateLimits::from_env().enabled());
+    assert!(RateLimits::from_env().enabled());
     // a redis address is only consulted while limits are enabled
     std::env::set_var("PDS_REDIS_SCRATCH_ADDRESS", "redis://127.0.0.1:1");
     assert!(!RateLimits::connect_from_env().await.shared());
