@@ -16,7 +16,9 @@ without changing the row.
 
 Account and app-password hashing runs on the blocking pool with a shared
 limit of four jobs per process, including jobs whose requests are cancelled.
-The request-limit default remains disabled.
+Slot waits are capped at 30 seconds; overloaded session creation returns
+`503 ServiceUnavailable` with `Retry-After: 5`. Failed app-password checks
+do not acquire a write lock. The request-limit default remains disabled.
 
 ## [1.2.0]
 

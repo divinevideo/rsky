@@ -327,7 +327,9 @@ are spooled to disk and refused with `413 PayloadTooLarge` one byte past
 
 Account and app-password hashing runs on the blocking pool with at most
 four jobs per process, even when request limits are disabled. Cancelled
-requests retain their hashing slot until the blocking job finishes.
+requests retain their hashing slot until the blocking job finishes. A request
+waits at most 30 seconds for a slot; session creation returns HTTP 503
+(`ServiceUnavailable`) with `Retry-After: 5` when that wait expires.
 Migrated Argon2 app passwords remain usable: a successful login on the
 account's admitted writer converts only the matched row to the current
 scrypt format, preserving its name, creation time, and privileges.

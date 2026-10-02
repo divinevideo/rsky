@@ -11,6 +11,7 @@ use rsky_lexicon::com::atproto::server::CreateAppPasswordOutput;
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use scrypt::{scrypt, Params as ScryptParams};
 use sha2::{Digest, Sha256};
+use std::time::Duration;
 use subtle::ConstantTimeEq;
 use tokio::sync::Semaphore;
 
@@ -19,13 +20,30 @@ use tokio::sync::Semaphore;
 // size and request-limit configuration.
 const PASSWORD_HASH_CONCURRENCY: usize = 4;
 static PASSWORD_HASH_SLOTS: Semaphore = Semaphore::const_new(PASSWORD_HASH_CONCURRENCY);
+const PASSWORD_HASH_WAIT: Duration = Duration::from_secs(30);
+
+#[derive(Debug, thiserror::Error)]
+#[error("too many concurrent password hashes")]
+pub(crate) struct PasswordHashOverloaded;
 
 pub(crate) async fn run_password_hash<F, T>(hash: F) -> Result<T>
 where
     F: FnOnce() -> Result<T> + Send + 'static,
     T: Send + 'static,
 {
-    let permit = PASSWORD_HASH_SLOTS.acquire().await?;
+    run_password_hash_on(&PASSWORD_HASH_SLOTS, PASSWORD_HASH_WAIT, hash).await
+}
+
+// Tests use independent slots so other hashes cannot conceal an early release.
+async fn run_password_hash_on<F, T>(slots: &'static Semaphore, wait: Duration, hash: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    let permit = match tokio::time::timeout(wait, slots.acquire()).await {
+        Ok(Ok(permit)) => permit,
+        _ => return Err(PasswordHashOverloaded.into()),
+    };
     tokio::task::spawn_blocking(move || {
         // Blocking work outlives a cancelled request. Keep its slot until
         // the hash finishes, rather than releasing it with the async caller.
@@ -132,21 +150,23 @@ pub async fn verify_app_password(
     // Session verification is allowed on a non-writer. Upgrading credentials
     // is an account mutation, so leave legacy rows intact when not admitted
     // or when the database was opened read-only.
-    if read_only || admission.admit_mutation(&did).is_err() {
-        return db
-            .run(move |conn| {
-                let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
-                let found = finish_app_password_verification(
-                    &tx,
-                    &did,
-                    &password_encrypted,
-                    &legacy_password_encrypted,
-                    false,
-                )?;
-                tx.commit()?;
-                Ok(found)
-            })
-            .await;
+    let (read_did, read_current, read_legacy) = (
+        did.clone(),
+        password_encrypted.clone(),
+        legacy_password_encrypted.clone(),
+    );
+    let (found, matched_legacy) = db
+        .run(move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+            let (found, matched_legacy) =
+                lookup_app_password_pair(&tx, &read_did, &read_current, &read_legacy)?;
+            tx.commit()?;
+            Ok((found, matched_legacy))
+        })
+        .await?;
+    // Wrong passwords and already upgraded rows need no write lock.
+    if !matched_legacy || read_only || admission.admit_mutation(&did).is_err() {
+        return Ok(found);
     }
     db.tx(move |conn| {
         finish_app_password_verification(
@@ -154,27 +174,21 @@ pub async fn verify_app_password(
             &did,
             &password_encrypted,
             &legacy_password_encrypted,
-            true,
         )
     })
     .await
 }
 
-// A concurrent login may have upgraded the row while we hashed. Both writers
-// and non-writers accept it. Callers hold one read snapshot for both lookups;
-// callers permitting an upgrade hold a write transaction.
+// The caller holds a write transaction and rechecks after the read-only
+// preflight: another login may have upgraded or deleted the matched row.
 fn finish_app_password_verification(
     conn: &rusqlite::Connection,
     did: &str,
     scrypt_hash: &str,
     legacy_hash: &str,
-    upgrade: bool,
 ) -> Result<Option<AppPassDescript>> {
-    if let Some(found) = lookup_app_password(conn, did, scrypt_hash)? {
-        return Ok(Some(found));
-    }
-    let found = lookup_app_password(conn, did, legacy_hash)?;
-    if upgrade {
+    let (found, matched_legacy) = lookup_app_password_pair(conn, did, scrypt_hash, legacy_hash)?;
+    if matched_legacy {
         if let Some(ref found) = found {
             conn.execute(
                 "UPDATE app_password SET \"passwordScrypt\" = ?1 \
@@ -184,6 +198,22 @@ fn finish_app_password_verification(
         }
     }
     Ok(found)
+}
+
+// Both lookups share the caller's read snapshot or write transaction.
+// Return whether the match needs an upgrade, keeping scrypt precedence.
+fn lookup_app_password_pair(
+    conn: &rusqlite::Connection,
+    did: &str,
+    scrypt_hash: &str,
+    legacy_hash: &str,
+) -> Result<(Option<AppPassDescript>, bool)> {
+    if let Some(found) = lookup_app_password(conn, did, scrypt_hash)? {
+        return Ok((Some(found), false));
+    }
+    let found = lookup_app_password(conn, did, legacy_hash)?;
+    let matched_legacy = found.is_some();
+    Ok((found, matched_legacy))
 }
 
 fn lookup_app_password(
@@ -647,13 +677,22 @@ mod tests {
             let current_hash = scrypt_hash.clone();
             let found = db
                 .tx(move |conn| {
-                    finish_app_password_verification(
-                        conn,
-                        STORED_LEGACY_DID,
-                        &current_hash,
-                        STORED_LEGACY_HASH,
-                        upgrade,
-                    )
+                    if upgrade {
+                        finish_app_password_verification(
+                            conn,
+                            STORED_LEGACY_DID,
+                            &current_hash,
+                            STORED_LEGACY_HASH,
+                        )
+                    } else {
+                        Ok(lookup_app_password_pair(
+                            conn,
+                            STORED_LEGACY_DID,
+                            &current_hash,
+                            STORED_LEGACY_HASH,
+                        )?
+                        .0)
+                    }
                 })
                 .await
                 .unwrap();
@@ -669,18 +708,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wrong_legacy_password_does_not_acquire_a_write_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("account.sqlite");
+        let db = app_password_db_at(
+            vec![(
+                STORED_LEGACY_DID,
+                "legacy",
+                STORED_LEGACY_HASH.to_owned(),
+                true,
+            )],
+            &path,
+        )
+        .await;
+        let blocker = rusqlite::Connection::open(&path).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        assert_eq!(
+            verify_app_password(STORED_LEGACY_DID, "wrong", &db)
+                .await
+                .unwrap(),
+            None,
+        );
+        blocker.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(stored_app_passwords(&db).await[0].2, STORED_LEGACY_HASH);
+    }
+
+    #[tokio::test]
+    async fn hashing_refuses_overload_without_starting_the_job() {
+        static SLOTS: Semaphore = Semaphore::const_new(1);
+        let held = SLOTS.acquire().await.unwrap();
+        let error = run_password_hash_on(&SLOTS, Duration::from_millis(5), || -> Result<()> {
+            panic!("a timed-out hash must never start");
+        })
+        .await
+        .unwrap_err();
+        assert!(error.is::<PasswordHashOverloaded>());
+        assert!(matches!(
+            crate::apis::ApiError::from(error),
+            crate::apis::ApiError::Overloaded(_)
+        ));
+        drop(held);
+        assert_eq!(
+            run_password_hash_on(&SLOTS, PASSWORD_HASH_WAIT, || Ok(42))
+                .await
+                .unwrap(),
+            42
+        );
+    }
+
+    #[tokio::test]
     async fn hashing_slots_remain_bounded_after_caller_cancellation() {
+        static SLOTS: Semaphore = Semaphore::const_new(PASSWORD_HASH_CONCURRENCY);
         let mut callers = Vec::new();
         let mut releases = Vec::new();
         for _ in 0..PASSWORD_HASH_CONCURRENCY {
             let (started, ready) = tokio::sync::oneshot::channel();
             let (release, finish) = std::sync::mpsc::channel();
-            let caller = tokio::spawn(run_password_hash(move || {
-                started.send(()).unwrap();
-                // Sender drops also unblock the job if the test panics.
-                finish.recv().unwrap();
-                Ok(())
-            }));
+            let caller = tokio::spawn(run_password_hash_on(
+                &SLOTS,
+                PASSWORD_HASH_WAIT,
+                move || {
+                    started.send(()).unwrap();
+                    // Sender drops also unblock the job if the test panics.
+                    finish.recv().unwrap();
+                    Ok(())
+                },
+            ));
             releases.push(release);
             callers.push(caller);
             tokio::time::timeout(std::time::Duration::from_secs(30), ready)
@@ -688,7 +781,7 @@ mod tests {
                 .unwrap()
                 .unwrap();
         }
-        let mut queued = Box::pin(run_password_hash(|| Ok(42)));
+        let mut queued = Box::pin(run_password_hash_on(&SLOTS, PASSWORD_HASH_WAIT, || Ok(42)));
         assert!(futures::poll!(&mut queued).is_pending());
 
         let cancelled = callers.remove(0);
@@ -698,7 +791,7 @@ mod tests {
         // Drop the queued waiter first: a wrongly released permit might
         // already be reserved for it, hiding the bug from available_permits.
         drop(queued);
-        assert!(PASSWORD_HASH_SLOTS.try_acquire().is_err());
+        assert!(SLOTS.try_acquire().is_err());
 
         for release in releases {
             release.send(()).unwrap();
@@ -706,7 +799,7 @@ mod tests {
         assert_eq!(
             tokio::time::timeout(
                 std::time::Duration::from_secs(30),
-                run_password_hash(|| Ok(42)),
+                run_password_hash_on(&SLOTS, PASSWORD_HASH_WAIT, || Ok(42)),
             )
             .await
             .unwrap()
