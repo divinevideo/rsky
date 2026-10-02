@@ -8,7 +8,7 @@ use rand::rngs::OsRng;
 use rand::RngCore;
 use rsky_common::{get_random_str, now};
 use rsky_lexicon::com::atproto::server::CreateAppPasswordOutput;
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use scrypt::{scrypt, Params as ScryptParams};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
@@ -101,15 +101,20 @@ pub async fn verify_app_password(
     let lookup_hash = password_encrypted.clone();
     let (found, has_legacy_rows, read_only) = db
         .run(move |conn| {
-            let found = lookup_app_password(conn, &lookup_did, &lookup_hash)?;
+            let read_only = conn.is_readonly("main")?;
+            // Both reads need one snapshot: another connection can upgrade
+            // the row between a scrypt miss and the legacy-presence check.
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+            let found = lookup_app_password(&tx, &lookup_did, &lookup_hash)?;
             let has_legacy_rows = found.is_none()
-                && conn.query_row(
+                && tx.query_row(
                     "SELECT EXISTS(SELECT 1 FROM app_password \
                      WHERE did = ?1 AND \"passwordScrypt\" GLOB '$argon2*')",
                     params![lookup_did],
                     |row| row.get::<_, bool>(0),
                 )?;
-            Ok((found, has_legacy_rows, conn.is_readonly("main")?))
+            tx.commit()?;
+            Ok((found, has_legacy_rows, read_only))
         })
         .await?;
     if found.is_some() || !has_legacy_rows {
@@ -130,13 +135,16 @@ pub async fn verify_app_password(
     if read_only || admission.admit_mutation(&did).is_err() {
         return db
             .run(move |conn| {
-                finish_app_password_verification(
-                    conn,
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+                let found = finish_app_password_verification(
+                    &tx,
                     &did,
                     &password_encrypted,
                     &legacy_password_encrypted,
                     false,
-                )
+                )?;
+                tx.commit()?;
+                Ok(found)
             })
             .await;
     }
@@ -153,7 +161,8 @@ pub async fn verify_app_password(
 }
 
 // A concurrent login may have upgraded the row while we hashed. Both writers
-// and non-writers accept it. Callers permitting an upgrade hold a transaction.
+// and non-writers accept it. Callers hold one read snapshot for both lookups;
+// callers permitting an upgrade hold a write transaction.
 fn finish_app_password_verification(
     conn: &rusqlite::Connection,
     did: &str,
@@ -582,16 +591,30 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_legacy_logins_both_succeed() {
-        let db = app_password_db(vec![(
-            STORED_LEGACY_DID,
-            "legacy",
-            STORED_LEGACY_HASH.to_owned(),
-            true,
-        )])
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("account.sqlite");
+        let db = app_password_db_at(
+            vec![(
+                STORED_LEGACY_DID,
+                "legacy",
+                STORED_LEGACY_HASH.to_owned(),
+                true,
+            )],
+            &path,
+        )
         .await;
+        let other_connection = Db::open(&path).unwrap();
+        let allowlist = dir.path().join("write-allowlist.toml");
+        std::fs::write(&allowlist, "version = 1\ndefault = \"absent\"\n").unwrap();
+        let non_writer = crate::admission::Admission::from_file(&allowlist).unwrap();
         let (first, second) = tokio::join!(
             verify_app_password(STORED_LEGACY_DID, STORED_LEGACY_PASSWORD, &db),
-            verify_app_password(STORED_LEGACY_DID, STORED_LEGACY_PASSWORD, &db),
+            super::verify_app_password(
+                STORED_LEGACY_DID,
+                STORED_LEGACY_PASSWORD,
+                &other_connection,
+                &non_writer
+            ),
         );
         let expected = Some(AppPassDescript {
             name: "legacy".to_owned(),
@@ -696,7 +719,14 @@ mod tests {
     }
 
     async fn app_password_db(rows: Vec<(&str, &str, String, bool)>) -> Db {
-        let db = crate::account_manager::db::get_migrated_db(":memory:")
+        app_password_db_at(rows, ":memory:").await
+    }
+
+    async fn app_password_db_at(
+        rows: Vec<(&str, &str, String, bool)>,
+        path: impl AsRef<std::path::Path>,
+    ) -> Db {
+        let db = crate::account_manager::db::get_migrated_db(path)
             .await
             .unwrap();
         let rows: Vec<_> = rows
