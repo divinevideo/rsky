@@ -130,36 +130,51 @@ pub async fn verify_app_password(
     if read_only || admission.admit_mutation(&did).is_err() {
         return db
             .run(move |conn| {
-                let found = lookup_app_password(conn, &did, &password_encrypted)?;
-                if found.is_some() {
-                    Ok(found)
-                } else {
-                    lookup_app_password(conn, &did, &legacy_password_encrypted)
-                }
+                finish_app_password_verification(
+                    conn,
+                    &did,
+                    &password_encrypted,
+                    &legacy_password_encrypted,
+                    false,
+                )
             })
             .await;
     }
     db.tx(move |conn| {
-        // A concurrent login may have upgraded it while we hashed.
-        if let Some(found) = lookup_app_password(conn, &did, &password_encrypted)? {
-            return Ok(Some(found));
-        }
-        let found = lookup_app_password(conn, &did, &legacy_password_encrypted)?;
+        finish_app_password_verification(
+            conn,
+            &did,
+            &password_encrypted,
+            &legacy_password_encrypted,
+            true,
+        )
+    })
+    .await
+}
+
+// A concurrent login may have upgraded the row while we hashed. Both writers
+// and non-writers accept it. Callers permitting an upgrade hold a transaction.
+fn finish_app_password_verification(
+    conn: &rusqlite::Connection,
+    did: &str,
+    scrypt_hash: &str,
+    legacy_hash: &str,
+    upgrade: bool,
+) -> Result<Option<AppPassDescript>> {
+    if let Some(found) = lookup_app_password(conn, did, scrypt_hash)? {
+        return Ok(Some(found));
+    }
+    let found = lookup_app_password(conn, did, legacy_hash)?;
+    if upgrade {
         if let Some(ref found) = found {
             conn.execute(
                 "UPDATE app_password SET \"passwordScrypt\" = ?1 \
                  WHERE did = ?2 AND name = ?3 AND \"passwordScrypt\" = ?4",
-                params![
-                    password_encrypted,
-                    did,
-                    found.name,
-                    legacy_password_encrypted
-                ],
+                params![scrypt_hash, did, found.name, legacy_hash],
             )?;
         }
-        Ok(found)
-    })
-    .await
+    }
+    Ok(found)
 }
 
 fn lookup_app_password(
@@ -585,6 +600,49 @@ mod tests {
         assert_eq!(first.unwrap(), expected);
         assert_eq!(second.unwrap(), expected);
         assert!(!stored_app_passwords(&db).await[0].2.starts_with('$'));
+    }
+
+    #[tokio::test]
+    async fn a_row_upgraded_during_hashing_still_verifies() {
+        let scrypt_hash = hash_app_password(
+            &STORED_LEGACY_DID.to_owned(),
+            &STORED_LEGACY_PASSWORD.to_owned(),
+        )
+        .await
+        .unwrap();
+        let db = app_password_db(vec![(
+            STORED_LEGACY_DID,
+            "legacy",
+            scrypt_hash.clone(),
+            true,
+        )])
+        .await;
+        let before = stored_app_passwords(&db).await;
+        // Model the row already upgraded by another login after our initial
+        // scrypt lookup missed, for both writer and non-writer final lookups.
+        for upgrade in [false, true] {
+            let current_hash = scrypt_hash.clone();
+            let found = db
+                .tx(move |conn| {
+                    finish_app_password_verification(
+                        conn,
+                        STORED_LEGACY_DID,
+                        &current_hash,
+                        STORED_LEGACY_HASH,
+                        upgrade,
+                    )
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                found,
+                Some(AppPassDescript {
+                    name: "legacy".to_owned(),
+                    privileged: true
+                })
+            );
+        }
+        assert_eq!(stored_app_passwords(&db).await, before);
     }
 
     #[tokio::test]
