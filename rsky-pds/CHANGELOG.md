@@ -2,6 +2,22 @@
 
 All notable changes to `rsky-pds` are documented here.
 
+## [Unreleased]
+
+### Fixed — migrated app passwords
+
+App passwords migrated from the PostgreSQL PDS can create sessions using
+their existing Argon2 hashes. The scrypt lookup remains first, and the
+legacy fallback runs only for accounts with Argon2 app-password rows.
+A successful legacy login on the account's admitted writer converts the
+matched row to the current scrypt format while preserving its name,
+creation time, and privileges. Non-writers and read-only databases verify
+without changing the row.
+
+Account and app-password hashing runs on the blocking pool with a shared
+limit of four jobs per process, including jobs whose requests are cancelled.
+The request-limit default remains disabled.
+
 ## [1.2.0]
 
 ### Changed — reference-compatible schema ledgers and account schema

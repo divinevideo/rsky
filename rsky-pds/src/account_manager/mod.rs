@@ -164,8 +164,7 @@ impl AccountManager {
         } = opts;
         let password_encrypted: Option<String> = match password {
             Some(password) => Some(
-                tokio::task::spawn_blocking(move || password::gen_salt_and_hash(password))
-                    .await??,
+                password::run_password_hash(move || password::gen_salt_and_hash(password)).await?,
             ),
             None => None,
         };
@@ -474,7 +473,7 @@ impl AccountManager {
         did: &str,
         password_str: &str,
     ) -> Result<Option<AppPassDescript>> {
-        password::verify_app_password(did, password_str, &self.db).await
+        password::verify_app_password(did, password_str, &self.db, &self.admission).await
     }
 
     pub async fn reset_password(&self, opts: ResetPasswordOpts) -> Result<()> {
@@ -496,8 +495,7 @@ impl AccountManager {
         self.admit(&opts.did)?;
         let UpdateAccountPasswordOpts { did, .. } = opts;
         let password_encrypted =
-            tokio::task::spawn_blocking(move || password::gen_salt_and_hash(opts.password))
-                .await??;
+            password::run_password_hash(move || password::gen_salt_and_hash(opts.password)).await?;
         try_join!(
             password::update_user_password(
                 UpdateUserPasswordOpts {

@@ -74,7 +74,7 @@ migration; rotating keys is not a substitute for migrating stored data.
 | `PDS_UPLOAD_SPOOL_DIR` | Where uploads are spooled while hashed and stored (default under the system temp dir) |
 | `PDS_MAX_CONCURRENT_EXPORTS` | Repository exports served at once (default 4); further requests wait up to 30 s, then 503 |
 | `PDS_MAX_CONCURRENT_BLOB_READS` | Blob downloads served at once (default 32) |
-| `PDS_RATE_LIMITS_ENABLED` | Apply the reference PDS's request limits (default true; set false to disable) |
+| `PDS_RATE_LIMITS_ENABLED` | Apply the reference PDS's request limits (default false) |
 | `PDS_RATE_LIMIT_BYPASS_KEY` | Value of an `x-ratelimit-bypass` header that skips every limit |
 | `PDS_RATE_LIMIT_BYPASS_IPS` | Comma-separated addresses that skip every limit |
 | `PDS_BLOB_UPLOAD_LIMIT` | Max blob upload size in bytes (default 5MB) |
@@ -325,8 +325,17 @@ Repository exports and blob downloads are streamed and bounded by
 are spooled to disk and refused with `413 PayloadTooLarge` one byte past
 `PDS_BLOB_UPLOAD_LIMIT`.
 
-With rate limits enabled (the default; set `PDS_RATE_LIMITS_ENABLED=false` to
-disable them), the reference PDS's limits apply: 3000
+Account and app-password hashing runs on the blocking pool with at most
+four jobs per process, even when request limits are disabled. Cancelled
+requests retain their hashing slot until the blocking job finishes.
+Migrated Argon2 app passwords remain usable: a successful login on the
+account's admitted writer converts only the matched row to the current
+scrypt format, preserving its name, creation time, and privileges.
+Non-writers and read-only databases verify without changing the row. Scrypt
+matches take precedence, and accounts without legacy app-password rows skip
+the Argon2 fallback.
+
+With `PDS_RATE_LIMITS_ENABLED=true` the reference PDS's limits apply: 3000
 XRPC requests per address per five minutes (repository exports have their
 own 6000), and the per-route limits on session creation, account creation,
 uploads, handle updates, password and email flows, and repository writes
