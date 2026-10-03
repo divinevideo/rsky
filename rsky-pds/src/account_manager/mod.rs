@@ -467,7 +467,7 @@ impl AccountManager {
         name: String,
     ) -> Result<CreateAppPasswordOutput> {
         self.admit(&did)?;
-        password::create_app_password(did, name, &self.db).await
+        password::create_app_password(did, name, &self.db, &self.admission).await
     }
 
     pub async fn list_app_passwords(&self, did: &str) -> Result<Vec<(String, String, bool)>> {
@@ -506,6 +506,11 @@ impl AccountManager {
         let UpdateAccountPasswordOpts { did, .. } = opts;
         let password_encrypted =
             password::run_password_hash(move || password::gen_salt_and_hash(opts.password)).await?;
+        self.store_account_password(did, password_encrypted).await
+    }
+
+    async fn store_account_password(&self, did: String, password_encrypted: String) -> Result<()> {
+        self.admit(&did)?;
         try_join!(
             password::update_user_password(
                 UpdateUserPasswordOpts {

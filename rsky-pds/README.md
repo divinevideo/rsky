@@ -332,10 +332,13 @@ waits at most 30 seconds for a slot; session creation returns HTTP 503
 (`ServiceUnavailable`) with `Retry-After: 5` when that wait expires.
 Sign-up hashes the password before creating its repository or publishing its
 identity, so a hashing timeout also returns HTTP 503 before those steps.
+This HTTP response applies to XRPC account creation; the web sign-up form
+displays its existing error message instead.
 Migrated Argon2 app passwords remain usable: a successful login on the
 account's admitted writer converts only the matched row to the current
 scrypt format, preserving its name, creation time, and privileges.
-Non-writers and read-only databases verify without changing the row. Scrypt
+The credential verifier leaves the row intact on non-writers and read-only
+databases; creating a session still requires writable session storage. Scrypt
 matches take precedence, and accounts without legacy app-password rows skip
 the Argon2 fallback.
 

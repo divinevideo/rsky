@@ -66,6 +66,57 @@ async fn create_test_account(am: &AccountManager, did: &str, handle: &str) -> (S
 }
 
 #[tokio::test]
+async fn prepared_password_writes_require_current_admission() {
+    let (dir, am) = test_manager().await;
+    create_test_account(&am, "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", "moved.test").await;
+    let allowlist = dir.path().join("write-allowlist.toml");
+    std::fs::write(&allowlist, "version = 1\ndefault = \"absent\"\n").unwrap();
+    let moved = AccountManager::new(am.db.clone()).with_admission(std::sync::Arc::new(
+        crate::admission::Admission::from_file(&allowlist).unwrap(),
+    ));
+    let hash = password::gen_salt_and_hash("replacement".to_owned()).unwrap();
+    for result in [
+        moved
+            .store_account_password("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".to_owned(), hash.clone())
+            .await,
+        moved
+            .create_account_with_password_hash(
+                create_opts("did:plc:bbbbbbbbbbbbbbbbbbbbbbbb", "not-created.test", None),
+                Some(hash),
+            )
+            .await
+            .map(drop),
+        password::create_app_password(
+            "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            "late".to_owned(),
+            &moved.db,
+            &moved.admission,
+        )
+        .await
+        .map(drop),
+    ] {
+        assert!(result.unwrap_err().is::<crate::admission::NotAdmitted>());
+    }
+    assert!(am
+        .verify_account_password(
+            "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+            &"password123".to_owned()
+        )
+        .await
+        .unwrap());
+    assert!(am
+        .list_app_passwords("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa")
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(am
+        .get_account("did:plc:bbbbbbbbbbbbbbbbbbbbbbbb", None)
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
 async fn creates_and_fetches_accounts() {
     let (_dir, am) = test_manager().await;
     let (access, refresh) = create_test_account(&am, "did:plc:alice", "alice.test").await;

@@ -12,7 +12,9 @@ legacy fallback runs only for accounts with Argon2 app-password rows.
 A successful legacy login on the account's admitted writer converts the
 matched row to the current scrypt format while preserving its name,
 creation time, and privileges. Non-writers and read-only databases verify
-without changing the row.
+credentials without changing the row; session creation still needs writable
+session storage. The same legacy format from older SQLite PDS versions is
+supported too.
 
 Account and app-password hashing runs on the blocking pool with a shared
 limit of four jobs per process, including jobs whose requests are cancelled.
@@ -20,7 +22,8 @@ Slot waits are capped at 30 seconds; overloaded session creation returns
 `503 ServiceUnavailable` with `Retry-After: 5`. Failed app-password checks
 do not acquire a write lock. The request-limit default remains disabled.
 Sign-up completes password hashing before repository and identity creation;
-hashing overload returns HTTP 503 before either step begins.
+hashing overload returns HTTP 503 from XRPC account creation before either
+step begins. The web sign-up form keeps its existing error response.
 
 ## [1.2.0]
 
