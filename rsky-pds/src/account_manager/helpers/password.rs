@@ -757,6 +757,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepared_signup_persists_without_waiting_for_another_hash_slot() {
+        use lexicon_cid::Cid;
+        use std::str::FromStr;
+
+        let (_dir, manager) = crate::account_manager::tests::test_manager().await;
+        let plaintext = "prepared-signup-password".to_owned();
+        let hash = gen_salt_and_hash(plaintext.clone()).unwrap();
+        let held = PASSWORD_HASH_SLOTS
+            .acquire_many(PASSWORD_HASH_CONCURRENCY as u32)
+            .await
+            .unwrap();
+        // Repository and identity creation must not be followed by another KDF.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            manager.create_account_with_password_hash(
+                crate::account_manager::CreateAccountOpts {
+                    did: APP_DID.to_owned(),
+                    handle: "prepared.example.test".to_owned(),
+                    email: Some("prepared@example.test".to_owned()),
+                    password: None,
+                    repo_cid: Cid::from_str(
+                        "bafkreibjfgx2gprinfvicegelk5kosd6y2frmqpqzwqkg7usac74l3t2v4",
+                    )
+                    .unwrap(),
+                    repo_rev: "3jzfcijpj2z2a".to_owned(),
+                    invite_code: None,
+                    deactivated: None,
+                },
+                Some(hash.clone()),
+            ),
+        )
+        .await
+        .expect("prepared signup must not wait for hashing capacity")
+        .unwrap();
+        drop(held);
+        assert!(manager
+            .verify_account_password(APP_DID, &plaintext)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
     async fn hashing_slots_remain_bounded_after_caller_cancellation() {
         static SLOTS: Semaphore = Semaphore::const_new(PASSWORD_HASH_CONCURRENCY);
         let mut callers = Vec::new();

@@ -19,6 +19,8 @@ limit of four jobs per process, including jobs whose requests are cancelled.
 Slot waits are capped at 30 seconds; overloaded session creation returns
 `503 ServiceUnavailable` with `Retry-After: 5`. Failed app-password checks
 do not acquire a write lock. The request-limit default remains disabled.
+Sign-up completes password hashing before repository and identity creation;
+hashing overload returns HTTP 503 before either step begins.
 
 ## [1.2.0]
 

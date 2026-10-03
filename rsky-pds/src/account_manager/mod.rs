@@ -150,25 +150,35 @@ impl AccountManager {
         }
     }
 
-    pub async fn create_account(&self, opts: CreateAccountOpts) -> Result<(String, String)> {
+    pub async fn create_account(&self, mut opts: CreateAccountOpts) -> Result<(String, String)> {
         self.admit(&opts.did)?;
-        let CreateAccountOpts {
-            did,
-            handle,
-            email,
-            password,
-            repo_cid,
-            repo_rev,
-            invite_code,
-            deactivated,
-        } = opts;
-        let password_encrypted: Option<String> = match password {
+        let password_encrypted = match opts.password.take() {
             Some(password) => Some(
                 password::run_password_hash(move || password::gen_salt_and_hash(password)).await?,
             ),
             None => None,
         };
+        self.create_account_with_password_hash(opts, password_encrypted)
+            .await
+    }
 
+    /// Persist credentials hashed before repository or identity creation.
+    pub(crate) async fn create_account_with_password_hash(
+        &self,
+        opts: CreateAccountOpts,
+        password_encrypted: Option<String>,
+    ) -> Result<(String, String)> {
+        self.admit(&opts.did)?;
+        let CreateAccountOpts {
+            did,
+            handle,
+            email,
+            password: _,
+            repo_cid,
+            repo_rev,
+            invite_code,
+            deactivated,
+        } = opts;
         let (access_jwt, refresh_jwt) = auth::create_tokens(CreateTokensOpts {
             did: did.clone(),
             service_did: env::var("PDS_SERVICE_DID").unwrap(),
