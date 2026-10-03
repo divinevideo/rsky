@@ -1,17 +1,60 @@
 use crate::db::sqlite::Db;
 use anyhow::{anyhow, bail, Result};
 use argon2::{
-    password_hash::{PasswordHash, PasswordVerifier},
-    Argon2,
+    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
+    Algorithm, Argon2, Params as Argon2Params, Version,
 };
 use rand::rngs::OsRng;
 use rand::RngCore;
 use rsky_common::{get_random_str, now};
 use rsky_lexicon::com::atproto::server::CreateAppPasswordOutput;
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use scrypt::{scrypt, Params as ScryptParams};
 use sha2::{Digest, Sha256};
+use std::time::Duration;
 use subtle::ConstantTimeEq;
+use tokio::sync::Semaphore;
+
+// Share a small process-wide budget across account and app-password KDFs.
+// Four legacy app hashes use 76 MiB, independently of Rocket's blocking-pool
+// size and request-limit configuration.
+const PASSWORD_HASH_CONCURRENCY: usize = 4;
+static PASSWORD_HASH_SLOTS: Semaphore = Semaphore::const_new(PASSWORD_HASH_CONCURRENCY);
+const PASSWORD_HASH_WAIT: Duration = Duration::from_secs(30);
+const LEGACY_ARGON2_MEMORY_KIB: u32 = 19_456;
+const LEGACY_ARGON2_ITERATIONS: u32 = 2;
+const LEGACY_ARGON2_PARALLELISM: u32 = 1;
+
+#[derive(Debug, thiserror::Error)]
+#[error("too many concurrent password hashes")]
+pub(crate) struct PasswordHashOverloaded;
+
+pub(crate) async fn run_password_hash<F, T>(hash: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    run_password_hash_on(&PASSWORD_HASH_SLOTS, PASSWORD_HASH_WAIT, hash).await
+}
+
+// Tests use independent slots so other hashes cannot conceal an early release.
+async fn run_password_hash_on<F, T>(slots: &'static Semaphore, wait: Duration, hash: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    let permit = match tokio::time::timeout(wait, slots.acquire()).await {
+        Ok(Ok(permit)) => permit,
+        _ => return Err(PasswordHashOverloaded.into()),
+    };
+    tokio::task::spawn_blocking(move || {
+        // Blocking work outlives a cancelled request. Keep its slot until
+        // the hash finishes, rather than releasing it with the async caller.
+        let _permit = permit;
+        hash()
+    })
+    .await?
+}
 
 /// An app password a session was created with, and whether it may reach
 /// privileged methods.
@@ -46,49 +89,179 @@ fn scrypt_params() -> ScryptParams {
 }
 
 pub async fn verify_account_password(did: &str, password: &String, db: &Db) -> Result<bool> {
-    let did = did.to_owned();
-    let found: Option<String> = db
-        .run(move |conn| {
-            Ok(conn
-                .query_row(
-                    "SELECT \"passwordScrypt\" FROM account WHERE did = ?1",
-                    params![did],
-                    |row| row.get(0),
-                )
-                .optional()?)
-        })
-        .await?;
-    if let Some(stored_hash) = found {
-        verify(password, &stored_hash)
+    if let Some(stored_hash) = stored_account_hash(did, db).await? {
+        verify_against_stored_hash(did, password.clone(), stored_hash, db).await
     } else {
         Ok(false)
     }
+}
+
+async fn stored_account_hash(did: &str, db: &Db) -> Result<Option<String>> {
+    let did = did.to_owned();
+    db.run(move |conn| {
+        Ok(conn
+            .query_row(
+                "SELECT \"passwordScrypt\" FROM account WHERE did = ?1",
+                params![did],
+                |row| row.get(0),
+            )
+            .optional()?)
+    })
+    .await
+}
+
+async fn verify_against_stored_hash(
+    did: &str,
+    password: String,
+    stored_hash: String,
+    db: &Db,
+) -> Result<bool> {
+    let checked_hash = stored_hash.clone();
+    if !run_password_hash(move || verify(&password, &checked_hash)).await? {
+        return Ok(false);
+    }
+    // Password changes may commit while verification waits for a hash slot.
+    Ok(stored_account_hash(did, db).await? == Some(stored_hash))
 }
 
 pub async fn verify_app_password(
     did: &str,
     password: &str,
     db: &Db,
+    admission: &crate::admission::Admission,
 ) -> Result<Option<AppPassDescript>> {
     let did = did.to_owned();
     let password = password.to_owned();
     let password_encrypted = hash_app_password(&did, &password).await?;
-    db.run(move |conn| {
-        Ok(conn
-            .query_row(
-                "SELECT name, privileged FROM app_password \
-                 WHERE did = ?1 AND \"passwordScrypt\" = ?2",
-                params![did, password_encrypted],
-                |row| {
-                    Ok(AppPassDescript {
-                        name: row.get(0)?,
-                        privileged: row.get::<_, i64>(1)? == 1,
-                    })
-                },
-            )
-            .optional()?)
+    let lookup_did = did.clone();
+    let lookup_hash = password_encrypted.clone();
+    let (found, has_legacy_rows, read_only) = db
+        .run(move |conn| {
+            let read_only = conn.is_readonly("main")?;
+            // Both reads need one snapshot: another connection can upgrade
+            // the row between a scrypt miss and the legacy-presence check.
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+            let (found, has_legacy_rows) =
+                lookup_app_password_state(&tx, &lookup_did, &lookup_hash)?;
+            tx.commit()?;
+            Ok((found, has_legacy_rows, read_only))
+        })
+        .await?;
+    if found.is_some() || !has_legacy_rows {
+        return Ok(found);
+    }
+
+    // Migrated app passwords retain the deterministic Argon2 hashes used by
+    // the old equality lookup. Retain compatibility for untouched legacy rows;
+    // a successful login upgrades only its matched row to reference-compatible
+    // scrypt. No KDF runs while holding the database connection.
+    let legacy_did = did.clone();
+    let legacy_password = password.clone();
+    let legacy_password_encrypted =
+        run_password_hash(move || hash_legacy_app_password(&legacy_did, &legacy_password)).await?;
+    // Session verification is allowed on a non-writer. Upgrading credentials
+    // is an account mutation, so leave legacy rows intact when not admitted
+    // or when the database was opened read-only.
+    let (read_did, read_current, read_legacy) = (
+        did.clone(),
+        password_encrypted.clone(),
+        legacy_password_encrypted.clone(),
+    );
+    let (found, matched_legacy) = db
+        .run(move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+            let (found, matched_legacy) =
+                lookup_app_password_pair(&tx, &read_did, &read_current, &read_legacy)?;
+            tx.commit()?;
+            Ok((found, matched_legacy))
+        })
+        .await?;
+    // Wrong passwords and already upgraded rows need no write lock.
+    if !matched_legacy || read_only || admission.admit_mutation(&did).is_err() {
+        return Ok(found);
+    }
+    db.tx(move |conn| {
+        finish_app_password_verification(
+            conn,
+            &did,
+            &password_encrypted,
+            &legacy_password_encrypted,
+        )
     })
     .await
+}
+
+// The caller holds a write transaction and rechecks after the read-only
+// preflight: another login may have upgraded or deleted the matched row.
+fn finish_app_password_verification(
+    conn: &rusqlite::Connection,
+    did: &str,
+    scrypt_hash: &str,
+    legacy_hash: &str,
+) -> Result<Option<AppPassDescript>> {
+    let (found, matched_legacy) = lookup_app_password_pair(conn, did, scrypt_hash, legacy_hash)?;
+    if matched_legacy {
+        if let Some(ref found) = found {
+            conn.execute(
+                "UPDATE app_password SET \"passwordScrypt\" = ?1 \
+                 WHERE did = ?2 AND name = ?3 AND \"passwordScrypt\" = ?4",
+                params![scrypt_hash, did, found.name, legacy_hash],
+            )?;
+        }
+    }
+    Ok(found)
+}
+
+fn lookup_app_password_state(
+    conn: &rusqlite::Connection,
+    did: &str,
+    hash: &str,
+) -> Result<(Option<AppPassDescript>, bool)> {
+    let found = lookup_app_password(conn, did, hash)?;
+    let try_legacy = found.is_none()
+        && conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM app_password \
+             WHERE did = ?1 AND \"passwordScrypt\" GLOB '$argon2*')",
+            params![did],
+            |row| row.get::<_, bool>(0),
+        )?;
+    Ok((found, try_legacy))
+}
+
+// Both lookups share the caller's read snapshot or write transaction.
+// Return whether the match needs an upgrade, keeping scrypt precedence.
+fn lookup_app_password_pair(
+    conn: &rusqlite::Connection,
+    did: &str,
+    scrypt_hash: &str,
+    legacy_hash: &str,
+) -> Result<(Option<AppPassDescript>, bool)> {
+    if let Some(found) = lookup_app_password(conn, did, scrypt_hash)? {
+        return Ok((Some(found), false));
+    }
+    let found = lookup_app_password(conn, did, legacy_hash)?;
+    let matched_legacy = found.is_some();
+    Ok((found, matched_legacy))
+}
+
+fn lookup_app_password(
+    conn: &rusqlite::Connection,
+    did: &str,
+    hash: &str,
+) -> Result<Option<AppPassDescript>> {
+    Ok(conn
+        .query_row(
+            "SELECT name, privileged FROM app_password \
+         WHERE did = ?1 AND \"passwordScrypt\" = ?2",
+            params![did, hash],
+            |row| {
+                Ok(AppPassDescript {
+                    name: row.get(0)?,
+                    privileged: row.get::<_, i64>(1)? == 1,
+                })
+            },
+        )
+        .optional()?)
 }
 
 /// Hash a brand-new password with a freshly generated random salt.
@@ -170,9 +343,30 @@ fn verify_scrypt(password: &String, stored_hash: &str) -> Result<bool> {
 }
 
 pub async fn hash_app_password(did: &String, password: &String) -> Result<String> {
-    let digest = Sha256::digest(did);
-    let salt = hex::encode(&digest[0..16]);
-    hash_with_salt(password, &salt)
+    let did = did.clone();
+    let password = password.clone();
+    run_password_hash(move || {
+        let digest = Sha256::digest(did);
+        let salt = hex::encode(&digest[0..16]);
+        hash_with_salt(&password, &salt)
+    })
+    .await
+}
+
+fn hash_legacy_app_password(did: &str, password: &str) -> Result<String> {
+    let salt =
+        SaltString::encode_b64(&Sha256::digest(did)).map_err(|error| anyhow!(error.to_string()))?;
+    let params = Argon2Params::new(
+        LEGACY_ARGON2_MEMORY_KIB,
+        LEGACY_ARGON2_ITERATIONS,
+        LEGACY_ARGON2_PARALLELISM,
+        None,
+    )
+    .expect("historical Argon2 parameters are valid");
+    Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
+        .hash_password(password.as_bytes(), &salt)
+        .map(|hash| hash.to_string())
+        .map_err(|error| anyhow!(error.to_string()))
 }
 
 /// create an app password with format:
@@ -181,11 +375,13 @@ pub async fn create_app_password(
     did: String,
     name: String,
     db: &Db,
+    admission: &crate::admission::Admission,
 ) -> Result<CreateAppPasswordOutput> {
     let str = &get_random_str()[0..16].to_lowercase();
     let chunks = [&str[0..4], &str[4..8], &str[8..12], &str[12..16]];
     let password = chunks.join("-");
     let password_encrypted = hash_app_password(&did, &password).await?;
+    admission.admit_mutation(&did)?;
 
     let created_at = now();
 
@@ -256,6 +452,634 @@ pub async fn delete_app_password(did: &str, name: &str, db: &Db) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const APP_DID: &str = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+    const OTHER_APP_DID: &str = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
+    const STORED_LEGACY_DID: &str = "did:plc:000000000000000000000000";
+    const STORED_LEGACY_PASSWORD: &str = "0000-abcd-0000-efgh";
+    const STORED_LEGACY_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$9oYswymdj3ecu6MJoE55RA3MWOxmdGmocGFvu2qS6sI$2h/vgSVkKj801/dO5BX3+oubsvnM0L9t06wznWfyJLo";
+
+    async fn verify_app_password(
+        did: &str,
+        password: &str,
+        db: &Db,
+    ) -> Result<Option<AppPassDescript>> {
+        super::verify_app_password(
+            did,
+            password,
+            db,
+            &crate::admission::Admission::unrestricted(),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn legacy_login_on_a_non_writer_preserves_the_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let allowlist = dir.path().join("write-allowlist.toml");
+        std::fs::write(&allowlist, "version = 1\ndefault = \"absent\"\n").unwrap();
+        let db = app_password_db(vec![(
+            STORED_LEGACY_DID,
+            "legacy",
+            STORED_LEGACY_HASH.to_owned(),
+            true,
+        )])
+        .await;
+        let before = stored_app_passwords(&db).await;
+        let manager = crate::account_manager::AccountManager::new(db.clone()).with_admission(
+            std::sync::Arc::new(crate::admission::Admission::from_file(&allowlist).unwrap()),
+        );
+        assert_eq!(
+            manager
+                .verify_app_password(STORED_LEGACY_DID, STORED_LEGACY_PASSWORD)
+                .await
+                .unwrap(),
+            Some(AppPassDescript {
+                name: "legacy".to_owned(),
+                privileged: true
+            }),
+        );
+        assert_eq!(stored_app_passwords(&db).await, before);
+    }
+
+    #[test]
+    fn legacy_app_hash_matches_stored_postgres_format() {
+        assert_eq!(
+            hash_legacy_app_password(STORED_LEGACY_DID, STORED_LEGACY_PASSWORD).unwrap(),
+            STORED_LEGACY_HASH,
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_verification_on_a_read_only_database_preserves_the_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("account.sqlite");
+        let writable = crate::account_manager::db::get_migrated_db(&path)
+            .await
+            .unwrap();
+        writable.run(|conn| {
+            conn.execute(
+                "INSERT INTO app_password (did, name, \"passwordScrypt\", \"createdAt\", privileged) \
+                 VALUES (?1, 'legacy', ?2, '2026-01-01T00:00:00.000Z', 1)",
+                params![STORED_LEGACY_DID, STORED_LEGACY_HASH],
+            )?;
+            Ok(())
+        }).await.unwrap();
+        let readonly = Db::open_read_only(&path).unwrap();
+        let before = stored_app_passwords(&readonly).await;
+        assert_eq!(
+            verify_app_password(STORED_LEGACY_DID, STORED_LEGACY_PASSWORD, &readonly)
+                .await
+                .unwrap(),
+            Some(AppPassDescript {
+                name: "legacy".to_owned(),
+                privileged: true
+            }),
+        );
+        assert_eq!(stored_app_passwords(&readonly).await, before);
+    }
+
+    #[tokio::test]
+    async fn legacy_login_upgrades_only_the_matched_row() {
+        let db = app_password_db(vec![
+            (
+                STORED_LEGACY_DID,
+                "matched",
+                STORED_LEGACY_HASH.to_owned(),
+                true,
+            ),
+            (
+                STORED_LEGACY_DID,
+                "unmatched",
+                "$argon2id$invalid".to_owned(),
+                false,
+            ),
+            (
+                OTHER_APP_DID,
+                "other-account",
+                STORED_LEGACY_HASH.to_owned(),
+                false,
+            ),
+        ])
+        .await;
+        let rows_before = stored_app_passwords(&db).await;
+        assert_eq!(
+            verify_app_password(STORED_LEGACY_DID, "wrong", &db)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(stored_app_passwords(&db).await, rows_before);
+        let expected = Some(AppPassDescript {
+            name: "matched".to_owned(),
+            privileged: true,
+        });
+        assert_eq!(
+            verify_app_password(STORED_LEGACY_DID, STORED_LEGACY_PASSWORD, &db)
+                .await
+                .unwrap(),
+            expected
+        );
+        let rows_after = stored_app_passwords(&db).await;
+        let scrypt_hash = hash_app_password(
+            &STORED_LEGACY_DID.to_owned(),
+            &STORED_LEGACY_PASSWORD.to_owned(),
+        )
+        .await
+        .unwrap();
+        let mut expected_rows = rows_before;
+        expected_rows
+            .iter_mut()
+            .find(|row| row.0 == STORED_LEGACY_DID && row.1 == "matched")
+            .unwrap()
+            .2 = scrypt_hash;
+        assert_eq!(rows_after, expected_rows);
+        assert_eq!(
+            verify_app_password(STORED_LEGACY_DID, STORED_LEGACY_PASSWORD, &db)
+                .await
+                .unwrap(),
+            expected
+        );
+    }
+
+    async fn stored_app_passwords(db: &Db) -> Vec<(String, String, String, String, i64)> {
+        db.run(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT did, name, \"passwordScrypt\", \"createdAt\", privileged \
+                 FROM app_password ORDER BY did, name",
+            )?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn scrypt_match_takes_precedence_over_a_legacy_match() {
+        let scrypt_hash = hash_app_password(
+            &STORED_LEGACY_DID.to_owned(),
+            &STORED_LEGACY_PASSWORD.to_owned(),
+        )
+        .await
+        .unwrap();
+        let db = app_password_db(vec![
+            (
+                STORED_LEGACY_DID,
+                "legacy",
+                STORED_LEGACY_HASH.to_owned(),
+                true,
+            ),
+            (STORED_LEGACY_DID, "current", scrypt_hash, false),
+        ])
+        .await;
+        let before = stored_app_passwords(&db).await;
+        assert_eq!(
+            verify_app_password(STORED_LEGACY_DID, STORED_LEGACY_PASSWORD, &db)
+                .await
+                .unwrap(),
+            Some(AppPassDescript {
+                name: "current".to_owned(),
+                privileged: false
+            }),
+        );
+        assert_eq!(stored_app_passwords(&db).await, before);
+    }
+
+    #[tokio::test]
+    async fn concurrent_legacy_logins_both_succeed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("account.sqlite");
+        let db = app_password_db_at(
+            vec![(
+                STORED_LEGACY_DID,
+                "legacy",
+                STORED_LEGACY_HASH.to_owned(),
+                true,
+            )],
+            &path,
+        )
+        .await;
+        let other_connection = Db::open(&path).unwrap();
+        let allowlist = dir.path().join("write-allowlist.toml");
+        std::fs::write(&allowlist, "version = 1\ndefault = \"absent\"\n").unwrap();
+        let non_writer = crate::admission::Admission::from_file(&allowlist).unwrap();
+        let (first, second) = tokio::join!(
+            verify_app_password(STORED_LEGACY_DID, STORED_LEGACY_PASSWORD, &db),
+            super::verify_app_password(
+                STORED_LEGACY_DID,
+                STORED_LEGACY_PASSWORD,
+                &other_connection,
+                &non_writer
+            ),
+        );
+        let expected = Some(AppPassDescript {
+            name: "legacy".to_owned(),
+            privileged: true,
+        });
+        assert_eq!(first.unwrap(), expected);
+        assert_eq!(second.unwrap(), expected);
+        assert!(!stored_app_passwords(&db).await[0].2.starts_with('$'));
+    }
+
+    #[tokio::test]
+    async fn a_row_upgraded_during_hashing_still_verifies() {
+        let scrypt_hash = hash_app_password(
+            &STORED_LEGACY_DID.to_owned(),
+            &STORED_LEGACY_PASSWORD.to_owned(),
+        )
+        .await
+        .unwrap();
+        let db = app_password_db(vec![(
+            STORED_LEGACY_DID,
+            "legacy",
+            scrypt_hash.clone(),
+            true,
+        )])
+        .await;
+        let before = stored_app_passwords(&db).await;
+        // Model the row already upgraded by another login after our initial
+        // scrypt lookup missed, for both writer and non-writer final lookups.
+        for upgrade in [false, true] {
+            let current_hash = scrypt_hash.clone();
+            let found = db
+                .tx(move |conn| {
+                    if upgrade {
+                        finish_app_password_verification(
+                            conn,
+                            STORED_LEGACY_DID,
+                            &current_hash,
+                            STORED_LEGACY_HASH,
+                        )
+                    } else {
+                        Ok(lookup_app_password_pair(
+                            conn,
+                            STORED_LEGACY_DID,
+                            &current_hash,
+                            STORED_LEGACY_HASH,
+                        )?
+                        .0)
+                    }
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                found,
+                Some(AppPassDescript {
+                    name: "legacy".to_owned(),
+                    privileged: true
+                })
+            );
+        }
+        assert_eq!(stored_app_passwords(&db).await, before);
+    }
+
+    #[tokio::test]
+    async fn wrong_legacy_password_does_not_acquire_a_write_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("account.sqlite");
+        let db = app_password_db_at(
+            vec![(
+                STORED_LEGACY_DID,
+                "legacy",
+                STORED_LEGACY_HASH.to_owned(),
+                true,
+            )],
+            &path,
+        )
+        .await;
+        let blocker = rusqlite::Connection::open(&path).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        assert_eq!(
+            verify_app_password(STORED_LEGACY_DID, "wrong", &db)
+                .await
+                .unwrap(),
+            None,
+        );
+        blocker.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(stored_app_passwords(&db).await[0].2, STORED_LEGACY_HASH);
+    }
+
+    #[tokio::test]
+    async fn hashing_refuses_overload_without_starting_the_job() {
+        static SLOTS: Semaphore = Semaphore::const_new(1);
+        let held = SLOTS.acquire().await.unwrap();
+        let error = run_password_hash_on(&SLOTS, Duration::from_millis(5), || -> Result<()> {
+            panic!("a timed-out hash must never start");
+        })
+        .await
+        .unwrap_err();
+        assert!(error.is::<PasswordHashOverloaded>());
+        assert!(matches!(
+            crate::apis::ApiError::from(error),
+            crate::apis::ApiError::Overloaded(_)
+        ));
+        drop(held);
+        assert_eq!(
+            run_password_hash_on(&SLOTS, PASSWORD_HASH_WAIT, || Ok(42))
+                .await
+                .unwrap(),
+            42
+        );
+    }
+
+    #[tokio::test]
+    async fn a_replaced_account_hash_does_not_verify() {
+        let db = crate::account_manager::db::get_migrated_db(":memory:")
+            .await
+            .unwrap();
+        let old_hash = gen_salt_and_hash("old-password".to_owned()).unwrap();
+        let new_hash = gen_salt_and_hash("new-password".to_owned()).unwrap();
+        db.run(move |conn| {
+            conn.execute(
+                "INSERT INTO account (did, email, \"passwordScrypt\") VALUES (?1, ?2, ?3)",
+                params![APP_DID, "replaced@example.test", new_hash],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        // Model a replacement committed after the login read its hash.
+        assert!(
+            !verify_against_stored_hash(APP_DID, "old-password".to_owned(), old_hash, &db)
+                .await
+                .unwrap()
+        );
+        assert!(
+            verify_account_password(APP_DID, &"new-password".to_owned(), &db)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_fallback_is_selected_only_for_legacy_rows() {
+        for (rows, expected) in [
+            (vec![], false),
+            (
+                vec![(APP_DID, "current", "salt:key".to_owned(), false)],
+                false,
+            ),
+            (
+                vec![(APP_DID, "legacy", STORED_LEGACY_HASH.to_owned(), false)],
+                true,
+            ),
+            (
+                vec![(OTHER_APP_DID, "other", STORED_LEGACY_HASH.to_owned(), false)],
+                false,
+            ),
+        ] {
+            let db = app_password_db(rows).await;
+            let (found, try_legacy) = db
+                .run(|conn| {
+                    let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+                    lookup_app_password_state(&tx, APP_DID, "unmatched-scrypt")
+                })
+                .await
+                .unwrap();
+            assert!(found.is_none());
+            assert_eq!(try_legacy, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_signup_persists_without_waiting_for_another_hash_slot() {
+        use lexicon_cid::Cid;
+        use std::str::FromStr;
+
+        let (_dir, manager) = crate::account_manager::tests::test_manager().await;
+        let plaintext = "prepared-signup-password".to_owned();
+        let hash = gen_salt_and_hash(plaintext.clone()).unwrap();
+        let held = PASSWORD_HASH_SLOTS
+            .acquire_many(PASSWORD_HASH_CONCURRENCY as u32)
+            .await
+            .unwrap();
+        // Repository and identity creation must not be followed by another KDF.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            manager.create_account_with_password_hash(
+                crate::account_manager::CreateAccountOpts {
+                    did: APP_DID.to_owned(),
+                    handle: "prepared.example.test".to_owned(),
+                    email: Some("prepared@example.test".to_owned()),
+                    password: None,
+                    repo_cid: Cid::from_str(
+                        "bafkreibjfgx2gprinfvicegelk5kosd6y2frmqpqzwqkg7usac74l3t2v4",
+                    )
+                    .unwrap(),
+                    repo_rev: "3jzfcijpj2z2a".to_owned(),
+                    invite_code: None,
+                    deactivated: None,
+                },
+                Some(hash.clone()),
+            ),
+        )
+        .await
+        .expect("prepared signup must not wait for hashing capacity")
+        .unwrap();
+        drop(held);
+        assert!(manager
+            .verify_account_password(APP_DID, &plaintext)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn hashing_slots_remain_bounded_after_caller_cancellation() {
+        static SLOTS: Semaphore = Semaphore::const_new(PASSWORD_HASH_CONCURRENCY);
+        let mut callers = Vec::new();
+        let mut releases = Vec::new();
+        for _ in 0..PASSWORD_HASH_CONCURRENCY {
+            let (started, ready) = tokio::sync::oneshot::channel();
+            let (release, finish) = std::sync::mpsc::channel();
+            let caller = tokio::spawn(run_password_hash_on(
+                &SLOTS,
+                PASSWORD_HASH_WAIT,
+                move || {
+                    started.send(()).unwrap();
+                    // Sender drops also unblock the job if the test panics.
+                    finish.recv().unwrap();
+                    Ok(())
+                },
+            ));
+            releases.push(release);
+            callers.push(caller);
+            tokio::time::timeout(std::time::Duration::from_secs(30), ready)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        let mut queued = Box::pin(run_password_hash_on(&SLOTS, PASSWORD_HASH_WAIT, || Ok(42)));
+        assert!(futures::poll!(&mut queued).is_pending());
+
+        let cancelled = callers.remove(0);
+        cancelled.abort();
+        assert!(cancelled.await.unwrap_err().is_cancelled());
+        // The blocking job is still alive and must retain its slot.
+        // Drop the queued waiter first: a wrongly released permit might
+        // already be reserved for it, hiding the bug from available_permits.
+        drop(queued);
+        assert!(SLOTS.try_acquire().is_err());
+
+        for release in releases {
+            release.send(()).unwrap();
+        }
+        assert_eq!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                run_password_hash_on(&SLOTS, PASSWORD_HASH_WAIT, || Ok(42)),
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+            42,
+        );
+        for caller in callers {
+            caller.await.unwrap().unwrap();
+        }
+    }
+
+    async fn app_password_db(rows: Vec<(&str, &str, String, bool)>) -> Db {
+        app_password_db_at(rows, ":memory:").await
+    }
+
+    async fn app_password_db_at(
+        rows: Vec<(&str, &str, String, bool)>,
+        path: impl AsRef<std::path::Path>,
+    ) -> Db {
+        let db = crate::account_manager::db::get_migrated_db(path)
+            .await
+            .unwrap();
+        let rows: Vec<_> = rows
+            .into_iter()
+            .map(|(did, name, hash, privileged)| {
+                (did.to_owned(), name.to_owned(), hash, privileged)
+            })
+            .collect();
+        db.run(move |conn| {
+            for (did, name, hash, privileged) in &rows {
+                conn.execute(
+                    "INSERT INTO app_password (did, name, \"passwordScrypt\", \"createdAt\", privileged) \
+                     VALUES (?1, ?2, ?3, '2026-01-01T00:00:00.000Z', ?4)",
+                    params![did, name, hash, privileged],
+                )?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+        db
+    }
+
+    #[tokio::test]
+    async fn migrated_argon2_app_password_preserves_name_and_privileges() {
+        let db = app_password_db(vec![
+            (
+                APP_DID,
+                "limited",
+                hash_legacy_app_password(APP_DID, "abcd-efgh-ijkl-mnop").unwrap(),
+                false,
+            ),
+            (
+                APP_DID,
+                "privileged",
+                hash_legacy_app_password(APP_DID, "qrst-uvwx-yzab-cdef").unwrap(),
+                true,
+            ),
+        ])
+        .await;
+
+        for (password, name, privileged) in [
+            ("abcd-efgh-ijkl-mnop", "limited", false),
+            ("qrst-uvwx-yzab-cdef", "privileged", true),
+        ] {
+            assert_eq!(
+                verify_app_password(APP_DID, password, &db).await.unwrap(),
+                Some(AppPassDescript {
+                    name: name.to_owned(),
+                    privileged
+                }),
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn app_passwords_reject_wrong_passwords_and_other_accounts() {
+        let scrypt_hash = hash_app_password(&APP_DID.to_owned(), &"new-password".to_owned())
+            .await
+            .unwrap();
+        let db = app_password_db(vec![
+            (
+                APP_DID,
+                "legacy",
+                hash_legacy_app_password(APP_DID, "old-password").unwrap(),
+                false,
+            ),
+            (APP_DID, "current", scrypt_hash, true),
+            (
+                OTHER_APP_DID,
+                "unrelated",
+                hash_legacy_app_password(OTHER_APP_DID, "unrelated-password").unwrap(),
+                false,
+            ),
+        ])
+        .await;
+        for (did, password) in [
+            (APP_DID, "wrong-password"),
+            (OTHER_APP_DID, "old-password"),
+            (OTHER_APP_DID, "new-password"),
+            ("did:plc:cccccccccccccccccccccccc", "old-password"),
+        ] {
+            assert_eq!(verify_app_password(did, password, &db).await.unwrap(), None);
+        }
+        assert_eq!(
+            verify_app_password(APP_DID, "new-password", &db)
+                .await
+                .unwrap(),
+            Some(AppPassDescript {
+                name: "current".to_owned(),
+                privileged: true
+            }),
+        );
+    }
+
+    #[tokio::test]
+    async fn unrelated_corrupt_rows_do_not_block_a_valid_legacy_lookup() {
+        let db = app_password_db(vec![
+            (APP_DID, "a-malformed", "$argon2id$invalid".to_owned(), true),
+            (APP_DID, "b-unknown", "not-a-hash".to_owned(), true),
+            (
+                APP_DID,
+                "c-valid",
+                hash_legacy_app_password(APP_DID, "old-password").unwrap(),
+                false,
+            ),
+        ])
+        .await;
+        assert_eq!(
+            verify_app_password(APP_DID, "old-password", &db)
+                .await
+                .unwrap(),
+            Some(AppPassDescript {
+                name: "c-valid".to_owned(),
+                privileged: false
+            }),
+        );
+        assert_eq!(
+            verify_app_password(APP_DID, "wrong", &db).await.unwrap(),
+            None
+        );
+    }
 
     /// A scrypt hash produced by our own `gen_salt_and_hash`/`hash_with_salt`
     /// round-trips through `verify`.
