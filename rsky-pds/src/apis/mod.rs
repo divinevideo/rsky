@@ -781,6 +781,11 @@ impl From<Error> for ApiError {
         use crate::account_manager::helpers::email_token::EmailTokenError;
         use crate::apis::com::atproto::repo::RepoUnavailable;
         use crate::lifecycle::AccountDeleting;
+        if let Some(overloaded) = value
+            .downcast_ref::<crate::account_manager::helpers::password::PasswordHashOverloaded>(
+        ) {
+            return ApiError::Overloaded(overloaded.to_string());
+        }
         if let Some(unavailable) = value.downcast_ref::<RepoUnavailable>() {
             return match unavailable {
                 RepoUnavailable::NotFound(_) => ApiError::RepoNotFound(value.to_string()),

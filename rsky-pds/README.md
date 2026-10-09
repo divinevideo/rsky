@@ -325,6 +325,23 @@ Repository exports and blob downloads are streamed and bounded by
 are spooled to disk and refused with `413 PayloadTooLarge` one byte past
 `PDS_BLOB_UPLOAD_LIMIT`.
 
+Account and app-password hashing runs on the blocking pool with at most
+four jobs per process, even when request limits are disabled. Cancelled
+requests retain their hashing slot until the blocking job finishes. A request
+waits at most 30 seconds for a slot; session creation returns HTTP 503
+(`ServiceUnavailable`) with `Retry-After: 5` when that wait expires.
+Sign-up hashes the password before creating its repository or publishing its
+identity, so a hashing timeout also returns HTTP 503 before those steps.
+This HTTP response applies to XRPC account creation; the web sign-up form
+displays its existing error message instead.
+Migrated Argon2 app passwords remain usable: a successful login on the
+account's admitted writer converts only the matched row to the current
+scrypt format, preserving its name, creation time, and privileges.
+The credential verifier leaves the row intact on non-writers and read-only
+databases; creating a session still requires writable session storage. Scrypt
+matches take precedence, and accounts without legacy app-password rows skip
+the Argon2 fallback.
+
 With `PDS_RATE_LIMITS_ENABLED=true` the reference PDS's limits apply: 3000
 XRPC requests per address per five minutes (repository exports have their
 own 6000), and the per-route limits on session creation, account creation,

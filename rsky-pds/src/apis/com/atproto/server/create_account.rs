@@ -124,6 +124,14 @@ pub async fn create_account_for(
     )
     .await?;
 
+    // Finish fallible password work before creating a repository or identity.
+    // In particular, an overloaded hash queue must leave no signup state behind.
+    let password_encrypted =
+        crate::account_manager::helpers::password::run_password_hash(move || {
+            crate::account_manager::helpers::password::gen_salt_and_hash(password)
+        })
+        .await?;
+
     // Create new actor repo TODO: Proper rollback
     let blobstore = blobstore_factory.blobstore(did.clone());
     if let Err(error) = actor_store.create(&did, &signing_key).await {
@@ -177,16 +185,19 @@ pub async fn create_account_for(
     let invited = invite_code.is_some();
     let (access_jwt, refresh_jwt);
     match account_manager
-        .create_account(CreateAccountOpts {
-            did: did.clone(),
-            handle: handle.clone(),
-            email: Some(email),
-            password: Some(password),
-            repo_cid: commit.commit_data.cid,
-            repo_rev: commit.commit_data.rev.clone(),
-            invite_code,
-            deactivated: Some(deactivated),
-        })
+        .create_account_with_password_hash(
+            CreateAccountOpts {
+                did: did.clone(),
+                handle: handle.clone(),
+                email: Some(email),
+                password: None,
+                repo_cid: commit.commit_data.cid,
+                repo_rev: commit.commit_data.rev.clone(),
+                invite_code,
+                deactivated: Some(deactivated),
+            },
+            Some(password_encrypted),
+        )
         .await
     {
         Ok(res) => {
