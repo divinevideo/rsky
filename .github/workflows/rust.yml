@@ -188,8 +188,10 @@ jobs:
           done
           docker logs test-redis
           exit 1
+      # rsky-pds enables `postgres-import` so the feature-gated importer and
+      # its end-to-end tests build and run.
       - name: Run cargo test for ${{ matrix.package }}
-        run: cargo test --release -p ${{ matrix.package }}
+        run: cargo test --release -p ${{ matrix.package }} ${{ matrix.package == 'rsky-pds' && '--features postgres-import' || '' }}
         env:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/bsky_test
           TEST_REDIS_URL: ${{ matrix.package == 'rsky-pds' && 'redis://127.0.0.1:6379' || '' }}
